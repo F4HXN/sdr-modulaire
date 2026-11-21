@@ -118,3 +118,11 @@ QT_QPA_PLATFORM=offscreen python3 -m tests.test_materiel capture.png  # affichag
 Décodeur APRS/AX.25 (vers aprs.jerko.fr), FT8/WSPR via `jt9`, stéréo + RDS en WFM,
 enregistreur IQ, scanner de mémoires, sortie MQTT vers InfluxDB/Grafana, serveur
 web pour l'écoute à distance.
+
+## Licence
+
+Logiciel libre sous licence MIT : vous pouvez l'utiliser, le modifier et le
+redistribuer librement, y compris dans un autre projet, en gardant la mention de
+copyright. Voir le fichier [LICENSE](LICENSE).
+
+Présentation du projet : https://rtl-sdr.fr/sdr-modulaire.html
