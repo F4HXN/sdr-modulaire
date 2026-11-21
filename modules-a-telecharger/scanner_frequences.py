@@ -13,8 +13,11 @@ Aucune dépendance en plus de SDR Modulaire.
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections import deque
+
+import numpy as np
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
@@ -28,6 +31,38 @@ PAS_KHZ = [5, 6.25, 8.33, 10, 12.5, 20, 25, 50, 100, 200]
 MODES = ["NFM", "AM", "WFM", "USB", "LSB", "CW"]
 HYSTERESIS = 3.0          # dB sous le seuil avant de considérer que le signal est parti
 STABILISATION = 0.12      # s ignorées après chaque changement de fréquence
+# Largeur du canal par mode (Hz) : sert à se caler au milieu d'une station plus large que le pas.
+LARGEURS = {"WFM": 180_000, "NFM": 12_500, "AM": 8_000, "USB": 2_700, "LSB": 2_700, "CW": 500}
+
+
+def bords_station(iq, centre, taux, f0, bw):
+    """Bords (gauche, droite) d'une station dans le spectre d'un bloc IQ, autour de f0
+    (là où le scanner l'a touchée) et dans une fenêtre de quelques largeurs de canal.
+    None si rien de net."""
+    n = 2048
+    trames = min(8, len(iq) // n)
+    if not trames:
+        return None
+    x = iq[: trames * n].reshape(trames, n) * np.hanning(n)
+    p = (np.abs(np.fft.fftshift(np.fft.fft(x, axis=1), axes=1)) ** 2).mean(axis=0)
+    res = taux / n
+    w = max(1, round(bw / 20 / res))
+    lisse = 10 * np.log10(np.convolve(p, np.ones(2 * w + 1) / (2 * w + 1), mode="same") + 1e-20)
+    bruit = float(np.median(lisse))
+    a = max(2, round((f0 - bw - centre) / res + n / 2))
+    b = min(n - 3, round((f0 + 2.5 * bw - centre) / res + n / 2))
+    if a > b:
+        return None
+    pic = a + int(np.argmax(lisse[a:b + 1]))
+    if lisse[pic] < bruit + 6:
+        return None
+    seuil = max(bruit + 6, lisse[pic] - 30)
+    g = d = pic
+    while g > 2 and lisse[g - 1] > seuil:
+        g -= 1
+    while d < n - 3 and lisse[d + 1] > seuil:
+        d += 1
+    return centre + (g - n / 2) * res, centre + (d - n / 2) * res
 
 
 class ScannerFrequences(Module):
@@ -59,11 +94,21 @@ class ScannerFrequences(Module):
         self.t_accord = 0.0
         self.t_silence = None
         self.journal: list[str] = []
+        self.k = -1
+        self.k_sortie = None                             # où reprendre après une station centrée
+        self.bloc_iq = None                              # bloc IQ lu pendant le centrage
+        self.t_centrage = 0.0
+        self.db_detection = 0.0
         self.mesures: deque = deque(maxlen=60)           # niveaux des derniers pas : leur médiane estime le bruit
         if self.ctx.mode() in MODES:
             self.mode_scan = self.ctx.mode()                 # on part du mode du récepteur
         self.abonner("niveau", lambda db: self.niveaux.append((time.monotonic(), db)))
         self.abonner("vfo", self._sur_vfo)                   # thread de l'interface
+        self.abonner("iq", self._sur_iq)                     # thread DSP : un bloc, pendant le centrage seulement
+
+    def _sur_iq(self, iq, centre, taux):
+        if self.etat == "centrage" and self.bloc_iq is None and time.monotonic() > self.t_accord + STABILISATION:
+            self.bloc_iq = (iq.copy(), float(centre), int(taux))
 
     def _sur_vfo(self, _frequence, mode):
         """Mode changé dans la barre du haut : le scanner suit."""
@@ -215,6 +260,7 @@ class ScannerFrequences(Module):
             self.actif = True
             self.mesures.clear()
             self.tours, self.fini = 1, False
+            self.k_sortie = None
             self.ctx.regler_mode(self.mode_scan)
             self.k = -1
             self.suivant()
@@ -230,8 +276,19 @@ class ScannerFrequences(Module):
             self.sauver()
             self.suivant()
 
+    def largeur(self):
+        return LARGEURS.get(self.mode_scan, 12_500)
+
+    def est_ignoree(self, f):
+        """Une fréquence ignorée écarte toute la largeur du canal autour d'elle."""
+        demi = max(self.largeur() / 2, self.pas * 500)
+        return any(abs(f - g) < demi for g in self.ignorees)
+
     def suivant(self):
         n, f_de = self.frequences()
+        if self.k_sortie is not None:          # reprise après une station : on la saute
+            self.k = min(self.k_sortie, n) - 1
+            self.k_sortie = None
         for _ in range(n):                    # pas suivant, en sautant les fréquences ignorées
             if self.k + 1 >= n:               # fin de la plage
                 if not self.boucle:
@@ -240,7 +297,7 @@ class ScannerFrequences(Module):
                     return
                 self.tours += 1
             self.k = (self.k + 1) % n
-            if f_de(self.k) not in self.ignorees:
+            if not self.est_ignoree(f_de(self.k)):
                 break
         else:
             self.actif, self.etat = False, "arret"
@@ -252,6 +309,19 @@ class ScannerFrequences(Module):
         self.t_accord = time.monotonic()
         self.t_silence = None
         self.etat = "mesure"
+        self._afficher()
+
+    def _arreter_sur(self, k, db):
+        _, f_de = self.frequences()
+        if k != self.k:
+            self.k, self.f = k, f_de(k)
+            self.ctx.regler_frequence(self.f)
+            self.f_attendue = self.ctx.frequence()
+        self.etat, self.t_silence, self.t_accord = "signal", None, time.monotonic()
+        self.journal.insert(0, f"{time.strftime('%H:%M:%S')}  {self.f / 1e6:.4f} MHz  {db:.0f} dBFS")
+        del self.journal[30:]
+        self.l_journal.clear()
+        self.l_journal.addItems(self.journal)
         self._afficher()
 
     def bruit(self):
@@ -282,14 +352,36 @@ class ScannerFrequences(Module):
             bruit = self.bruit()
             self.mesures.append(db)
             if bruit is not None and db > bruit + self.marge:
-                self.etat = "signal"
-                self.journal.insert(0, f"{time.strftime('%H:%M:%S')}  {self.f / 1e6:.4f} MHz  {db:.0f} dBFS")
-                del self.journal[30:]
-                self.l_journal.clear()
-                self.l_journal.addItems(self.journal)
+                pas_hz, bw = self.pas * 1e3, self.largeur()
+                if bw > 2 * pas_hz:
+                    # Canal plus large que le pas (WFM…) : on vient de toucher le flanc de la station.
+                    # On lit le spectre pour trouver ses deux bords et se caler au milieu.
+                    self.bloc_iq, self.db_detection, self.t_centrage = None, db, maintenant
+                    self.etat = "centrage"
+                    self._afficher()
+                    return
+                self._arreter_sur(self.k, db)
             else:
                 self.suivant()
                 return
+        elif self.etat == "centrage":
+            if self.bloc_iq is None:
+                if maintenant - self.t_centrage > 1.0:         # pas de bloc IQ : on reste où on est
+                    self._arreter_sur(self.k, self.db_detection)
+                return
+            iq, centre, taux = self.bloc_iq
+            bw, pas_hz = self.largeur(), self.pas * 1e3
+            bords = bords_station(iq, centre, taux, self.f, bw)
+            if bords is None:
+                self._arreter_sur(self.k, self.db_detection)
+                return
+            n, _ = self.frequences()
+            bas = min(self.debut, self.fin) * 1e6
+            kc = max(0, min(n - 1, round(((bords[0] + bords[1]) / 2 - bas) / pas_hz)))
+            # à la reprise : premier pas dont le canal ne touche plus la station
+            self.k_sortie = max(kc + 1, math.ceil((bords[1] + bw / 2 - bas) / pas_hz))
+            self._arreter_sur(kc, self.db_detection)
+            return
         elif self.etat == "signal":
             db = self._niveau_depuis(maintenant - 0.3)
             if db is None:
@@ -314,6 +406,8 @@ class ScannerFrequences(Module):
         if not self.actif:
             bas, haut = sorted((self.debut, self.fin))
             self.statut.setText(f"{'Passage terminé' if self.fini else 'Arrêté'} · {bas:.4f} → {haut:.4f} MHz, {n} pas de {self.pas:g} kHz en {self.mode_scan}")
+        elif self.etat == "centrage":
+            self.statut.setText(f"Centrage sur la station… {self.f / 1e6:.4f} MHz")
         elif self.etat == "signal":
             reste = "" if self.t_silence is None else \
                 f" · reprise dans {max(0.0, self.reprise - (time.monotonic() - self.t_silence)):.0f} s"
