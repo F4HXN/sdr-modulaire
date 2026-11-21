@@ -22,6 +22,7 @@ class VueSpectre(pg.GraphicsLayoutWidget):
         self.niveaux = (-110.0, -40.0)
         self._geometrie = None
         self._buf = np.full((LIGNES_WATERFALL, 16), -150.0, dtype=np.float32)
+        self._rect = None
 
         self.p_spec = self.addPlot(row=0, col=0)
         self.p_wf = self.addPlot(row=1, col=0)
@@ -89,7 +90,7 @@ class VueSpectre(pg.GraphicsLayoutWidget):
             self.x = (centre + (np.arange(n) - n / 2) * taux / n) / 1e6
             x0, larg = (centre - taux / 2) / 1e6, taux / 1e6
             self.p_spec.setXRange(x0, x0 + larg, padding=0)
-            self.img.setRect(QRectF(x0, 0, larg, LIGNES_WATERFALL))
+            self._rect = QRectF(x0, 0, larg, LIGNES_WATERFALL)
         self._dernier = db
         self.courbe.setData(self.x, db)
 
@@ -102,6 +103,10 @@ class VueSpectre(pg.GraphicsLayoutWidget):
         self._buf[:-1] = self._buf[1:]
         self._buf[-1] = ligne
         self.img.setImage(self._buf, autoLevels=False, levels=self.niveaux)
+        if self._rect is not None:
+            # le cadre se pose après l'image : il dépend de sa taille (sinon waterfall étiré au démarrage)
+            self.img.setRect(self._rect)
+            self._rect = None
 
     # ------------------------------------------------------------ souris
     def _accorder(self, pos_vue) -> bool:

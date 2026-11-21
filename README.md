@@ -4,6 +4,10 @@ Récepteur SDR pour Linux, écrit en Python, construit autour d'un cœur minimal
 (source → waterfall → démodulation → audio) auquel on **ajoute ou retire des
 modules à chaud**, sans redémarrer.
 
+![Réception d'une station FM avec les modules Stéréo et RDS, S-mètre et Enregistreur audio](docs/captures/fenetre-principale.png)
+
+*Réception d'une station FM avec une clé RTL-SDR (tuner FC0013), modules Stéréo et RDS, S-mètre et Enregistreur audio.*
+
 ## Ce que fait la base
 
 - Spectre + waterfall (FFT 1024 à 16384, moyenne, plancher/plafond, échelle auto)
@@ -26,6 +30,13 @@ pip install -r requirements.txt
 - **RTL-SDR Blog V4** : il faut le pilote `rtl-sdr-blog` (le paquet de la distribution ne gère pas le tuner R828D de la V4).
 - Si l'import de pyrtlsdr échoue avec `rtlsdr_set_dithering` : `pip install pyrtlsdr==0.2.93`.
 - Pense à blacklister `dvb_usb_rtl28xxu` si la clé est prise par le pilote TNT.
+
+### Ajouter des modules
+
+Menu **Modules → Ajouter des modules…** : les modules proposés sur rtl-sdr.fr s'installent
+(et se mettent à jour) en un clic dans `~/.config/sdr-modulaire/modules/`.
+
+![Gestionnaire d'ajout de modules](docs/captures/ajout-modules.png)
 
 ## Lancement
 
