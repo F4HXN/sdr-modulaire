@@ -76,8 +76,7 @@ class PilotageRigctl(Module):
         self.mode_cache = self.ctx.mode()
         self.erreur = ""
         self._fin = threading.Event()
-        self._prise = None
-        self._fil = None
+        self._prises = []
         self.ouvrir()
         self.abonner("vfo", self._sur_vfo)
 
@@ -86,33 +85,37 @@ class PilotageRigctl(Module):
 
     # ------------------------------------------------------------ serveur
     def ouvrir(self):
+        """Écoute sur 127.0.0.1 et ::1 : « localhost » peut désigner l'un ou l'autre."""
         self.fermer()
         self._fin = threading.Event()
-        try:
-            prise = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            prise.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            prise.bind(("127.0.0.1", self.port))
-            prise.listen(4)
-            prise.settimeout(0.5)
-        except OSError as exc:
-            self.erreur = f"port {self.port} indisponible ({exc.strerror or exc})"
-            return
-        self.erreur = ""
-        self._prise = prise
-        self._fil = threading.Thread(target=self._accepter, name="rigctl", daemon=True)
-        self._fil.start()
+        self._prises, erreurs = [], []
+        for famille, adresse in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+            try:
+                prise = socket.socket(famille, socket.SOCK_STREAM)
+                prise.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if famille == socket.AF_INET6:
+                    prise.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                prise.bind((adresse, self.port))
+                prise.listen(4)
+                prise.settimeout(0.5)
+            except OSError as exc:
+                erreurs.append(f"{adresse} : {exc.strerror or exc}")
+                continue
+            self._prises.append(prise)
+            threading.Thread(target=self._accepter, args=(prise, self._fin), name="rigctl", daemon=True).start()
+        self.erreur = "" if any(p.family == socket.AF_INET for p in self._prises) else \
+            f"port {self.port} indisponible ({'; '.join(erreurs)})"
 
     def fermer(self):
         self._fin.set()
-        if self._prise:
+        for prise in getattr(self, "_prises", []):
             try:
-                self._prise.close()
+                prise.close()
             except OSError:
                 pass
-            self._prise = None
+        self._prises = []
 
-    def _accepter(self):
-        prise, fin = self._prise, self._fin
+    def _accepter(self, prise, fin):
         while not fin.is_set():
             try:
                 conn, adresse = prise.accept()
@@ -120,8 +123,8 @@ class PilotageRigctl(Module):
                 continue
             except OSError:
                 break
-            threading.Thread(target=self._servir, args=(conn, f"{adresse[0]}:{adresse[1]}", fin),
-                             daemon=True).start()
+            nom = f"[{adresse[0]}]:{adresse[1]}" if ":" in adresse[0] else f"{adresse[0]}:{adresse[1]}"
+            threading.Thread(target=self._servir, args=(conn, nom, fin), daemon=True).start()
 
     def _servir(self, conn, nom, fin):
         conn.settimeout(0.5)
@@ -323,7 +326,7 @@ class PilotageRigctl(Module):
             self.statut.setText(f"⚠ Serveur arrêté : {self.erreur}.")
             return
         clients = list(self.clients)
-        etat = f"En écoute sur 127.0.0.1:{self.port}"
+        etat = f"En écoute sur localhost:{self.port} (" + " et ".join("IPv6" if p.family == socket.AF_INET6 else "IPv4" for p in self._prises) + ")"
         etat += f" · {len(clients)} client(s) connecté(s)" if clients else " · aucun client"
         if self.derniere_f is not None:
             etat += f"\nDernière fréquence : {self.derniere_f / 1e6:.6f} MHz"
