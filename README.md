@@ -128,4 +128,11 @@ Logiciel libre sous licence MIT : vous pouvez l'utiliser, le modifier et le
 redistribuer librement, y compris dans un autre projet, en gardant la mention de
 copyright. Voir le fichier [LICENSE](LICENSE).
 
+Exception : `web/rtlsdr.js` (pilote WebUSB de SDR Web) est un portage de librtlsdr et reste sous
+licence GPL-2.0 ou ultérieure, comme l'original.
+
+## SDR Web
+
+Une version navigateur (WebUSB, Chrome/Edge/Opera) est dans [web/](web/) : https://rtl-sdr.fr/sdr-web.html
+
 Présentation du projet : https://rtl-sdr.fr/sdr-modulaire.html
