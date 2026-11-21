@@ -1,6 +1,7 @@
 # Modules à télécharger
 
-Ces modules ne sont **pas** chargés automatiquement par SDR Modulaire. Pour en utiliser un :
+Ces modules ne sont **pas** chargés automatiquement par SDR Modulaire. Le plus simple : dans l'application,
+**Modules → Ajouter des modules…**, puis **Installer**. À la main :
 
 1. copiez le fichier dans `~/.config/sdr-modulaire/modules/` ;
 2. dans l'application : **Modules → Gérer les modules → Rescanner les dossiers**, puis cochez-le.

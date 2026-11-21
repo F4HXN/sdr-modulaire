@@ -110,6 +110,10 @@ Le module doit : <décrire ici ce que le module doit faire>
 
 ## Modules à télécharger
 
+Le plus simple : **Modules → Ajouter des modules…** dans l'application. La liste vient du catalogue
+<https://rtl-sdr.fr/catalogue-modules.json> ; un clic télécharge le module, vérifie son empreinte SHA-256 et sa
+syntaxe, et le range dans `~/.config/sdr-modulaire/modules/`. Le même dialogue installe aussi un `.py` local.
+
 Certains modules ne sont pas fournis avec l'application (dossier `modules-a-telecharger/`) : on les télécharge sur
 <https://rtl-sdr.fr/sdr-modulaire.html#modules-a-venir> et on les place dans
 `~/.config/sdr-modulaire/modules/`, puis **Modules → Gérer les modules → Rescanner les dossiers**.

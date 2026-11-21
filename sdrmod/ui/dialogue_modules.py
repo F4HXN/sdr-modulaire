@@ -12,7 +12,7 @@ class DialogueModules(QDialog):
         super().__init__(fenetre)
         self.fenetre = fenetre
         self.setWindowTitle("Modules")
-        self.resize(520, 380)
+        self.resize(620, 400)
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel("Coche un module pour l'ajouter, décoche-le pour le retirer (à chaud)."))
         self.liste = QListWidget()
@@ -26,6 +26,10 @@ class DialogueModules(QDialog):
         b_redec.clicked.connect(self._rescanner)
         b_rech = QPushButton("Recharger le module")
         b_rech.clicked.connect(self._recharger)
+        b_ajout = QPushButton("Ajouter des modules…")
+        b_ajout.setToolTip("Télécharger des modules depuis rtl-sdr.fr ou installer un fichier .py")
+        b_ajout.clicked.connect(self._ajouter)
+        boutons.addWidget(b_ajout)
         boutons.addWidget(b_redec)
         boutons.addWidget(b_rech)
         boutons.addStretch(1)
@@ -67,6 +71,11 @@ class DialogueModules(QDialog):
 
     def _afficher(self, item) -> None:
         self.detail.setText(item.data(Qt.UserRole) if item else "")
+
+    def _ajouter(self) -> None:
+        from .dialogue_ajout_modules import DialogueAjoutModules
+        DialogueAjoutModules(self.fenetre, self).exec()
+        self._remplir()
 
     def _rescanner(self) -> None:
         self.fenetre.modules.decouvrir()

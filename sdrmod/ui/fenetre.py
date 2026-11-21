@@ -276,6 +276,10 @@ class FenetrePrincipale(QMainWindow):
         self.moteur.regler_largeur(v)
         self._maj_vfo()
 
+    def _ajouter_modules(self) -> None:
+        from .dialogue_ajout_modules import DialogueAjoutModules
+        DialogueAjoutModules(self).exec()
+
     def _changer_taux(self, t: int) -> None:
         etait = self.moteur.actif
         if etait:
@@ -462,6 +466,7 @@ class FenetrePrincipale(QMainWindow):
         menu = self.menu_modules
         menu.clear()
         menu.addAction("Gérer les modules…", lambda: DialogueModules(self).exec())
+        menu.addAction("Ajouter des modules…", self._ajouter_modules)
         menu.addSeparator()
         for nom in sorted(self.modules.classes):
             a = menu.addAction(nom)
