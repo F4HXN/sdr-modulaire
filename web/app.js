@@ -380,13 +380,16 @@ function retirerModule(nom) {
   R.modules = [...actifs.keys()]; listeModules();
 }
 function listeModules() {
-  $("#modules").replaceChildren(...MODULES.map(M => {
-    const l = document.createElement("label"); l.title = M.description;
-    const c = document.createElement("input"); c.type = "checkbox"; c.checked = actifs.has(M.nom);
-    c.onchange = () => c.checked ? activerModule(M.nom) : retirerModule(M.nom);
-    const d = document.createElement("small"); d.textContent = M.description;
-    l.append(c, " ", M.nom, d); return l;
-  }));
+  const choix = document.createElement("select"); choix.id = "choix-module"; choix.setAttribute("aria-label", "Ajouter ou retirer un module");
+  const titre = new Option(actifs.size ? `${actifs.size} module${actifs.size > 1 ? "s" : ""} actif${actifs.size > 1 ? "s" : ""} — ajouter…` : "Ajouter un module…", "");
+  titre.disabled = true; titre.selected = true; choix.add(titre);
+  for (const M of MODULES) {
+    const o = new Option(`${actifs.has(M.nom) ? "✓ " : "\u2003"}${M.nom}`, M.nom);
+    o.title = M.description + (actifs.has(M.nom) ? " (choisir pour le retirer)" : ""); choix.add(o);
+  }
+  const aide = document.createElement("small"); aide.textContent = "Un module coché ✓ est actif ; le choisir à nouveau le retire.";
+  choix.onchange = () => { const nom = choix.value; actifs.has(nom) ? retirerModule(nom) : activerModule(nom); };
+  $("#modules").replaceChildren(choix, aide);
 }
 
 // ---------------------------------------------------------------- démarrage de la page
