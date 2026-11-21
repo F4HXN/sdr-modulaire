@@ -13,7 +13,6 @@ modules à chaud**, sans redémarrer.
 - Bande passante réglable par mode (mémorisée), AGC audio, squelch en dBFS, volume
 - Détection de la clé : modèle, tuner, couverture, paliers de gain, taux max ; options non prises en charge grisées, fréquence en rouge hors couverture (menu Source → Informations sur le matériel)
 - RTL-SDR : taux d'échantillonnage, gain RF (auto ou manuel), correction ppm, échantillonnage direct I/Q (HF sur V3), bias-T
-- Source **Simulation** (5 émetteurs fictifs) pour essayer sans matériel
 - Réglages, modules actifs et disposition des fenêtres retrouvés au lancement suivant
 
 ## Installation (Debian / Ubuntu)
@@ -33,8 +32,8 @@ pip install -r requirements.txt
 Depuis le dossier du projet :
 
 ```bash
-python3 -m sdrmod                # RTL-SDR
-python3 -m sdrmod --simulation   # sans matériel
+python3 -m sdrmod                # clé RTL-SDR
+python3 -m sdrmod --debug        # avec un journal détaillé
 ```
 
 ## Architecture
@@ -58,7 +57,8 @@ sdrmod/
   dsp.py           NCO, FIR/IIR à état, décimateurs, AGC
   bus.py           publication / abonnement
   modules.py       Module, Contexte, GestionnaireModules
-  sources/         rtlsdr_source.py, simulation.py   (une classe Source par matériel)
+  sources/         rtlsdr_source.py (une classe Source par matériel),
+                   simulation.py (émetteurs fictifs, pour les tests automatiques seulement)
   demods/          am.py, fm.py, blu.py              (un fichier = un ou plusieurs modes)
   ui/              fenêtre, waterfall, afficheur, panneau, dialogue modules
 modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite.py,

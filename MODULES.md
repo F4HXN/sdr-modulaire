@@ -79,7 +79,7 @@ Les abonnements faits avec `self.abonner()` sont retirés automatiquement au ret
 ## Tester
 
 ```bash
-python3 -m sdrmod --simulation --debug   # source simulée : 5 émetteurs fictifs autour de 145 MHz
+python3 -m sdrmod --debug   # clé RTL-SDR branchée, journal détaillé (erreurs des modules)
 ```
 
 Activer le module, regarder le terminal. Après une modification du fichier : *Modules → Gérer les modules… → Recharger le module*.
@@ -104,7 +104,7 @@ Lis d'abord la spécification : https://raw.githubusercontent.com/F4HXN/sdr-modu
 et inspire-toi de l'exemple : https://raw.githubusercontent.com/F4HXN/sdr-modulaire/main/modules/journal_activite.py
 Contraintes : un seul fichier .py, une sous-classe de sdrmod.modules.Module avec nom et description,
 rappels du bus rapides et sans widget, affichage par QTimer, tout libérer dans arreter(),
-code et interface en français. Donne le fichier complet, puis comment le tester avec --simulation.
+code et interface en français. Donne le fichier complet, puis comment le tester avec une clé RTL-SDR.
 Le module doit : <décrire ici ce que le module doit faire>
 ```
 

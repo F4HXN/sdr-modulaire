@@ -1,4 +1,4 @@
-"""Lancement : python3 -m sdrmod [--simulation] [--debug]"""
+"""Lancement : python3 -m sdrmod [--debug]"""
 
 import argparse
 import logging
@@ -25,7 +25,6 @@ def appliquer_theme_sombre(app: QApplication) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(prog="sdrmod", description="Récepteur SDR modulaire")
-    ap.add_argument("--simulation", action="store_true", help="utiliser la source simulée (sans matériel)")
     ap.add_argument("--debug", action="store_true", help="journal détaillé")
     args = ap.parse_args()
 
@@ -40,7 +39,7 @@ def main() -> int:
     appliquer_theme_sombre(app)
 
     from .ui.fenetre import FenetrePrincipale
-    fenetre = FenetrePrincipale(source="simulation" if args.simulation else None)
+    fenetre = FenetrePrincipale()
     fenetre.show()
     return app.exec()
 

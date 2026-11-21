@@ -16,7 +16,6 @@ et des **modules ajoutés / retirés à chaud** sans redémarrer.
 ```bash
 source ~/.venv/sdrmod/bin/activate
 python3 -m sdrmod                 # clé RTL-SDR (menu Source → RTL-SDR)
-python3 -m sdrmod --simulation    # source simulée, 5 émetteurs fictifs
 python3 -m tests.test_dsp                                              # chaque mode sur signaux simulés
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_interface capture.png  # interface + modules à chaud
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_materiel capture.png   # affichage matériel (FC0013 émulée)

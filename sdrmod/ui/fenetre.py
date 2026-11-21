@@ -17,7 +17,7 @@ from ..config import PAS_ACCORD, Reglages
 from ..demods import decouvrir
 from ..modules import Contexte, GestionnaireModules
 from ..moteur import Moteur
-from ..sources import SOURCES
+from ..sources import SOURCES, TOUTES_SOURCES
 from ..sources.rtlsdr_source import libelle_cle, lister_cles
 from .afficheur import AfficheurFrequence
 from .dialogue_modules import DialogueModules
@@ -46,8 +46,10 @@ class FenetrePrincipale(QMainWindow):
     def __init__(self, source: str | None = None) -> None:
         super().__init__()
         self.reglages = r = Reglages.charger()
-        if source:
+        if source:                       # source imposée (tests automatiques)
             r.source = source
+        elif r.source not in SOURCES:    # anciens réglages (source simulée retirée) : retour à la clé
+            r.source = "rtlsdr"
         self.bus = Bus()
         self.bus.sur_erreur = lambda rappel, exc: self._erreur_module.emit(rappel, str(exc))
         self.modes = decouvrir()
@@ -333,7 +335,7 @@ class FenetrePrincipale(QMainWindow):
         if r.source == "rtlsdr":
             source = SOURCES["rtlsdr"](index=r.rtlsdr_index, serie=r.rtlsdr_serie)
         else:
-            source = SOURCES[r.source]()
+            source = TOUTES_SOURCES[r.source]()
         problemes = []
 
         def initialiser(src):
@@ -359,14 +361,11 @@ class FenetrePrincipale(QMainWindow):
         except Exception as exc:
             log.exception("Démarrage")
             self.b_marche.setChecked(False)
-            rep = QMessageBox.warning(
+            QMessageBox.warning(
                 self, "Démarrage impossible",
                 f"Impossible d'ouvrir la source « {source.nom} » :\n\n{exc}\n\n"
-                "Passer sur la source simulée pour essayer l'interface ?",
-                QMessageBox.Yes | QMessageBox.No)
-            if rep == QMessageBox.Yes:
-                self._choisir_source("simulation")
-                self.demarrer()
+                "Vérifiez que la clé est branchée et qu'aucun autre programme ne l'utilise "
+                "(SDR Web dans le navigateur, rtl_tcp, Gqrx…).")
             return
         self.panneau.appliquer_materiel(self.infos_materiel)
         self._maj_statut()
@@ -436,7 +435,7 @@ class FenetrePrincipale(QMainWindow):
         detail = f" — {i.get('modele', '')}, {i.get('tuner', '')}".rstrip(", ") if i else ""
         if i.get("numero_serie"):
             detail += f", n° {i['numero_serie']}"
-        texte = f"Source : {SOURCES[self.reglages.source].nom}{detail} ({etat})"
+        texte = f"Source : {TOUTES_SOURCES[self.reglages.source].nom}{detail} ({etat})"
         if getattr(self, "_avertissement", ""):
             texte = f"<span style='color:#ff7043;font-weight:bold'>{self._avertissement}</span>&nbsp;&nbsp;&nbsp;{texte}"
         self.lbl_source.setText(texte)
