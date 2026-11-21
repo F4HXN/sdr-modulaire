@@ -29,6 +29,8 @@ TAILLES_FFT = [1024, 2048, 4096, 8192, 16384]
 @dataclass
 class Reglages:
     source: str = "rtlsdr"
+    rtlsdr_serie: str = ""              # clé choisie (numéro de série) ; vide = première clé
+    rtlsdr_index: int = 0               # position, pour départager deux numéros de série identiques
     centre: float = 145_300_000.0       # fréquence centrale du récepteur (Hz)
     decalage: float = 200_000.0         # position du VFO par rapport au centre (Hz)
     taux: int = 2_400_000

@@ -18,6 +18,7 @@ from ..demods import decouvrir
 from ..modules import Contexte, GestionnaireModules
 from ..moteur import Moteur
 from ..sources import SOURCES
+from ..sources.rtlsdr_source import libelle_cle, lister_cles
 from .afficheur import AfficheurFrequence
 from .dialogue_modules import DialogueModules
 from .panneau import PanneauReglages, texte_plages
@@ -132,16 +133,10 @@ class FenetrePrincipale(QMainWindow):
         menu = self.menuBar().addMenu("&Fichier")
         menu.addAction("Quitter", QKeySequence.Quit, self.close)
 
-        menu = self.menuBar().addMenu("&Source")
-        groupe = QActionGroup(self)
-        for cle, classe in SOURCES.items():
-            a = QAction(classe.nom, self, checkable=True)
-            a.setChecked(cle == r.source)
-            a.triggered.connect(lambda _=False, c=cle: self._choisir_source(c))
-            groupe.addAction(a)
-            menu.addAction(a)
-        menu.addSeparator()
-        menu.addAction("Informations sur le matériel…", self._afficher_materiel)
+        self.menu_source = self.menuBar().addMenu("&Source")
+        self.menu_source.aboutToShow.connect(self._remplir_menu_source)
+        self._groupe_source = None
+        self._remplir_menu_source()
 
         self.menu_modules = self.menuBar().addMenu("&Modules")
         self.menu_modules.aboutToShow.connect(self._remplir_menu_modules)
@@ -305,7 +300,10 @@ class FenetrePrincipale(QMainWindow):
         r = self.reglages
         m = self.moteur
         m.centre, m.taux, m.decalage = r.centre, r.taux, r.decalage
-        source = SOURCES[r.source]()
+        if r.source == "rtlsdr":
+            source = SOURCES["rtlsdr"](index=r.rtlsdr_index, serie=r.rtlsdr_serie)
+        else:
+            source = SOURCES[r.source]()
         problemes = []
 
         def initialiser(src):
@@ -357,14 +355,47 @@ class FenetrePrincipale(QMainWindow):
         if not self.moteur.actif and self.moteur._threads:
             self.moteur.arreter()
 
-    def _choisir_source(self, cle: str) -> None:
+    def _remplir_menu_source(self) -> None:
+        """Reconstruit le menu Source à chaque ouverture : les clés branchées à cet instant."""
+        r, menu = self.reglages, self.menu_source
+        menu.clear()
+        if self._groupe_source is not None:
+            self._groupe_source.deleteLater()
+        groupe = self._groupe_source = QActionGroup(menu)
+
+        def ajouter(texte, coche, rappel):
+            a = QAction(texte, menu, checkable=True)
+            a.setChecked(coche)
+            a.triggered.connect(rappel)
+            groupe.addAction(a)
+            menu.addAction(a)
+
+        cles = lister_cles()
+        for c in cles:
+            doublon = sum(x["serie"] == c["serie"] for x in cles) > 1
+            coche = (r.source == "rtlsdr"
+                     and (c["serie"] == r.rtlsdr_serie or (not r.rtlsdr_serie and c["index"] == 0))
+                     and (not doublon or c["index"] == r.rtlsdr_index))
+            ajouter(libelle_cle(c, cles), coche,
+                    lambda _=False, c=c: self._choisir_source("rtlsdr", c["index"], c["serie"]))
+        if not cles:
+            a = menu.addAction("RTL-SDR : aucune clé détectée")
+            a.setEnabled(False)
+        for cle, classe in SOURCES.items():
+            if cle != "rtlsdr":
+                ajouter(classe.nom, cle == r.source, lambda _=False, c=cle: self._choisir_source(c))
+        menu.addSeparator()
+        menu.addAction("Informations sur le matériel…", self._afficher_materiel)
+
+    def _choisir_source(self, cle: str, index: int | None = None, serie: str | None = None) -> None:
         etait = self.moteur.actif
         if etait:
             self.moteur.arreter()
         self.reglages.source = cle
+        if cle == "rtlsdr" and index is not None:
+            self.reglages.rtlsdr_index = index
+            self.reglages.rtlsdr_serie = serie or ""
         self.infos_materiel = {}
-        for a in self.menuBar().actions()[1].menu().actions():
-            a.setChecked(a.text() == SOURCES[cle].nom)
         self._maj_statut()
         if etait:
             self.demarrer()
@@ -373,6 +404,8 @@ class FenetrePrincipale(QMainWindow):
         etat = "en marche" if self.moteur.actif else "arrêtée"
         i = self.infos_materiel
         detail = f" — {i.get('modele', '')}, {i.get('tuner', '')}".rstrip(", ") if i else ""
+        if i.get("numero_serie"):
+            detail += f", n° {i['numero_serie']}"
         texte = f"Source : {SOURCES[self.reglages.source].nom}{detail} ({etat})"
         if getattr(self, "_avertissement", ""):
             texte = f"<span style='color:#ff7043;font-weight:bold'>{self._avertissement}</span>&nbsp;&nbsp;&nbsp;{texte}"

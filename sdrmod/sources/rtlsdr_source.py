@@ -23,11 +23,57 @@ TUNERS = {
 TAUX_MAX_STABLE = 2_400_000
 
 
+def lister_cles() -> list[dict]:
+    """Clés RTL-SDR branchées, sans les ouvrir (marche aussi pour une clé déjà en service)."""
+    try:
+        from ctypes import c_ubyte
+
+        from rtlsdr.librtlsdr import librtlsdr
+        nombre = int(librtlsdr.rtlsdr_get_device_count())
+    except Exception:
+        return []
+    cles = []
+    for i in range(nombre):
+        fabricant = produit = serie = nom = ""
+        try:
+            tampons = [(c_ubyte * 256)() for _ in range(3)]
+            if librtlsdr.rtlsdr_get_device_usb_strings(i, *tampons) == 0:
+                fabricant, produit, serie = ("".join(chr(b) for b in t if b > 0).strip() for t in tampons)
+            brut = librtlsdr.rtlsdr_get_device_name(i)
+            nom = brut.decode(errors="replace") if isinstance(brut, bytes) else str(brut or "")
+        except Exception:
+            pass
+        cles.append({"index": i, "fabricant": fabricant, "produit": produit, "serie": serie, "nom": nom})
+    return cles
+
+
+def libelle_cle(cle: dict, cles: list[dict]) -> str:
+    """Texte du menu ; la position USB est ajoutée si deux clés ont le même numéro de série."""
+    texte = f"RTL-SDR — {cle['produit'] or cle['nom'] or 'RTL2832U'}"
+    if cle["serie"]:
+        texte += f" n° {cle['serie']}"
+    if sum(c["serie"] == cle["serie"] for c in cles) > 1:
+        texte += f" (clé {cle['index'] + 1})"
+    return texte
+
+
+def choisir_index(cles: list[dict], serie: str, index: int) -> int:
+    """Retrouve la clé mémorisée : par numéro de série, ou par position s'il est en double."""
+    if not serie:
+        return index
+    memes = [c["index"] for c in cles if c["serie"] == serie]
+    if not memes:
+        branchees = ", ".join(c["serie"] or "?" for c in cles) or "aucune"
+        raise RuntimeError(f"La clé n° {serie} n'est pas branchée (clés présentes : {branchees}).")
+    return index if index in memes else memes[0]
+
+
 class SourceRtlSdr(Source):
     nom = "RTL-SDR"
 
-    def __init__(self, index: int = 0) -> None:
+    def __init__(self, index: int = 0, serie: str = "") -> None:
         self.index = index
+        self.serie = serie
         self.sdr = None
         self._ppm = 0
 
@@ -50,6 +96,7 @@ class SourceRtlSdr(Source):
                 "Installe le paquet système « rtl-sdr » (ou le pilote rtl-sdr-blog pour une V4) "
                 "et « pip install pyrtlsdr »."
             ) from exc
+        self.index = choisir_index(lister_cles(), self.serie, self.index)
         self.sdr = RtlSdr(self.index)
         self.sdr.sample_rate = taux
         self.sdr.center_freq = int(frequence)
