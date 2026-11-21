@@ -3,8 +3,9 @@
 import argparse
 import logging
 import sys
+from pathlib import Path
 
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import QApplication
 
 
@@ -33,6 +34,8 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("SDR Modulaire")
+    app.setDesktopFileName("sdr-modulaire")   # GNOME/Wayland : icône prise dans sdr-modulaire.desktop
+    app.setWindowIcon(QIcon(str(Path(__file__).parent / "ressources" / "icone.svg")))
     app.setStyle("Fusion")
     appliquer_theme_sombre(app)
 
