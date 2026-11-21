@@ -110,7 +110,7 @@ Le module doit : <décrire ici ce que le module doit faire>
 
 ## Modules à télécharger
 
-Certains modules ne sont pas fournis avec l'application : on les télécharge sur
+Certains modules ne sont pas fournis avec l'application (dossier `modules-a-telecharger/`) : on les télécharge sur
 <https://rtl-sdr.fr/sdr-modulaire.html#modules-a-venir> et on les place dans
 `~/.config/sdr-modulaire/modules/`, puis **Modules → Gérer les modules → Rescanner les dossiers**.
 
