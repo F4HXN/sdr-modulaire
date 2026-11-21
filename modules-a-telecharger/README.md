@@ -13,3 +13,4 @@ Ils sont aussi téléchargeables sur <https://rtl-sdr.fr/sdr-modulaire.html#modu
 | `adsb.py` | avions sur 1090 MHz (2,4 MS/s, gain maximal) : carte radar mondiale et tableau dans une fenêtre séparée |
 | `scanner_memoires.py` | balaie les fréquences du module Mémoires, s'arrête sur un signal et reprend après un silence |
 | `scanner_frequences.py` | balaie une plage début–fin avec un pas, s'arrête sur un signal qui dépasse le bruit estimé |
+| `pilotage_rigctl.py` | serveur rigctld local (port 4532) : Gpredict suit les satellites (Doppler), WSJT-X, fldigi… pilotent fréquence et mode |
