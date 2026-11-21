@@ -148,7 +148,7 @@ class PanneauReglages(QWidget):
 
         self.moyennage = _curseur(0, 95, int(r.moyennage * 100))
         self.moyennage.valueChanged.connect(lambda v: self.moyennage_change.emit(v / 100))
-        f.addRow("Moyennage", self.moyennage)
+        f.addRow("Moyenne", self.moyennage)
 
         self.n_min = _curseur(-150, 0, int(r.niveau_min))
         self.n_max = _curseur(-150, 0, int(r.niveau_max))

@@ -57,7 +57,22 @@ class ScannerFrequences(Module):
         self.t_silence = None
         self.journal: list[str] = []
         self.mesures: deque = deque(maxlen=60)           # niveaux des derniers pas : leur médiane estime le bruit
+        if self.ctx.mode() in MODES:
+            self.mode_scan = self.ctx.mode()                 # on part du mode du récepteur
         self.abonner("niveau", lambda db: self.niveaux.append((time.monotonic(), db)))
+        self.abonner("vfo", self._sur_vfo)                   # thread de l'interface
+
+    def _sur_vfo(self, _frequence, mode):
+        """Mode changé dans la barre du haut : le scanner suit."""
+        if mode == self.mode_scan or mode not in MODES:
+            return
+        self.mode_scan = mode
+        if hasattr(self, "c_mode"):
+            self.c_mode.blockSignals(True)
+            self.c_mode.setCurrentText(mode)
+            self.c_mode.blockSignals(False)
+            self._afficher()
+        self.sauver()
 
     def sauver(self):
         try:
@@ -166,6 +181,8 @@ class ScannerFrequences(Module):
         self.debut, self.fin = self.s_debut.value(), self.s_fin.value()
         self.pas = self.c_pas.currentData()
         self.mode_scan = self.c_mode.currentText()
+        if self.mode_scan != self.ctx.mode():
+            self.ctx.regler_mode(self.mode_scan)             # mode changé dans le scanner : le récepteur suit
         self.sauver()
         self._afficher()
 

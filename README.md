@@ -6,7 +6,7 @@ modules à chaud**, sans redémarrer.
 
 ## Ce que fait la base
 
-- Spectre + waterfall (FFT 1024 à 16384, moyennage, plancher/plafond, échelle auto)
+- Spectre + waterfall (FFT 1024 à 16384, moyenne, plancher/plafond, échelle auto)
 - Afficheur de fréquence façon transceiver : molette sur un chiffre, clic haut/bas, double-clic pour saisir
 - Accord par clic sur le spectre ou le waterfall (calé sur le pas), molette = ± 1 pas, ↑/↓ et PgPréc/PgSuiv au clavier
 - Modes : AM, NFM, WFM (mono, désaccentuation 50 µs), USB, LSB, CW (note 700 Hz)

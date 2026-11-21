@@ -516,7 +516,13 @@ class ScannerFrequences {
     this.mesures = [];   // niveaux des derniers pas : leur médiane estime le bruit
     this.ignorees = new Set(l("ignorees", []));
     this.niveaux = []; this.actif = false; this.etat = "arret"; this.k = -1; this.f = null; this.journal = [];
+    if (MODES_SCAN.includes(this.ctx.mode())) this.modeScan = this.ctx.mode();   // on part du mode du récepteur
     this.ctx.abonner("niveau", db => { this.niveaux.push([performance.now(), db]); if (this.niveaux.length > 200) this.niveaux.splice(0, 100); });
+    this.ctx.abonner("vfo", (_f, mode) => {   // mode changé dans la barre du haut : le scanner suit
+      if (mode === this.modeScan || !MODES_SCAN.includes(mode)) return;
+      this.modeScan = mode; if (this.choixMode) this.choixMode.value = mode;
+      this.sauver(); if (this.bMarche) this.afficher();
+    });
   }
   sauver() { for (const c of ["debut", "fin", "pas", "marge", "duree", "reprise"]) this.ctx.ecrire(c, this[c]); this.ctx.ecrire("mode", this.modeScan); this.ctx.ecrire("ignorees", [...this.ignorees]); }
   plage() {
@@ -532,8 +538,11 @@ class ScannerFrequences {
     };
     const pas = el("select", {}, ...PAS_SCAN.map(p => new Option(`${p} kHz`, p, false, p === this.pas)));
     pas.onchange = () => { this.pas = Number(pas.value); this.sauver(); this.afficher(); };
-    const mode = el("select", {}, ...MODES_SCAN.map(m => new Option(m, m, false, m === this.modeScan)));
-    mode.onchange = () => { this.modeScan = mode.value; this.sauver(); this.afficher(); };
+    const mode = this.choixMode = el("select", {}, ...MODES_SCAN.map(m => new Option(m, m, false, m === this.modeScan)));
+    mode.onchange = () => {   // mode changé dans le scanner : le récepteur suit
+      this.modeScan = mode.value; if (this.ctx.mode() !== this.modeScan) this.ctx.reglerMode(this.modeScan);
+      this.sauver(); this.afficher();
+    };
     const curseur = (titre, cle, min, max, p, texte) => {
       const val = el("span", { className: "petit", textContent: texte(this[cle]) });
       const c = el("input", { type: "range", min, max, step: p, value: this[cle] });
