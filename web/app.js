@@ -4,7 +4,7 @@
 import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261121-fm-stereo";
 import { CleRtlSdr } from "./rtlsdr.js";
 import { SourceSimulation } from "./simulation.js?v=20261121-adsb";
-import { MODULES } from "./modules.js?v=20261121-boucle";
+import { MODULES } from "./modules.js?v=20261121-centrage";
 
 const $ = s => document.querySelector(s);
 const PAS = [100, 1000, 2500, 5000, 6250, 8330, 10000, 12500, 25000, 100000, 1000000];
@@ -187,7 +187,6 @@ $("#echelle").onclick = () => {
   R.min = Math.round(t[Math.floor(t.length * 0.2)] - 8); R.max = Math.round(Math.max(t[Math.floor(t.length * 0.999)] + 5, R.min + 30));
 };
 $("#b-cle").onclick = () => demarrer("cle");
-$("#b-sim").onclick = () => demarrer("sim");
 $("#b-arret").onclick = () => arreter();
 addEventListener("keydown", e => {
   if (e.defaultPrevented || e.target.closest("input, select, textarea")) return;
@@ -413,8 +412,8 @@ function listeModules() {
 // ---------------------------------------------------------------- démarrage de la page
 const compatible = "usb" in navigator;
 $("#b-cle").disabled = !compatible;
-if (!compatible) erreur("Ce navigateur ne gère pas WebUSB : la clé ne peut pas être utilisée. Essayez Chrome, Edge ou Opera sur ordinateur ou Android. La source simulée fonctionne partout.");
-else statut("Branchez la clé puis cliquez sur « Connecter la clé », ou essayez la source simulée.");
+if (!compatible) erreur("Ce navigateur ne gère pas WebUSB : la clé ne peut pas être utilisée. Essayez Chrome, Edge ou Opera sur ordinateur ou Android.");
+else statut("Branchez la clé puis cliquez sur « Connecter la clé ».");
 reglerMode(R.mode);
 majVfo(); majEtat(); listeModules();
 [...R.modules].forEach(activerModule);
