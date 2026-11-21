@@ -87,6 +87,7 @@ async function demarrer(type, usb = null) {   // usb : clé déjà autorisée (r
 async function arreter() {
   clearInterval(minuterie); minuterie = null;
   const s = source; source = null;
+  effacerSpectre();
   if (s) await s.fermer();
   majEtat();
 }
@@ -96,14 +97,14 @@ function accorderCentre(c) {      // les réglages de la clé passent l'un aprè
   R.centre = c;
   if (source?.reglerFrequence) enAccord = enAccord.then(() => source?.reglerFrequence(c)).catch(e => erreur(e.message));
   else source?.regler?.(c);
-  moyenne = null;
+  effacerSpectre();
 }
 
 // ---------------------------------------------------------------- accord
-function reglerFrequence(f) {
+function reglerFrequence(f, recentrer = true) {
   f = Math.round(Math.max(22e6, Math.min(1100e6, f)));
   const marge = R.taux * 0.4;
-  if (Math.abs(f - R.centre) > marge) accorderCentre(f - R.taux * 0.1);
+  if (recentrer && Math.abs(f - R.centre) > marge) accorderCentre(f - R.taux * 0.1);
   R.decalage = f - R.centre;
   majVfo();
 }
@@ -181,7 +182,7 @@ $("#b-cle").onclick = () => demarrer("cle");
 $("#b-sim").onclick = () => demarrer("sim");
 $("#b-arret").onclick = () => arreter();
 addEventListener("keydown", e => {
-  if (e.target.closest("input, select, textarea")) return;
+  if (e.defaultPrevented || e.target.closest("input, select, textarea")) return;
   const n = { ArrowUp: 1, ArrowDown: -1, ArrowRight: 1, ArrowLeft: -1, PageUp: 10, PageDown: -10 }[e.key];
   if (n) { e.preventDefault(); pas(n); }
 });
@@ -202,6 +203,66 @@ function erreur(t) { $("#statut").textContent = t; $("#statut").className = "err
 
 // ---------------------------------------------------------------- spectre et chute d'eau
 const cs = $("#spectre"), cw = $("#chute"), xs = cs.getContext("2d"), xw = cw.getContext("2d");
+function effacerSpectre() {
+  moyenne = dernierSpectre = null;
+  xw.clearRect(0, 0, cw.width, cw.height);
+}
+
+const separateur = document.createElement("div");
+separateur.tabIndex = 0;
+separateur.setAttribute("role", "separator");
+separateur.setAttribute("aria-orientation", "horizontal");
+separateur.setAttribute("aria-label", "Hauteur du spectre et de la chute d’eau");
+separateur.setAttribute("aria-valuemin", "10");
+separateur.setAttribute("aria-valuemax", "90");
+Object.assign(separateur.style, {
+  cursor: "ns-resize", touchAction: "none",
+  background: "linear-gradient(to bottom, #101a2b 3px, #48a6bb 3px 5px, #101a2b 5px)",
+});
+
+const ecran = cs.parentElement;
+// La taille des bitmaps ne doit pas déterminer la hauteur de la grille.
+ecran.style.contain = "size";
+const hauteurSeparateur = 8;
+cs.after(separateur);
+for (const canvas of [cs, cw]) {
+  Object.assign(canvas.style, { minWidth: "0", minHeight: "0", contain: "size" });
+}
+function repartirGraphiques(pourcentage) {
+  const partSpectre = Math.max(10, Math.min(90, pourcentage));
+  ecran.style.gridTemplateRows = `calc((100% - ${hauteurSeparateur}px) * ${partSpectre / 100}) ${hauteurSeparateur}px minmax(0, 1fr)`;
+  separateur.setAttribute("aria-valuenow", String(Math.round(partSpectre)));
+}
+repartirGraphiques(50);
+
+let glissement;
+separateur.addEventListener("pointerdown", e => {
+  if (e.button !== 0 || glissement) return;
+  e.preventDefault();
+  separateur.focus({ preventScroll: true });
+  separateur.setPointerCapture(e.pointerId);
+  glissement = {
+    id: e.pointerId,
+    decalage: e.clientY - separateur.getBoundingClientRect().top,
+  };
+});
+addEventListener("pointermove", e => {
+  if (glissement?.id !== e.pointerId) return;
+  const hauteurGraphiques = Math.max(1, ecran.clientHeight - hauteurSeparateur);
+  const y = e.clientY - ecran.getBoundingClientRect().top - glissement.decalage;
+  repartirGraphiques(100 * y / hauteurGraphiques);
+});
+for (const evenement of ["pointerup", "pointercancel", "lostpointercapture"]) {
+  addEventListener(evenement, e => {
+    if (glissement?.id === e.pointerId) glissement = undefined;
+  });
+}
+separateur.addEventListener("keydown", e => {
+  if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+  e.preventDefault();
+  const part = Number(separateur.getAttribute("aria-valuenow"));
+  repartirGraphiques(part + (e.key === "ArrowUp" ? -5 : 5));
+});
 const LUT = (() => {   // palette froide → chaude
   const pts = [[0, [8, 10, 30]], [0.3, [20, 60, 160]], [0.55, [0, 200, 230]], [0.75, [250, 220, 60]], [1, [255, 60, 40]]];
   const t = new Uint8ClampedArray(256 * 3);
@@ -214,9 +275,18 @@ const LUT = (() => {   // palette froide → chaude
 })();
 function dimensionner() {
   const r = devicePixelRatio || 1;
-  for (const c of [cs, cw]) { const w = Math.round(c.clientWidth * r), h = Math.round(c.clientHeight * r); if (c.width !== w || c.height !== h) { c.width = w; c.height = h; } }
+  for (const c of [cs, cw]) {
+    const w = Math.round(c.clientWidth * r), h = Math.round(c.clientHeight * r);
+    if (c.width === w && c.height === h) continue;
+    // Conserve les lignes récentes quand seule la hauteur du waterfall change.
+    const lignes = Math.min(h, c.height);
+    const historique = c === cw && c.width === w && w > 0 && lignes > 0
+      ? xw.getImageData(0, 0, w, lignes) : null;
+    c.width = w;
+    c.height = h;
+    if (historique) xw.putImageData(historique, 0, 0);
+  }
 }
-function xVersFreq(x) { return R.centre + (x / cs.clientWidth - 0.5) * R.taux; }
 function dessiner() {
   requestAnimationFrame(dessiner);
   dimensionner();
@@ -262,7 +332,11 @@ function dessiner() {
   xw.putImageData(img, 0, 0);
 }
 for (const c of [cs, cw]) {
-  c.addEventListener("click", e => { const f = xVersFreq(e.offsetX); reglerFrequence(Math.round(f / R.pas) * R.pas); });
+  c.addEventListener("click", e => {
+    const rect = c.getBoundingClientRect();
+    const position = (e.clientX - rect.left) / rect.width;
+    reglerFrequence(R.centre + (position - 0.5) * R.taux, false);
+  });
   c.addEventListener("wheel", e => { e.preventDefault(); pas(e.deltaY < 0 ? 1 : -1); }, { passive: false });
 }
 
