@@ -90,7 +90,6 @@ Activer le module, regarder le terminal. Après une modification du fichier : *M
 | `modules/memoires.py`          | piloter le récepteur (`regler_frequence`, `regler_mode`), fichier JSON |
 | `modules/enregistreur_wav.py`  | abonnement `audio`, fichier ouvert/fermé avec un verrou      |
 | `modules/journal_activite.py`  | deux sujets, file `deque` du DSP vers l'interface, CSV       |
-| `modules/adsb.py`              | sujet `iq`, décodage lourd dans un fil à part, `regler_taux`, fenêtre séparée (carte) |
 | `modules/_modele.py`           | modèle vide à copier                                         |
 
 ## Demander un module à une IA
@@ -106,3 +105,13 @@ rappels du bus rapides et sans widget, affichage par QTimer, tout libérer dans 
 code et interface en français. Donne le fichier complet, puis comment le tester avec --simulation.
 Le module doit : <décrire ici ce que le module doit faire>
 ```
+
+## Modules à télécharger
+
+Certains modules ne sont pas fournis avec l'application : on les télécharge sur
+<https://rtl-sdr.fr/sdr-modulaire.html#modules-a-venir> et on les place dans
+`~/.config/sdr-modulaire/modules/`, puis **Modules → Gérer les modules → Rescanner les dossiers**.
+
+| Fichier   | Ce qu'il fait |
+|-----------|---------------|
+| `adsb.py` | avions sur 1090 MHz (2,4 MS/s), carte radar dans une fenêtre séparée ; montre un décodage lourd dans un fil à part et `regler_taux` |
