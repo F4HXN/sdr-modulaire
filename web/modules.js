@@ -405,6 +405,7 @@ class ScannerMemoires {
   demarrer() {
     this.seuil = this.ctx.lire("seuil", -60); this.duree = this.ctx.lire("duree", 0.35); this.reprise = this.ctx.lire("reprise", 3);
     this.exclues = new Set(this.ctx.lire("exclues", []));
+    this.boucle = this.ctx.lire("boucle", true); this.tours = 0; this.fini = false;
     this.niveaux = []; this.actif = false; this.etat = "arret"; this.indice = -1; this.journal = [];
     this.charger();
     this.ctx.abonner("niveau", db => { this.niveaux.push([performance.now(), db]); if (this.niveaux.length > 200) this.niveaux.splice(0, 100); });
@@ -431,11 +432,14 @@ class ScannerMemoires {
     };
     this.ul = el("ul", { className: "journal scanner-liste" });
     this.ulJournal = el("ul", { className: "journal" });
+    const boucle = el("input", { type: "checkbox", checked: this.boucle });
+    boucle.onchange = () => { this.boucle = boucle.checked; this.ctx.ecrire("boucle", this.boucle); };
+    this.caseBoucle = el("label", { className: "petit scanner-boucle", title: "Reprendre au début après la dernière mémoire ; sinon un seul passage" }, boucle, " En boucle");
     this.remplir();
     this.minuterie = setInterval(() => this.pas(), 50);
     this.afficher();
     return el("div", {},
-      el("div", { className: "scanner-boutons" }, this.bMarche, passer, relire), this.statut,
+      el("div", { className: "scanner-boutons" }, this.bMarche, passer, relire), this.caseBoucle, this.statut,
       curseur("Seuil", "seuil", -110, -20, 1, v => `${v} dBFS`),
       curseur("Par canal", "duree", 0.2, 2, 0.05, v => `${v.toFixed(2)} s`),
       curseur("Reprise", "reprise", 1, 15, 1, v => `${v} s`),
@@ -452,13 +456,18 @@ class ScannerMemoires {
   basculer() {
     if (this.actif) { this.actif = false; this.etat = "arret"; }
     else if (!this.canaux().length) { this.statut.textContent = "Aucune mémoire à scanner : cochez-en au moins une."; return; }
-    else { this.actif = true; this.suivant(); }
+    else { this.actif = true; this.tours = 1; this.fini = false; this.indice = -1; this.suivant(); }
     this.afficher();
   }
   suivant() {
     const canaux = this.canaux();
     if (!canaux.length) { this.actif = false; this.etat = "arret"; return; }
-    this.indice = canaux.find(i => i > this.indice) ?? canaux[0];
+    const apres = canaux.find(i => i > this.indice);
+    if (apres === undefined && this.indice >= 0) {   // fin de la liste
+      if (!this.boucle) { this.actif = false; this.etat = "arret"; this.fini = true; this.afficher(); return; }
+      this.tours++;
+    }
+    this.indice = apres ?? canaux[0];
     const m = this.memoires[this.indice];
     this.ctx.reglerMode(m.mode); this.ctx.reglerFrequence(m.f);
     this.fAttendue = this.ctx.frequence(); this.tAccord = performance.now(); this.tSilence = null; this.etat = "mesure";
@@ -493,11 +502,11 @@ class ScannerMemoires {
   afficher() {
     this.bMarche.textContent = this.actif ? "■ Arrêter" : "▶ Scanner";
     for (const li of this.ul.children) li.classList.toggle("courant", this.actif && Number(li.dataset.i) === this.indice);
-    if (!this.actif) { this.statut.textContent = `Arrêté · ${this.canaux().length} mémoire(s) à scanner`; return; }
+    if (!this.actif) { this.statut.textContent = `${this.fini ? "Passage terminé" : "Arrêté"} · ${this.canaux().length} mémoire(s) à scanner`; return; }
     const m = this.memoires[this.indice], t = `${(m.f / 1e6).toFixed(4)} MHz ${m.mode} · ${m.nom}`;
     this.statut.textContent = this.etat === "signal"
       ? `● Signal sur ${t}${this.tSilence === null ? "" : ` · reprise dans ${Math.max(0, this.reprise - (performance.now() - this.tSilence) / 1000).toFixed(0)} s`}`
-      : `Balayage… ${t}`;
+      : `Balayage… ${t} · tour ${this.tours}`;
   }
   arreter() { clearInterval(this.minuterie); this.actif = false; }
 }
@@ -515,6 +524,7 @@ class ScannerFrequences {
       marge: l("marge", 10), duree: l("duree", 0.15), reprise: l("reprise", 3) });
     this.mesures = [];   // niveaux des derniers pas : leur médiane estime le bruit
     this.ignorees = new Set(l("ignorees", []));
+    this.boucle = l("boucle", true); this.tours = 0; this.fini = false;
     this.niveaux = []; this.actif = false; this.etat = "arret"; this.k = -1; this.f = null; this.journal = [];
     if (MODES_SCAN.includes(this.ctx.mode())) this.modeScan = this.ctx.mode();   // on part du mode du récepteur
     this.ctx.abonner("niveau", db => { this.niveaux.push([performance.now(), db]); if (this.niveaux.length > 200) this.niveaux.splice(0, 100); });
@@ -524,7 +534,7 @@ class ScannerFrequences {
       this.sauver(); if (this.bMarche) this.afficher();
     });
   }
-  sauver() { for (const c of ["debut", "fin", "pas", "marge", "duree", "reprise"]) this.ctx.ecrire(c, this[c]); this.ctx.ecrire("mode", this.modeScan); this.ctx.ecrire("ignorees", [...this.ignorees]); }
+  sauver() { for (const c of ["debut", "fin", "pas", "marge", "duree", "reprise"]) this.ctx.ecrire(c, this[c]); this.ctx.ecrire("mode", this.modeScan); this.ctx.ecrire("ignorees", [...this.ignorees]); this.ctx.ecrire("boucle", this.boucle); }
   plage() {
     const bas = Math.min(this.debut, this.fin), haut = Math.max(this.debut, this.fin);
     return [Math.floor(((haut - bas) * 1e6) / (this.pas * 1e3) + 1e-9) + 1, k => Math.round(bas * 1e6 + k * this.pas * 1e3)];
@@ -553,6 +563,9 @@ class ScannerFrequences {
     const passer = el("button", { type: "button", textContent: "Passer" }); passer.onclick = () => this.actif && this.suivant();
     const ignorer = el("button", { type: "button", textContent: "Ignorer", title: "Ne plus s'arrêter sur cette fréquence" });
     ignorer.onclick = () => { if (this.actif && this.f !== null) { this.ignorees.add(this.f); this.sauver(); this.suivant(); } };
+    const boucle = el("input", { type: "checkbox", checked: this.boucle });
+    boucle.onchange = () => { this.boucle = boucle.checked; this.sauver(); };
+    const caseBoucle = el("label", { className: "petit scanner-boucle", title: "Reprendre au début après la fin de la plage ; sinon un seul passage" }, boucle, " En boucle");
     this.barre = el("progress", { className: "scanner-progression", max: 1, value: 0 });
     this.statut = el("div", { className: "petit scanner-statut" });
     this.txtIgnorees = el("div", { className: "petit" });
@@ -565,19 +578,25 @@ class ScannerFrequences {
       el("label", { className: "scanner-reglage" }, el("span", { textContent: "Pas, mode" }), el("span", { className: "scanner-choix" }, pas, mode), el("span")),
       curseur("Marge", "marge", 3, 30, 1, v => `+${v} dB`), curseur("Par pas", "duree", 0.05, 1, 0.01, v => `${v.toFixed(2)} s`),
       curseur("Reprise", "reprise", 1, 15, 1, v => `${v} s`),
-      el("div", { className: "scanner-boutons" }, this.bMarche, passer, ignorer), this.barre, this.statut,
+      el("div", { className: "scanner-boutons" }, this.bMarche, passer, ignorer), caseBoucle, this.barre, this.statut,
       this.txtIgnorees, oublier, el("div", { className: "petit", textContent: "Derniers arrêts :" }), this.ulJournal);
   }
   basculer() {
     if (this.actif) { this.actif = false; this.etat = "arret"; this.afficher(); return; }
     const [n] = this.plage();
     if (this.debut === this.fin || n > 200000) { this.statut.textContent = "Plage invalide : début et fin différents, 200 000 pas au plus."; return; }
-    this.actif = true; this.mesures = []; this.ctx.reglerMode(this.modeScan); this.k = -1; this.suivant();
+    this.actif = true; this.mesures = []; this.tours = 1; this.fini = false; this.ctx.reglerMode(this.modeScan); this.k = -1; this.suivant();
   }
   suivant() {
     const [n, fDe] = this.plage();
     let trouve = false;
-    for (let i = 0; i < n; i++) { this.k = (this.k + 1) % n; if (!this.ignorees.has(fDe(this.k))) { trouve = true; break; } }
+    for (let i = 0; i < n; i++) {
+      if (this.k + 1 >= n) {   // fin de la plage
+        if (!this.boucle) { this.actif = false; this.etat = "arret"; this.fini = true; this.afficher(); return; }
+        this.tours++;
+      }
+      this.k = (this.k + 1) % n; if (!this.ignorees.has(fDe(this.k))) { trouve = true; break; }
+    }
     if (!trouve) { this.actif = false; this.etat = "arret"; this.afficher(); return; }
     this.f = fDe(this.k); this.ctx.reglerFrequence(this.f);
     this.fAttendue = this.ctx.frequence(); this.tAccord = performance.now(); this.tSilence = null; this.etat = "mesure";
@@ -623,10 +642,10 @@ class ScannerFrequences {
     this.txtIgnorees.textContent = ig.length ? `Ignorées : ${ig.slice(0, 12).map(f => (f / 1e6).toFixed(4)).join(", ")}${ig.length > 12 ? " …" : ""}` : "Aucune fréquence ignorée.";
     if (!this.actif) {
       const bas = Math.min(this.debut, this.fin), haut = Math.max(this.debut, this.fin);
-      this.statut.textContent = `Arrêté · ${bas.toFixed(4)} → ${haut.toFixed(4)} MHz, ${n} pas de ${this.pas} kHz en ${this.modeScan}`;
+      this.statut.textContent = `${this.fini ? "Passage terminé" : "Arrêté"} · ${bas.toFixed(4)} → ${haut.toFixed(4)} MHz, ${n} pas de ${this.pas} kHz en ${this.modeScan}`;
     } else if (this.etat === "signal") {
       this.statut.textContent = `● Signal sur ${(this.f / 1e6).toFixed(4)} MHz ${this.modeScan}${this.tSilence === null ? "" : ` · reprise dans ${Math.max(0, this.reprise - (performance.now() - this.tSilence) / 1000).toFixed(0)} s`}`;
-    } else this.statut.textContent = `Balayage… ${(this.f / 1e6).toFixed(4)} MHz (${this.k + 1}/${n})${this.bruit() === null ? " · mesure du bruit" : ` · bruit ${this.bruit().toFixed(0)} dBFS`}`;
+    } else this.statut.textContent = `Balayage… ${(this.f / 1e6).toFixed(4)} MHz (${this.k + 1}/${n}, tour ${this.tours})${this.bruit() === null ? " · mesure du bruit" : ` · bruit ${this.bruit().toFixed(0)} dBFS`}`;
   }
   arreter() { clearInterval(this.minuterie); this.actif = false; }
 }

@@ -17,7 +17,7 @@ from collections import deque
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QFormLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QSlider,
+    QCheckBox, QFormLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QSlider,
     QVBoxLayout, QWidget,
 )
 
@@ -48,6 +48,9 @@ class ScannerMemoires(Module):
         self.duree = float(r.get("duree", 0.35))      # temps passé sur chaque canal (s)
         self.reprise = float(r.get("reprise", 3.0))   # silence avant de reprendre (s)
         self.exclues = set(r.get("exclues", []))
+        self.boucle = bool(r.get("boucle", True))     # reprendre au début après la dernière mémoire
+        self.tours = 0
+        self.fini = False
         self.memoires = []
         self.niveaux: deque = deque(maxlen=200)       # (instant, dBFS), rempli par le thread DSP
         self.actif = False
@@ -75,7 +78,7 @@ class ScannerMemoires(Module):
         try:
             self.fichier_reglages.write_text(json.dumps({
                 "seuil": self.seuil, "duree": self.duree, "reprise": self.reprise,
-                "exclues": sorted(self.exclues)}), encoding="utf-8")
+                "exclues": sorted(self.exclues), "boucle": self.boucle}), encoding="utf-8")
         except OSError:
             pass
 
@@ -102,6 +105,11 @@ class ScannerMemoires(Module):
         for b in (self.b_marche, b_passer, b_relire):
             boutons.addWidget(b)
         lay.addLayout(boutons)
+        self.c_boucle = QCheckBox("En boucle")
+        self.c_boucle.setToolTip("Reprendre au début après la dernière mémoire ; sinon un seul passage")
+        self.c_boucle.setChecked(self.boucle)
+        self.c_boucle.toggled.connect(lambda v: self._regler("boucle", bool(v)))
+        lay.addWidget(self.c_boucle)
 
         self.statut = QLabel()
         self.statut.setWordWrap(True)
@@ -185,6 +193,8 @@ class ScannerMemoires(Module):
                 self.statut.setText("Aucune mémoire à scanner : cochez-en au moins une.")
                 return
             self.actif = True
+            self.tours, self.fini = 1, False
+            self.indice = -1
             self.suivant()
         self._afficher()
 
@@ -198,6 +208,12 @@ class ScannerMemoires(Module):
             self.actif, self.etat = False, "arret"
             return
         apres = [i for i in canaux if i > self.indice]
+        if not apres and self.indice >= 0:           # fin de la liste
+            if not self.boucle:
+                self.actif, self.etat, self.fini = False, "arret", True
+                self._afficher()
+                return
+            self.tours += 1
         self.indice = apres[0] if apres else canaux[0]
         m = self.memoires[self.indice]
         self.ctx.regler_mode(m["mode"])
@@ -257,7 +273,8 @@ class ScannerMemoires(Module):
         if garder_statut:
             return
         if not self.actif:
-            self.statut.setText(f"Arrêté · {len(self.canaux())} mémoire(s) à scanner")
+            fin = "Passage terminé · " if self.fini else "Arrêté · "
+            self.statut.setText(f"{fin}{len(self.canaux())} mémoire(s) à scanner")
             return
         m = self.memoires[self.indice]
         texte = f"{m['frequence'] / 1e6:.4f} MHz {m['mode']} · {m['nom']}"
@@ -265,7 +282,7 @@ class ScannerMemoires(Module):
             reste = "" if self.t_silence is None else f" · reprise dans {max(0, self.reprise - (time.monotonic() - self.t_silence)):.0f} s"
             self.statut.setText(f"● Signal sur {texte}{reste}")
         else:
-            self.statut.setText(f"Balayage… {texte}")
+            self.statut.setText(f"Balayage… {texte} · tour {self.tours}")
 
     def arreter(self):
         self.actif = False

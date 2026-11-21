@@ -18,7 +18,7 @@ from collections import deque
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QListWidget, QProgressBar,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QListWidget, QProgressBar,
     QPushButton, QSlider, QVBoxLayout, QWidget,
 )
 
@@ -48,6 +48,9 @@ class ScannerFrequences(Module):
         self.duree = float(r.get("duree", 0.15))        # s par pas, après stabilisation
         self.reprise = float(r.get("reprise", 3.0))
         self.ignorees = set(int(f) for f in r.get("ignorees", []))
+        self.boucle = bool(r.get("boucle", True))     # reprendre au début après la fin de la plage
+        self.tours = 0
+        self.fini = False
         self.niveaux: deque = deque(maxlen=200)          # (instant, dBFS), rempli par le thread DSP
         self.actif = False
         self.etat = "arret"
@@ -79,7 +82,7 @@ class ScannerFrequences(Module):
             self.fichier.write_text(json.dumps({
                 "debut": self.debut, "fin": self.fin, "pas": self.pas, "mode": self.mode_scan,
                 "marge": self.marge, "duree": self.duree, "reprise": self.reprise,
-                "ignorees": sorted(self.ignorees)}), encoding="utf-8")
+                "ignorees": sorted(self.ignorees), "boucle": self.boucle}), encoding="utf-8")
         except OSError:
             pass
 
@@ -135,6 +138,11 @@ class ScannerFrequences(Module):
         for b in (self.b_marche, b_passer, b_ignorer):
             boutons.addWidget(b)
         lay.addLayout(boutons)
+        self.c_boucle = QCheckBox("En boucle")
+        self.c_boucle.setToolTip("Reprendre au début après la fin de la plage ; sinon un seul passage")
+        self.c_boucle.setChecked(self.boucle)
+        self.c_boucle.toggled.connect(self._boucle)
+        lay.addWidget(self.c_boucle)
         self.progression = QProgressBar()
         self.progression.setTextVisible(False)
         self.progression.setMaximumHeight(8)
@@ -186,6 +194,10 @@ class ScannerFrequences(Module):
         self.sauver()
         self._afficher()
 
+    def _boucle(self, v):
+        self.boucle = bool(v)
+        self.sauver()
+
     def _effacer_ignorees(self):
         self.ignorees.clear()
         self.sauver()
@@ -202,6 +214,7 @@ class ScannerFrequences(Module):
                 return
             self.actif = True
             self.mesures.clear()
+            self.tours, self.fini = 1, False
             self.ctx.regler_mode(self.mode_scan)
             self.k = -1
             self.suivant()
@@ -220,6 +233,12 @@ class ScannerFrequences(Module):
     def suivant(self):
         n, f_de = self.frequences()
         for _ in range(n):                    # pas suivant, en sautant les fréquences ignorées
+            if self.k + 1 >= n:               # fin de la plage
+                if not self.boucle:
+                    self.actif, self.etat, self.fini = False, "arret", True
+                    self._afficher()
+                    return
+                self.tours += 1
             self.k = (self.k + 1) % n
             if f_de(self.k) not in self.ignorees:
                 break
@@ -294,14 +313,14 @@ class ScannerFrequences(Module):
             + (" …" if len(self.ignorees) > 12 else "") if self.ignorees else "Aucune fréquence ignorée.")
         if not self.actif:
             bas, haut = sorted((self.debut, self.fin))
-            self.statut.setText(f"Arrêté · {bas:.4f} → {haut:.4f} MHz, {n} pas de {self.pas:g} kHz en {self.mode_scan}")
+            self.statut.setText(f"{'Passage terminé' if self.fini else 'Arrêté'} · {bas:.4f} → {haut:.4f} MHz, {n} pas de {self.pas:g} kHz en {self.mode_scan}")
         elif self.etat == "signal":
             reste = "" if self.t_silence is None else \
                 f" · reprise dans {max(0.0, self.reprise - (time.monotonic() - self.t_silence)):.0f} s"
             self.statut.setText(f"● Signal sur {self.f / 1e6:.4f} MHz {self.mode_scan}{reste}")
         else:
             bruit = self.bruit()
-            self.statut.setText(f"Balayage… {self.f / 1e6:.4f} MHz ({self.k + 1}/{n})"
+            self.statut.setText(f"Balayage… {self.f / 1e6:.4f} MHz ({self.k + 1}/{n}, tour {self.tours})"
                                 + (" · mesure du bruit" if bruit is None else f" · bruit {bruit:.0f} dBFS"))
 
     def arreter(self):
