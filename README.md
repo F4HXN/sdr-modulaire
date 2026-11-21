@@ -63,7 +63,7 @@ sdrmod/
   ui/              fenêtre, waterfall, afficheur, panneau, dialogue modules
 modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite.py,
                    capteurs_433.py, stereo_rds_fm.py
-modules-a-telecharger/  adsb.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
+modules-a-telecharger/  adsb.py, scanner_memoires.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
 tests/             test_dsp.py, test_interface.py
 ```
 

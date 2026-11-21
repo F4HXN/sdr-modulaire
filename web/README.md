@@ -9,7 +9,7 @@ le traitement dans le navigateur. En ligne : https://rtl-sdr.fr/sdr-web.html
 | `dsp.js`        | NCO, filtres décimants à état, FFT, démodulateurs, AGC      | MIT |
 | `audio.js`      | sortie audio (AudioWorklet, tampon circulaire)              | MIT |
 | `simulation.js` | source simulée (émetteurs fictifs)                          | MIT |
-| `modules.js`    | modules à chaud : S-mètre, mémoires, enregistreur WAV, journal, capteurs 433 MHz, stéréo et RDS, ADS-B | MIT |
+| `modules.js`    | modules à chaud : S-mètre, mémoires, enregistreur WAV, journal, capteurs 433 MHz, stéréo et RDS, ADS-B, scanner de mémoires | MIT |
 | `capteurs433.js` | décodeur OOK des sondes Nexus-T, Nexus-TH et Rubicson (433,92 MHz) | MIT |
 | `adsb.js`       | ADS-B : démodulation Mode S, CRC-24, positions CPR, suivi des avions | MIT |
 | `carte-adsb.js` | carte radar des avions (canevas)                              | MIT |

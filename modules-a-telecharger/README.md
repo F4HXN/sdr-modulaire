@@ -10,3 +10,4 @@ Ils sont aussi téléchargeables sur <https://rtl-sdr.fr/sdr-modulaire.html#modu
 | Fichier   | Ce qu'il fait |
 |-----------|---------------|
 | `adsb.py` | avions sur 1090 MHz (2,4 MS/s, gain maximal) : carte radar mondiale et tableau dans une fenêtre séparée |
+| `scanner_memoires.py` | balaie les fréquences du module Mémoires, s'arrête sur un signal et reprend après un silence |

@@ -20,6 +20,11 @@ import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261121-monde";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
 
+const MEMOIRES_DEFAUT = [
+  { nom: "APRS", f: 144_800_000, mode: "NFM" }, { nom: "Appel FM 2 m", f: 145_500_000, mode: "NFM" },
+  { nom: "Appel FM 70 cm", f: 433_500_000, mode: "NFM" }, { nom: "Radio FM (exemple)", f: 87_800_000, mode: "WFM" },
+];
+
 class SMetre {
   static nom = "S-mètre";
   static description = "Niveau du canal en dBFS, avec maintien de crête.";
@@ -43,10 +48,7 @@ class Memoires {
   static nom = "Mémoires";
   static description = "Fréquences favorites : ajouter la fréquence courante, rappeler d'un clic.";
   demarrer() {
-    this.liste = this.ctx.lire("liste", [
-      { nom: "APRS", f: 144_800_000, mode: "NFM" }, { nom: "Appel FM 2 m", f: 145_500_000, mode: "NFM" },
-      { nom: "Appel FM 70 cm", f: 433_500_000, mode: "NFM" }, { nom: "Radio FM (exemple)", f: 87_800_000, mode: "WFM" },
-    ]);
+    this.liste = this.ctx.lire("liste", MEMOIRES_DEFAUT);
   }
   creerPanneau() {
     this.ul = el("ul", { className: "memoires" });
@@ -393,4 +395,111 @@ class ADSB {
   arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB];
+// Scanner : relit la liste du module Mémoires, s'arrête sur un signal, reprend après un silence.
+const HYSTERESIS = 3, STABILISATION = 150;   // dB ; ms ignorées après chaque changement de fréquence
+
+class ScannerMemoires {
+  static nom = "Scanner de mémoires";
+  static description = "Parcourt les mémoires, s'arrête sur un signal et reprend quand il se tait.";
+
+  demarrer() {
+    this.seuil = this.ctx.lire("seuil", -60); this.duree = this.ctx.lire("duree", 0.35); this.reprise = this.ctx.lire("reprise", 3);
+    this.exclues = new Set(this.ctx.lire("exclues", []));
+    this.niveaux = []; this.actif = false; this.etat = "arret"; this.indice = -1; this.journal = [];
+    this.charger();
+    this.ctx.abonner("niveau", db => { this.niveaux.push([performance.now(), db]); if (this.niveaux.length > 200) this.niveaux.splice(0, 100); });
+  }
+  charger() {
+    let liste;
+    try { liste = JSON.parse(localStorage.getItem("sdr-web/Mémoires/liste")); } catch { liste = null; }
+    this.memoires = [...(Array.isArray(liste) ? liste : MEMOIRES_DEFAUT)].sort((a, b) => a.f - b.f);
+  }
+  cle(m) { return `${m.f}/${m.mode}`; }
+  canaux() { return this.memoires.map((m, i) => i).filter(i => !this.exclues.has(this.cle(this.memoires[i]))); }
+
+  creerPanneau() {
+    this.bMarche = el("button", { type: "button" }); this.bMarche.onclick = () => this.basculer();
+    const passer = el("button", { type: "button", textContent: "Passer", title: "Quitter le canal actuel et continuer" }); passer.onclick = () => this.actif && this.suivant();
+    const relire = el("button", { type: "button", textContent: "Relire", title: "Relire la liste du module Mémoires" });
+    relire.onclick = () => { this.charger(); this.indice = -1; this.remplir(); };
+    this.statut = el("div", { className: "petit scanner-statut" });
+    const curseur = (titre, cle, min, max, pas, texte) => {
+      const val = el("span", { className: "petit", textContent: texte(this[cle]) });
+      const c = el("input", { type: "range", min, max, step: pas, value: this[cle] });
+      c.oninput = () => { this[cle] = Number(c.value); val.textContent = texte(this[cle]); this.ctx.ecrire(cle, this[cle]); };
+      return el("label", { className: "scanner-reglage" }, el("span", { textContent: titre }), c, val);
+    };
+    this.ul = el("ul", { className: "journal scanner-liste" });
+    this.ulJournal = el("ul", { className: "journal" });
+    this.remplir();
+    this.minuterie = setInterval(() => this.pas(), 50);
+    this.afficher();
+    return el("div", {},
+      el("div", { className: "scanner-boutons" }, this.bMarche, passer, relire), this.statut,
+      curseur("Seuil", "seuil", -110, -20, 1, v => `${v} dBFS`),
+      curseur("Par canal", "duree", 0.2, 2, 0.05, v => `${v.toFixed(2)} s`),
+      curseur("Reprise", "reprise", 1, 15, 1, v => `${v} s`),
+      this.ul, el("div", { className: "petit", textContent: "Derniers arrêts :" }), this.ulJournal);
+  }
+  remplir() {
+    this.ul.replaceChildren(...this.memoires.map((m, i) => {
+      const c = el("input", { type: "checkbox", checked: !this.exclues.has(this.cle(m)), title: "Décocher pour sauter cette mémoire" });
+      c.onchange = () => { c.checked ? this.exclues.delete(this.cle(m)) : this.exclues.add(this.cle(m)); this.ctx.ecrire("exclues", [...this.exclues]); };
+      const li = el("li", {}, el("label", {}, c, ` ${(m.f / 1e6).toFixed(4)} ${m.mode} · ${m.nom}`)); li.dataset.i = i;
+      return li;
+    }));
+  }
+  basculer() {
+    if (this.actif) { this.actif = false; this.etat = "arret"; }
+    else if (!this.canaux().length) { this.statut.textContent = "Aucune mémoire à scanner : cochez-en au moins une."; return; }
+    else { this.actif = true; this.suivant(); }
+    this.afficher();
+  }
+  suivant() {
+    const canaux = this.canaux();
+    if (!canaux.length) { this.actif = false; this.etat = "arret"; return; }
+    this.indice = canaux.find(i => i > this.indice) ?? canaux[0];
+    const m = this.memoires[this.indice];
+    this.ctx.reglerMode(m.mode); this.ctx.reglerFrequence(m.f);
+    this.fAttendue = this.ctx.frequence(); this.tAccord = performance.now(); this.tSilence = null; this.etat = "mesure";
+    this.afficher();
+  }
+  niveauDepuis(t) { let m = null; for (const [ti, db] of this.niveaux) if (ti >= t) m = m === null ? db : Math.max(m, db); return m; }
+  pas() {
+    if (!this.actif) return;
+    const maintenant = performance.now();
+    if (Math.abs(this.ctx.frequence() - this.fAttendue) > 1) {   // fréquence changée à la main
+      this.actif = false; this.etat = "arret"; this.afficher(); this.statut.textContent = "Scanner arrêté : fréquence changée à la main."; return;
+    }
+    if (this.etat === "mesure") {
+      if (maintenant - this.tAccord < STABILISATION + this.duree * 1000) return;
+      const db = this.niveauDepuis(this.tAccord + STABILISATION);
+      if (db !== null && db > this.seuil) {
+        this.etat = "signal";
+        const m = this.memoires[this.indice];
+        this.journal.unshift(`${new Date().toLocaleTimeString("fr-FR")}  ${(m.f / 1e6).toFixed(4)}  ${m.nom}  ${db.toFixed(0)} dBFS`);
+        this.journal.length = Math.min(this.journal.length, 20);
+        this.ulJournal.replaceChildren(...this.journal.map(t => el("li", { textContent: t })));
+      } else this.suivant();
+    } else if (this.etat === "signal") {
+      const db = this.niveauDepuis(maintenant - 300);
+      if (db === null) { /* pas de mesure récente : on ne conclut rien */ }
+      else if (db > this.seuil - HYSTERESIS) this.tSilence = null;
+      else if (this.tSilence === null) this.tSilence = maintenant;
+      else if (maintenant - this.tSilence >= this.reprise * 1000) this.suivant();
+    }
+    this.afficher();
+  }
+  afficher() {
+    this.bMarche.textContent = this.actif ? "■ Arrêter" : "▶ Scanner";
+    for (const li of this.ul.children) li.classList.toggle("courant", this.actif && Number(li.dataset.i) === this.indice);
+    if (!this.actif) { this.statut.textContent = `Arrêté · ${this.canaux().length} mémoire(s) à scanner`; return; }
+    const m = this.memoires[this.indice], t = `${(m.f / 1e6).toFixed(4)} MHz ${m.mode} · ${m.nom}`;
+    this.statut.textContent = this.etat === "signal"
+      ? `● Signal sur ${t}${this.tSilence === null ? "" : ` · reprise dans ${Math.max(0, this.reprise - (performance.now() - this.tSilence) / 1000).toFixed(0)} s`}`
+      : `Balayage… ${t}`;
+  }
+  arreter() { clearInterval(this.minuterie); this.actif = false; }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires];
