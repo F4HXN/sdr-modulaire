@@ -2,7 +2,7 @@
 // SDR Web : récepteur SDR dans le navigateur (WebUSB), version web de SDR Modulaire.
 
 import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261121-fm-stereo";
-import { CleRtlSdr } from "./rtlsdr.js";
+import { CleRtlSdr } from "./rtlsdr.js?v=20261121-r820t";
 import { SourceSimulation } from "./simulation.js?v=20261121-adsb";
 import { MODULES } from "./modules.js?v=20261121-centrage";
 
@@ -110,7 +110,8 @@ function accorderCentre(c) {      // les réglages de la clé passent l'un aprè
 
 // ---------------------------------------------------------------- accord
 function reglerFrequence(f, recentrer = true) {
-  f = Math.round(Math.max(22e6, Math.min(1100e6, f)));
+  const [mini, maxi] = source?.plage || [22e6, 1100e6];   // plage du tuner
+  f = Math.round(Math.max(mini, Math.min(maxi, f)));
   const marge = R.taux * 0.4;
   if (recentrer && Math.abs(f - R.centre) > marge) accorderCentre(f - R.taux * 0.1);
   R.decalage = f - R.centre;

@@ -5,7 +5,7 @@ le traitement dans le navigateur. En ligne : https://rtl-sdr.fr/sdr-web.html
 
 | Fichier         | Rôle                                                        | Licence |
 |-----------------|-------------------------------------------------------------|---------|
-| `rtlsdr.js`     | pilote WebUSB : puce RTL2832U + tuner Fitipower FC0013 (portage de librtlsdr) | GPL-2.0-or-later |
+| `rtlsdr.js`     | pilote WebUSB : puce RTL2832U + tuners FC0013, R820T/R820T2, R828D et Blog V4 (portage de librtlsdr) | GPL-2.0-or-later |
 | `dsp.js`        | NCO, filtres décimants à état, FFT, démodulateurs, AGC      | MIT |
 | `audio.js`      | sortie audio (AudioWorklet, tampon circulaire)              | MIT |
 | `simulation.js` | source simulée (émetteurs fictifs)                          | MIT |
