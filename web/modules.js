@@ -502,4 +502,124 @@ class ScannerMemoires {
   arreter() { clearInterval(this.minuterie); this.actif = false; }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires];
+// Scanner de fréquences : plage début–fin avec un pas, arrêt sur signal, reprise après un silence.
+const PAS_SCAN = [5, 6.25, 8.33, 10, 12.5, 20, 25, 50, 100, 200], MODES_SCAN = ["NFM", "AM", "WFM", "USB", "LSB", "CW"];
+
+class ScannerFrequences {
+  static nom = "Scanner de fréquences";
+  static description = "Balaye une plage début–fin avec un pas, s'arrête sur un signal qui dépasse le bruit et reprend après un silence.";
+
+  demarrer() {
+    const l = (c, d) => this.ctx.lire(c, d);
+    Object.assign(this, { debut: l("debut", 144), fin: l("fin", 146), pas: l("pas", 12.5), modeScan: l("mode", "NFM"),
+      marge: l("marge", 10), duree: l("duree", 0.15), reprise: l("reprise", 3) });
+    this.mesures = [];   // niveaux des derniers pas : leur médiane estime le bruit
+    this.ignorees = new Set(l("ignorees", []));
+    this.niveaux = []; this.actif = false; this.etat = "arret"; this.k = -1; this.f = null; this.journal = [];
+    this.ctx.abonner("niveau", db => { this.niveaux.push([performance.now(), db]); if (this.niveaux.length > 200) this.niveaux.splice(0, 100); });
+  }
+  sauver() { for (const c of ["debut", "fin", "pas", "marge", "duree", "reprise"]) this.ctx.ecrire(c, this[c]); this.ctx.ecrire("mode", this.modeScan); this.ctx.ecrire("ignorees", [...this.ignorees]); }
+  plage() {
+    const bas = Math.min(this.debut, this.fin), haut = Math.max(this.debut, this.fin);
+    return [Math.floor(((haut - bas) * 1e6) / (this.pas * 1e3) + 1e-9) + 1, k => Math.round(bas * 1e6 + k * this.pas * 1e3)];
+  }
+
+  creerPanneau() {
+    const nombre = (cle, titre) => {
+      const e = el("input", { type: "number", min: 0, max: 6000, step: 0.0125, value: this[cle] });
+      e.onchange = () => { this[cle] = Number(e.value) || 0; this.sauver(); this.afficher(); };
+      return el("label", { className: "scanner-reglage" }, el("span", { textContent: titre }), e, el("span", { className: "petit", textContent: "MHz" }));
+    };
+    const pas = el("select", {}, ...PAS_SCAN.map(p => new Option(`${p} kHz`, p, false, p === this.pas)));
+    pas.onchange = () => { this.pas = Number(pas.value); this.sauver(); this.afficher(); };
+    const mode = el("select", {}, ...MODES_SCAN.map(m => new Option(m, m, false, m === this.modeScan)));
+    mode.onchange = () => { this.modeScan = mode.value; this.sauver(); this.afficher(); };
+    const curseur = (titre, cle, min, max, p, texte) => {
+      const val = el("span", { className: "petit", textContent: texte(this[cle]) });
+      const c = el("input", { type: "range", min, max, step: p, value: this[cle] });
+      c.oninput = () => { this[cle] = Number(c.value); val.textContent = texte(this[cle]); this.sauver(); };
+      return el("label", { className: "scanner-reglage" }, el("span", { textContent: titre }), c, val);
+    };
+    this.bMarche = el("button", { type: "button" }); this.bMarche.onclick = () => this.basculer();
+    const passer = el("button", { type: "button", textContent: "Passer" }); passer.onclick = () => this.actif && this.suivant();
+    const ignorer = el("button", { type: "button", textContent: "Ignorer", title: "Ne plus s'arrêter sur cette fréquence" });
+    ignorer.onclick = () => { if (this.actif && this.f !== null) { this.ignorees.add(this.f); this.sauver(); this.suivant(); } };
+    this.barre = el("progress", { className: "scanner-progression", max: 1, value: 0 });
+    this.statut = el("div", { className: "petit scanner-statut" });
+    this.txtIgnorees = el("div", { className: "petit" });
+    const oublier = el("button", { type: "button", textContent: "Oublier les fréquences ignorées" });
+    oublier.onclick = () => { this.ignorees.clear(); this.sauver(); this.afficher(); };
+    this.ulJournal = el("ul", { className: "journal" });
+    this.minuterie = setInterval(() => this.tic(), 30);
+    this.afficher();
+    return el("div", {}, nombre("debut", "Début"), nombre("fin", "Fin"),
+      el("label", { className: "scanner-reglage" }, el("span", { textContent: "Pas, mode" }), el("span", { className: "scanner-choix" }, pas, mode), el("span")),
+      curseur("Marge", "marge", 3, 30, 1, v => `+${v} dB`), curseur("Par pas", "duree", 0.05, 1, 0.01, v => `${v.toFixed(2)} s`),
+      curseur("Reprise", "reprise", 1, 15, 1, v => `${v} s`),
+      el("div", { className: "scanner-boutons" }, this.bMarche, passer, ignorer), this.barre, this.statut,
+      this.txtIgnorees, oublier, el("div", { className: "petit", textContent: "Derniers arrêts :" }), this.ulJournal);
+  }
+  basculer() {
+    if (this.actif) { this.actif = false; this.etat = "arret"; this.afficher(); return; }
+    const [n] = this.plage();
+    if (this.debut === this.fin || n > 200000) { this.statut.textContent = "Plage invalide : début et fin différents, 200 000 pas au plus."; return; }
+    this.actif = true; this.mesures = []; this.ctx.reglerMode(this.modeScan); this.k = -1; this.suivant();
+  }
+  suivant() {
+    const [n, fDe] = this.plage();
+    let trouve = false;
+    for (let i = 0; i < n; i++) { this.k = (this.k + 1) % n; if (!this.ignorees.has(fDe(this.k))) { trouve = true; break; } }
+    if (!trouve) { this.actif = false; this.etat = "arret"; this.afficher(); return; }
+    this.f = fDe(this.k); this.ctx.reglerFrequence(this.f);
+    this.fAttendue = this.ctx.frequence(); this.tAccord = performance.now(); this.tSilence = null; this.etat = "mesure";
+    this.afficher();
+  }
+  bruit() {   // médiane des derniers pas (presque tous vides) ; rien tant qu'il y en a moins de 5
+    if (this.mesures.length < 5) return null;
+    const t = [...this.mesures].sort((x, y) => x - y); return t[t.length >> 1];
+  }
+  niveauDepuis(t) { let m = null; for (const [ti, db] of this.niveaux) if (ti >= t) m = m === null ? db : Math.max(m, db); return m; }
+  tic() {
+    if (!this.actif) return;
+    const maintenant = performance.now();
+    if (Math.abs(this.ctx.frequence() - this.fAttendue) > 1) {
+      this.actif = false; this.etat = "arret"; this.afficher(); this.statut.textContent = "Scanner arrêté : fréquence changée à la main."; return;
+    }
+    if (this.etat === "mesure") {
+      if (maintenant - this.tAccord < STABILISATION + this.duree * 1000) return;
+      const db = this.niveauDepuis(this.tAccord + STABILISATION);
+      if (db === null) return;
+      const bruit = this.bruit();
+      this.mesures.push(db); if (this.mesures.length > 60) this.mesures.shift();
+      if (bruit !== null && db > bruit + this.marge) {
+        this.etat = "signal";
+        this.journal.unshift(`${new Date().toLocaleTimeString("fr-FR")}  ${(this.f / 1e6).toFixed(4)} MHz  ${db.toFixed(0)} dBFS`);
+        this.journal.length = Math.min(this.journal.length, 30);
+        this.ulJournal.replaceChildren(...this.journal.map(t => el("li", { textContent: t })));
+      } else { this.suivant(); return; }
+    } else if (this.etat === "signal") {
+      const db = this.niveauDepuis(maintenant - 300);
+      if (db === null) { /* pas de mesure récente */ }
+      else if (db > (this.bruit() ?? -200) + this.marge - HYSTERESIS) this.tSilence = null;
+      else if (this.tSilence === null) this.tSilence = maintenant;
+      else if (maintenant - this.tSilence >= this.reprise * 1000) { this.suivant(); return; }
+    }
+    this.afficher();
+  }
+  afficher() {
+    const [n] = this.plage();
+    this.bMarche.textContent = this.actif ? "■ Arrêter" : "▶ Scanner";
+    this.barre.max = Math.max(1, n - 1); this.barre.value = this.actif ? Math.max(0, this.k) : 0;
+    const ig = [...this.ignorees].sort((a, b) => a - b);
+    this.txtIgnorees.textContent = ig.length ? `Ignorées : ${ig.slice(0, 12).map(f => (f / 1e6).toFixed(4)).join(", ")}${ig.length > 12 ? " …" : ""}` : "Aucune fréquence ignorée.";
+    if (!this.actif) {
+      const bas = Math.min(this.debut, this.fin), haut = Math.max(this.debut, this.fin);
+      this.statut.textContent = `Arrêté · ${bas.toFixed(4)} → ${haut.toFixed(4)} MHz, ${n} pas de ${this.pas} kHz en ${this.modeScan}`;
+    } else if (this.etat === "signal") {
+      this.statut.textContent = `● Signal sur ${(this.f / 1e6).toFixed(4)} MHz ${this.modeScan}${this.tSilence === null ? "" : ` · reprise dans ${Math.max(0, this.reprise - (performance.now() - this.tSilence) / 1000).toFixed(0)} s`}`;
+    } else this.statut.textContent = `Balayage… ${(this.f / 1e6).toFixed(4)} MHz (${this.k + 1}/${n})${this.bruit() === null ? " · mesure du bruit" : ` · bruit ${this.bruit().toFixed(0)} dBFS`}`;
+  }
+  arreter() { clearInterval(this.minuterie); this.actif = false; }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences];

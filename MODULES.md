@@ -118,3 +118,4 @@ Certains modules ne sont pas fournis avec l'application (dossier `modules-a-tele
 |-----------|---------------|
 | `adsb.py` | avions sur 1090 MHz (2,4 MS/s), carte radar dans une fenêtre séparée ; montre un décodage lourd dans un fil à part et `regler_taux` |
 | `scanner_memoires.py` | balayage des mémoires ; montre une machine à états menée par un `QTimer` qui pilote le récepteur |
+| `scanner_frequences.py` | balayage d'une plage ; montre un seuil relatif au bruit (médiane des derniers pas) |
