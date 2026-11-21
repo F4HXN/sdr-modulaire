@@ -67,6 +67,9 @@ tests/             test_dsp.py, test_interface.py
 
 ## Trois niveaux d'extension
 
+Guide complet pour écrire un module (règles, bus, contexte, texte à donner à une IA) :
+[MODULES.md](MODULES.md). Modèle à copier : `modules/_modele.py`.
+
 **1. Ajouter un module** (le plus courant) : déposer un `.py` dans `modules/` ou
 `~/.config/sdr-modulaire/modules/`, puis *Modules → Gérer les modules → Rescanner*.
 Cocher pour l'ajouter, décocher (ou fermer son panneau) pour le retirer.
