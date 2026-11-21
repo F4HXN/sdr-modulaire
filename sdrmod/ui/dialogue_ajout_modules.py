@@ -97,7 +97,7 @@ class DialogueAjoutModules(QDialog):
 
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel("Modules proposés sur <b>rtl-sdr.fr</b>. Ils sont installés dans "
-                             f"<code>{DOSSIER_UTILISATEUR}</code>."))
+                             f"<code>{str(DOSSIER_UTILISATEUR).replace(str(Path.home()), '~', 1)}</code>."))
         self.tableau = QTableWidget(0, 4)
         self.tableau.setHorizontalHeaderLabels(["Module", "Description", "État", ""])
         self.tableau.verticalHeader().hide()

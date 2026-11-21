@@ -5,6 +5,7 @@ import logging
 import sys
 from pathlib import Path
 
+from PySide6.QtCore import QLibraryInfo, QLocale, QTranslator
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import QApplication
 
@@ -23,6 +24,13 @@ def appliquer_theme_sombre(app: QApplication) -> None:
     app.setPalette(p)
 
 
+def charger_traductions(app: QApplication) -> None:
+    """Boutons standard de Qt (Fermer, Annuler, Oui…) dans la langue du système."""
+    trad = QTranslator(app)
+    if trad.load(QLocale.system(), "qtbase", "_", QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)):
+        app.installTranslator(trad)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="sdrmod", description="Récepteur SDR modulaire")
     ap.add_argument("--debug", action="store_true", help="journal détaillé")
@@ -37,6 +45,7 @@ def main() -> int:
     app.setWindowIcon(QIcon(str(Path(__file__).parent / "ressources" / "icone.svg")))
     app.setStyle("Fusion")
     appliquer_theme_sombre(app)
+    charger_traductions(app)
 
     from .ui.fenetre import FenetrePrincipale
     fenetre = FenetrePrincipale()
