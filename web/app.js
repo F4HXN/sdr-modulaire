@@ -4,7 +4,7 @@
 import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261121-fm-stereo";
 import { CleRtlSdr } from "./rtlsdr.js";
 import { SourceSimulation } from "./simulation.js?v=20261121-adsb";
-import { MODULES } from "./modules.js?v=20261121-adsb";
+import { MODULES } from "./modules.js?v=20261121-monde";
 
 const $ = s => document.querySelector(s);
 const PAS = [100, 1000, 2500, 5000, 6250, 8330, 10000, 12500, 25000, 100000, 1000000];
@@ -354,6 +354,14 @@ const contexte = module => ({
   abonner(sujet, f) { f.module = module; abonnes[sujet].add(f); module._abos.push([sujet, f]); },
   frequence, mode: () => R.mode, reglerFrequence, reglerMode,
   taux: () => R.taux,
+  gains: () => source?.gains?.() || [],
+  reglerGain(g) {             // g en dB, ou null pour le gain automatique
+    const liste = source?.gains?.() || [];
+    if (g !== null && !liste.length) return;
+    $("#gain-auto").checked = g === null;
+    if (g !== null) $("#gain").value = liste.reduce((m, x, i) => Math.abs(x - g) < Math.abs(liste[m] - g) ? i : m, 0);
+    appliquerGain();
+  },
   async reglerTaux(t) {
     if (!TAUX.includes(t) || t === R.taux) return;
     R.taux = t; $("#taux").value = t;

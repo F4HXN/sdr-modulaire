@@ -3,12 +3,23 @@
 // avions orientés selon leur cap avec leur trace. Molette : zoom ; glisser : déplacer ;
 // clic : choisir un avion ; double-clic : recentrer.
 
-import { CARTE } from "./carte-europe.js";
 import { distanceKm } from "./adsb.js?v=20261121-adsb";
 
 const KM_DEG = 111.32;
 const decoder = l => { const p = []; let x = 0, y = 0; for (let i = 0; i < l.length; i += 2) { x += l[i]; y += l[i + 1]; p.push([x / 100, y / 100]); } return p; };
-const COTES = CARTE.cotes.map(decoder), FRONTIERES = CARTE.frontieres.map(decoder);
+// Fond de carte mondial (~230 Ko) : chargé seulement à la première ouverture de la carte.
+let COTES = [], FRONTIERES = [], chargement = null;
+function chargerFond() {
+  chargement ??= import("./carte-monde.js").then(({ CARTE }) => {
+    COTES = CARTE.cotes.map(decoder); FRONTIERES = CARTE.frontieres.map(decoder);
+    for (const l of [...COTES, ...FRONTIERES]) {   // boîte englobante : on ne trace que le visible
+      let a = 90, b = -90, c = 180, d = -180;
+      for (const [lon, lat] of l) { a = Math.min(a, lat); b = Math.max(b, lat); c = Math.min(c, lon); d = Math.max(d, lon); }
+      l.boite = [a, b, c, d];
+    }
+  });
+  return chargement;
+}
 
 /** Couleur selon l'altitude : vert au sol, jaune vers 15 000 ft, magenta au-dessus de 35 000 ft. */
 export function couleurAltitude(alt) {
@@ -24,11 +35,12 @@ export class CarteRadar {
     this.lat0 = 46.6; this.lon0 = 2.4; this.kmPx = 2.5;   // km par pixel
     this.selection = null; this.surChoix = surChoix;
     this.avions = []; this.station = null;
+    chargerFond().then(() => this.dessiner());
     let glisse = null;
     canvas.addEventListener("wheel", e => {
       e.preventDefault();
       const [lat, lon] = this.versGeo(e.offsetX, e.offsetY), f = e.deltaY < 0 ? 1 / 1.2 : 1.2;
-      this.kmPx = Math.max(0.05, Math.min(20, this.kmPx * f));
+      this.kmPx = Math.max(0.05, Math.min(50, this.kmPx * f));
       const [x, y] = this.versEcran(lat, lon);           // garde le point sous la souris
       this.deplacer(x - e.offsetX, y - e.offsetY); this.dessiner();
     }, { passive: false });
@@ -65,7 +77,7 @@ export class CarteRadar {
     else if (pos.length) { this.lat0 = pos.reduce((s, a) => s + a.lat, 0) / pos.length; this.lon0 = pos.reduce((s, a) => s + a.lon, 0) / pos.length; }
     let rayon = 250;
     for (const a of pos) rayon = Math.max(rayon, distanceKm(this.lat0, this.lon0, a.lat, a.lon) * 1.15);
-    this.kmPx = Math.max(0.05, Math.min(20, 2 * rayon / Math.min(this.W || 600, this.H || 400)));
+    this.kmPx = Math.max(0.05, Math.min(50, 2 * rayon / Math.min(this.W || 600, this.H || 400)));
     this.dessiner();
   }
 
@@ -99,7 +111,12 @@ export class CarteRadar {
     // Côtes et frontières.
     const trace = (lignes, style, tirets) => {
       g.strokeStyle = style; g.setLineDash(tirets); g.beginPath();
-      for (const l of lignes) l.forEach(([lon, lat], i) => { const [x, y] = this.versEcran(lat, lon); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+      const [latH] = this.versGeo(0, 0), [latB] = this.versGeo(0, H), [, lonG] = this.versGeo(0, 0), [, lonD] = this.versGeo(W, 0);
+      for (const l of lignes) {
+        const [a, b, c, d] = l.boite;
+        if (b < latB || a > latH || d < lonG || c > lonD) continue;
+        l.forEach(([lon, lat], i) => { const [x, y] = this.versEcran(lat, lon); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+      }
       g.stroke(); g.setLineDash([]);
     };
     g.lineWidth = 1.2; trace(COTES, "rgba(0,229,255,.55)", []);

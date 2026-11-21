@@ -8,6 +8,7 @@
 //   arreter()         : minuteries, fichiers… (les abonnements sont retirés automatiquement)
 // Sujets : "niveau" (dBFS), "audio" (Float32Array 48 kHz), "iq" (re, im, centre, taux), "vfo" (fréquence, mode).
 // Contexte : frequence(), mode(), reglerFrequence(f), reglerMode(m), taux(), reglerTaux(t) (asynchrone),
+//            gains() (dB), reglerGain(g) (null = automatique),
 //            lire(clé, défaut), ecrire(clé, valeur).
 // Les rappels du bus doivent rester rapides : on stocke, et une minuterie met l'affichage à jour.
 
@@ -15,7 +16,7 @@ import { FirComplexe, NCO, passeBas } from "./dsp.js?v=20261121-fm-stereo";
 import { StereoRds } from "./fm-stereo.js?v=20261121-fm-stereo";
 import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
 import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261121-adsb";
-import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261121-adsb";
+import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261121-monde";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
 
@@ -294,9 +295,11 @@ class ADSB {
 
   creerPanneau() {
     const accorder = el("button", { type: "button", textContent: "Accorder sur 1090 MHz" });
-    accorder.title = "Règle l'échantillonnage sur 2,4 MS/s et la fréquence sur 1090 MHz";
+    accorder.title = "Règle l'échantillonnage sur 2,4 MS/s, le gain au maximum et la fréquence sur 1090 MHz";
     accorder.onclick = async () => {
       if (this.ctx.taux() < TAUX_ADSB) await this.ctx.reglerTaux(TAUX_ADSB);
+      const gains = this.ctx.gains();
+      if (gains.length) this.ctx.reglerGain(Math.max(...gains));   // impulsions brèves : gain maximal
       this.ctx.reglerMode("AM"); this.ctx.reglerFrequence(FREQUENCE_ADSB);
     };
     const ouvrir = el("button", { type: "button", textContent: "Ouvrir la carte", className: "adsb-ouvrir" });

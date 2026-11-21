@@ -59,6 +59,22 @@ class Contexte:
         if i >= 0:
             choix.setCurrentIndex(i)
 
+    def gains(self) -> list[float]:
+        """Paliers de gain de la clé en dB (liste vide si la source n'en a pas)."""
+        return list(self._fenetre.panneau._gains)
+
+    def regler_gain(self, gain: float | None) -> None:
+        """Gain en dB (palier le plus proche), ou None pour l'automatique. Thread de l'interface uniquement."""
+        p = self._fenetre.panneau
+        if gain is None:
+            p.gain_auto.setChecked(True)
+            return
+        if not p._gains:
+            return
+        p.gain_auto.setChecked(False)
+        p.gain.setValue(min(range(len(p._gains)), key=lambda i: abs(p._gains[i] - gain)))
+        p._emettre_gain()
+
     def dossier_donnees(self, nom: str) -> Path:
         d = DOSSIER_CONFIG / "donnees" / nom
         d.mkdir(parents=True, exist_ok=True)

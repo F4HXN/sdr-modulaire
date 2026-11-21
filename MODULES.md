@@ -60,6 +60,8 @@ Les abonnements faits avec `self.abonner()` sont retirés automatiquement au ret
 | `regler_mode(mode: str)`      | changer de mode (**depuis le thread de l'interface**)       |
 | `taux() -> int`               | taux d'échantillonnage actuel (échantillons/s)              |
 | `regler_taux(taux: int)`      | changer l'échantillonnage, la source redémarre (**thread de l'interface**) |
+| `gains() -> list[float]`      | paliers de gain de la clé (dB), liste vide sans clé         |
+| `regler_gain(g: float \| None)` | gain en dB, ou `None` pour l'automatique (**thread de l'interface**) |
 | `dossier_donnees(nom) -> Path`| dossier propre au module, créé si besoin (`~/.config/sdr-modulaire/donnees/<nom>`) |
 
 ## Règles à respecter

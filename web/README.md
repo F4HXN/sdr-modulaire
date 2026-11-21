@@ -13,7 +13,7 @@ le traitement dans le navigateur. En ligne : https://rtl-sdr.fr/sdr-web.html
 | `capteurs433.js` | décodeur OOK des sondes Nexus-T, Nexus-TH et Rubicson (433,92 MHz) | MIT |
 | `adsb.js`       | ADS-B : démodulation Mode S, CRC-24, positions CPR, suivi des avions | MIT |
 | `carte-adsb.js` | carte radar des avions (canevas)                              | MIT |
-| `carte-europe.js` | côtes et frontières (Natural Earth, domaine public)         | domaine public |
+| `carte-monde.js` | côtes et frontières du monde (Natural Earth, domaine public), chargé à l'ouverture de la carte | domaine public |
 | `fm-stereo.js`  | décodage stéréo (pilote 19 kHz) et RDS de la FM large bande  | MIT |
 | `app.js`        | interface, spectre, chute d'eau, bus des modules            | MIT |
 
