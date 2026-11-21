@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Source simulée : quelques émetteurs fictifs autour de la fréquence centrale, pour essayer sans clé.
+import { encoderIndicatif, encoderPosition, encoderVitesse, impulsion } from "./adsb.js?v=20261121-adsb";
 
 // Capteur Nexus-TH fictif : ID 42, canal 1, 23,5 °C et 56 %.
 const MOTIF_CAPTEUR = [...BigInt("0x2a80ebf38").toString(2).padStart(36, "0")];
@@ -35,9 +36,35 @@ function multiplexDemo(t, gauche) {
     0.085 * Math.sin(pilote) + 0.035 * biphase * Math.cos(3 * pilote);
 }
 
+// Avions fictifs autour du centre de la France, émettant en ADS-B sur 1090 MHz.
+const AVIONS_DEMO = [
+  { icao: 0x3c6586, indicatif: "AFR1234", lat: 46.9, lon: 1.6, alt: 36000, kt: 460, cap: 135, vz: 0 },
+  { icao: 0x4ca7b5, indicatif: "EZY48TP", lat: 45.8, lon: 3.6, alt: 24000, kt: 390, cap: 340, vz: 1500 },
+  { icao: 0x39856a, indicatif: "TVF82LM", lat: 47.6, lon: 2.9, alt: 11000, kt: 280, cap: 210, vz: -1800 },
+  { icao: 0x40762f, indicatif: "BAW306", lat: 46.2, lon: 0.9, alt: 38000, kt: 480, cap: 20, vz: 0 },
+  { icao: 0x3944ef, indicatif: "FGKXS", lat: 46.6, lon: 2.7, alt: 3500, kt: 110, cap: 270, vz: 0 },
+];
+const CRENEAU = 0.04;   // un message toutes les 40 ms, à tour de rôle
+let adsbCreneau = -1, adsbOctets = null;
+function amplitudeAdsb(t) {
+  const c = Math.floor(t / CRENEAU), dt = (t - c * CRENEAU) * 1e6;
+  if (dt >= 120) return 0;
+  if (c !== adsbCreneau) {
+    adsbCreneau = c;
+    const a = AVIONS_DEMO[c % AVIONS_DEMO.length], genre = Math.floor(c / AVIONS_DEMO.length) % 4;
+    const ts = c * CRENEAU % 1800, km = a.kt * 1.852 / 3600 * ts, r = a.cap * Math.PI / 180;
+    const lat = a.lat + km * Math.cos(r) / 111.32, lon = a.lon + km * Math.sin(r) / (111.32 * Math.cos(a.lat * Math.PI / 180));
+    const alt = Math.max(500, Math.min(41000, a.alt + a.vz * ts / 60));
+    adsbOctets = genre === 3 ? encoderIndicatif(a.icao, a.indicatif) : genre === 1 ? encoderVitesse(a.icao, a.kt, a.cap, a.vz)
+      : encoderPosition(a.icao, lat, lon, Math.round(alt / 25) * 25, genre === 2);
+  }
+  return impulsion(adsbOctets, dt);
+}
+
 const EMETTEURS = [
   // fréquence (Hz), mode, niveau (amplitude), tonalité (Hz)
   { f: 433_920_000, mode: "OOK" },
+  { f: 1_090_000_000, mode: "ADSB", a: 0.25 },
   { f: 144_800_000, mode: "NFM", a: 0.05, ton: 1200 },
   { f: 145_500_000, mode: "NFM", a: 0.20, ton: 1000 },
   { f: 145_237_500, mode: "AM", a: 0.06, ton: 600 },
@@ -68,6 +95,7 @@ export class SourceSimulation {
         const m = Math.sin(2 * Math.PI * e.ton * t);
         let amp = e.a, inst = df;
         if (e.mode === "OOK") amp = amplitudeCapteur(t);
+        else if (e.mode === "ADSB") amp = e.a * amplitudeAdsb(t);
         else if (e.mode === "NFM") inst = df + 2500 * m;
         else if (e.mode === "WFM") inst = df + (e.stereo ? 75000 * multiplexDemo(t, m) : 50000 * m);
         else if (e.mode === "AM") amp = e.a * (1 + 0.7 * m);

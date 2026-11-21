@@ -3,8 +3,8 @@
 
 import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261121-fm-stereo";
 import { CleRtlSdr } from "./rtlsdr.js";
-import { SourceSimulation } from "./simulation.js?v=20261121-fm-stereo";
-import { MODULES } from "./modules.js?v=20261121-voyant-stereo";
+import { SourceSimulation } from "./simulation.js?v=20261121-adsb";
+import { MODULES } from "./modules.js?v=20261121-adsb";
 
 const $ = s => document.querySelector(s);
 const PAS = [100, 1000, 2500, 5000, 6250, 8330, 10000, 12500, 25000, 100000, 1000000];
@@ -353,6 +353,12 @@ const actifs = new Map();
 const contexte = module => ({
   abonner(sujet, f) { f.module = module; abonnes[sujet].add(f); module._abos.push([sujet, f]); },
   frequence, mode: () => R.mode, reglerFrequence, reglerMode,
+  taux: () => R.taux,
+  async reglerTaux(t) {
+    if (!TAUX.includes(t) || t === R.taux) return;
+    R.taux = t; $("#taux").value = t;
+    if (source) await demarrer(source instanceof SourceSimulation ? "sim" : "cle", source.usb);
+  },
   lire(cle, defaut) { try { return JSON.parse(localStorage.getItem(`sdr-web/${module.nom}/${cle}`)) ?? defaut; } catch { return defaut; } },
   ecrire(cle, v) { localStorage.setItem(`sdr-web/${module.nom}/${cle}`, JSON.stringify(v)); },
 });

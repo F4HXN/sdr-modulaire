@@ -7,12 +7,15 @@
 //   creerPanneau()    : facultatif, renvoie un élément HTML affiché dans la colonne des modules
 //   arreter()         : minuteries, fichiers… (les abonnements sont retirés automatiquement)
 // Sujets : "niveau" (dBFS), "audio" (Float32Array 48 kHz), "iq" (re, im, centre, taux), "vfo" (fréquence, mode).
-// Contexte : frequence(), mode(), reglerFrequence(f), reglerMode(m), lire(clé, défaut), ecrire(clé, valeur).
+// Contexte : frequence(), mode(), reglerFrequence(f), reglerMode(m), taux(), reglerTaux(t) (asynchrone),
+//            lire(clé, défaut), ecrire(clé, valeur).
 // Les rappels du bus doivent rester rapides : on stocke, et une minuterie met l'affichage à jour.
 
 import { FirComplexe, NCO, passeBas } from "./dsp.js?v=20261121-fm-stereo";
 import { StereoRds } from "./fm-stereo.js?v=20261121-fm-stereo";
 import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
+import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261121-adsb";
+import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261121-adsb";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
 
@@ -266,4 +269,125 @@ class ModuleStereoRds {
   }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds];
+const FREQUENCE_ADSB = 1_090_000_000, TAUX_ADSB = 2_400_000;
+
+class ADSB {
+  static nom = "ADS-B (avions)";
+  static description = "Avions sur 1090 MHz : indicatif, altitude, vitesse, position sur une carte radar.";
+
+  demarrer() {
+    this.trafic = new Trafic();
+    this.trafic.station = this.ctx.lire("station", null);
+    this.derniersIQ = -Infinity; this.etat = "attente"; this.messages = 0; this.debit = 0;
+    this.ctx.abonner("iq", (re, im, centre, taux) => {
+      const maintenant = performance.now(), interrompu = maintenant - this.derniersIQ > 1000;
+      this.derniersIQ = maintenant;
+      if (taux < TAUX_ADSB) { this.etat = "taux"; this.demod = null; return; }
+      if (Math.abs(FREQUENCE_ADSB - centre) > 0.3 * taux) { this.etat = "hors"; this.demod = null; return; }
+      this.etat = "ecoute";
+      if (!this.demod || interrompu || taux !== this.demod.taux) {
+        this.demod = new DemodModeS(taux, o => { this.trafic.recevoir(o); this.messages++; });
+      }
+      this.demod.traiter(re, im);
+    });
+  }
+
+  creerPanneau() {
+    const accorder = el("button", { type: "button", textContent: "Accorder sur 1090 MHz" });
+    accorder.title = "Règle l'échantillonnage sur 2,4 MS/s et la fréquence sur 1090 MHz";
+    accorder.onclick = async () => {
+      if (this.ctx.taux() < TAUX_ADSB) await this.ctx.reglerTaux(TAUX_ADSB);
+      this.ctx.reglerMode("AM"); this.ctx.reglerFrequence(FREQUENCE_ADSB);
+    };
+    const ouvrir = el("button", { type: "button", textContent: "Ouvrir la carte", className: "adsb-ouvrir" });
+    ouvrir.setAttribute("aria-haspopup", "dialog");
+    this.statut = el("div", { className: "petit" });
+    this.liste = el("ul", { className: "journal adsb-mini" });
+
+    // Fenêtre de la carte.
+    const titre = el("h2", { id: "adsb-titre", textContent: "ADS-B · avions sur 1090 MHz" });
+    this.resume = el("span", { className: "adsb-resume" });
+    const fermer = el("button", { type: "button", textContent: "Fermer" });
+    const recentrer = el("button", { type: "button", textContent: "Recentrer" });
+    this.toile = el("canvas", { className: "adsb-carte" });
+    this.toile.setAttribute("aria-label", "Carte radar des avions reçus");
+    this.tableau = el("tbody");
+    const table = el("table", { className: "adsb-table" },
+      el("thead", {}, el("tr", {}, ...["Vol", "Alt. (ft)", "Vit. (kt)", "Cap", "V/z", "Dist."].map(t => el("th", { textContent: t })))), this.tableau);
+    const st = this.trafic.station;
+    const lat = el("input", { type: "number", step: "0.0001", min: -90, max: 90, placeholder: "48.8566", value: st?.lat ?? "" });
+    const lon = el("input", { type: "number", step: "0.0001", min: -180, max: 180, placeholder: "2.3522", value: st?.lon ?? "" });
+    const placer = el("button", { type: "button", textContent: "Enregistrer la station" });
+    placer.onclick = () => {
+      const la = parseFloat(lat.value), lo = parseFloat(lon.value);
+      this.trafic.station = Number.isFinite(la) && Number.isFinite(lo) ? { lat: la, lon: lo } : null;
+      this.ctx.ecrire("station", this.trafic.station); this.carte.station = this.trafic.station; this.carte.centrer();
+    };
+    const pied = el("div", { className: "adsb-pied" },
+      el("label", {}, "Station : lat. ", lat), el("label", {}, " lon. ", lon), placer,
+      el("span", { className: "petit", textContent: "Facultatif : sert aux distances et aux cercles." }));
+    this.dialogue = el("dialog", { className: "adsb-dialogue" },
+      el("header", {}, titre, this.resume, el("span", { className: "adsb-boutons" }, recentrer, fermer)),
+      el("div", { className: "adsb-corps" }, this.toile, el("div", { className: "adsb-cote" }, table)), pied);
+    this.dialogue.setAttribute("aria-labelledby", titre.id);
+    this.carte = new CarteRadar(this.toile, { surChoix: icao => { this.choisi = icao; this.majTableau(); } });
+    this.carte.station = this.trafic.station;
+    ouvrir.onclick = () => { this.dialogue.showModal(); this.carte.avions = [...this.trafic.avions.values()]; this.carte.centrer(); };
+    fermer.onclick = () => this.dialogue.close();
+    recentrer.onclick = () => this.carte.centrer();
+    this.dialogue.addEventListener("close", () => ouvrir.focus());
+
+    let avant = 0, tAvant = performance.now();
+    this.minuterie = setInterval(() => {
+      const maintenant = performance.now();
+      if (maintenant - tAvant >= 1000) { this.debit = (this.messages - avant) * 1000 / (maintenant - tAvant); avant = this.messages; tAvant = maintenant; this.trafic.nettoyer(); }
+      if (maintenant - this.derniersIQ > 1000) this.etat = "attente";
+      this.statut.textContent = {
+        attente: "En attente des échantillons du récepteur.",
+        taux: "Il faut 2,4 MS/s : cliquez sur « Accorder sur 1090 MHz ».",
+        hors: "1090 MHz hors de la bande reçue : cliquez sur « Accorder ».",
+        ecoute: `Écoute de 1090 MHz · ${this.trafic.avions.size} avion(s) · ${this.debit.toFixed(1)} msg/s`,
+      }[this.etat];
+      const avions = this.trier();
+      this.liste.replaceChildren(...avions.slice(0, 6).map(a => el("li", { textContent: this.ligne(a) })));
+      if (this.dialogue.open) {
+        this.resume.textContent = `${avions.length} avion(s) · ${avions.filter(a => a.lat !== undefined).length} sur la carte · ${this.debit.toFixed(1)} msg/s`;
+        this.carte.avions = avions; this.carte.dessiner(); this.majTableau();
+      }
+    }, 250);
+    return el("div", {}, accorder, this.statut, this.liste, ouvrir, this.dialogue);
+  }
+
+  trier() {   // ordre stable : par distance si la station est connue, sinon par indicatif
+    const st = this.trafic.station, cle = a => st && a.lat !== undefined ? distanceKm(st.lat, st.lon, a.lat, a.lon) : Infinity;
+    return [...this.trafic.avions.values()].sort((a, b) => cle(a) - cle(b) || (a.indicatif || "~" + a.icao).localeCompare(b.indicatif || "~" + b.icao));
+  }
+  distance(a) {
+    const st = this.trafic.station;
+    return st && a.lat !== undefined ? `${Math.round(distanceKm(st.lat, st.lon, a.lat, a.lon))} km` : "";
+  }
+  ligne(a) {
+    return `${(a.indicatif || a.icao).padEnd(8)} ${a.altitude !== undefined ? `${a.altitude} ft` : "—"}${a.vitesse !== undefined ? ` · ${a.vitesse} kt` : ""}`;
+  }
+  majTableau() {
+    this.tableau.replaceChildren(...this.trier().map(a => {
+      const tr = el("tr", { className: a.icao === this.choisi ? "choisi" : "" },
+        el("td", {}, el("i", { className: "adsb-pastille" }), a.indicatif || "", el("small", { textContent: ` ${a.icao}` })),
+        el("td", { textContent: a.altitude ?? "—" }), el("td", { textContent: a.vitesse ?? "—" }),
+        el("td", { textContent: a.cap !== undefined ? `${a.cap}°` : "—" }),
+        el("td", { textContent: a.vz !== undefined ? (a.vz > 0 ? `+${a.vz}` : `${a.vz}`) : "—" }),
+        el("td", { textContent: this.distance(a) || (a.lat === undefined ? "sans pos." : "") }));
+      tr.firstChild.firstChild.style.background = couleurAltitude(a.altitude);
+      tr.onclick = () => {
+        this.choisi = this.carte.selection = a.icao;
+        if (a.lat !== undefined) { this.carte.lat0 = a.lat; this.carte.lon0 = a.lon; }
+        this.carte.dessiner(); this.majTableau();
+      };
+      return tr;
+    }));
+  }
+
+  arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB];

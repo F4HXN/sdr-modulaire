@@ -48,6 +48,17 @@ class Contexte:
     def regler_mode(self, mode: str) -> None:
         self._fenetre.regler_mode(mode)
 
+    def taux(self) -> int:
+        """Taux d'échantillonnage courant de la clé (échantillons par seconde)."""
+        return self._fenetre.reglages.taux
+
+    def regler_taux(self, taux: int) -> None:
+        """Change le taux d'échantillonnage (redémarre la source). Thread de l'interface uniquement."""
+        choix = self._fenetre.panneau.taux
+        i = choix.findData(taux)
+        if i >= 0:
+            choix.setCurrentIndex(i)
+
     def dossier_donnees(self, nom: str) -> Path:
         d = DOSSIER_CONFIG / "donnees" / nom
         d.mkdir(parents=True, exist_ok=True)

@@ -61,7 +61,8 @@ sdrmod/
   sources/         rtlsdr_source.py, simulation.py   (une classe Source par matériel)
   demods/          am.py, fm.py, blu.py              (un fichier = un ou plusieurs modes)
   ui/              fenêtre, waterfall, afficheur, panneau, dialogue modules
-modules/           smetre.py, enregistreur_wav.py, memoires.py
+modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite.py,
+                   capteurs_433.py, stereo_rds_fm.py, adsb.py
 tests/             test_dsp.py, test_interface.py
 ```
 

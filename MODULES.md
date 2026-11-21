@@ -58,6 +58,8 @@ Les abonnements faits avec `self.abonner()` sont retirés automatiquement au ret
 | `mode() -> str`               | mode actuel                                                 |
 | `regler_frequence(f: float)`  | changer de fréquence (**depuis le thread de l'interface**)  |
 | `regler_mode(mode: str)`      | changer de mode (**depuis le thread de l'interface**)       |
+| `taux() -> int`               | taux d'échantillonnage actuel (échantillons/s)              |
+| `regler_taux(taux: int)`      | changer l'échantillonnage, la source redémarre (**thread de l'interface**) |
 | `dossier_donnees(nom) -> Path`| dossier propre au module, créé si besoin (`~/.config/sdr-modulaire/donnees/<nom>`) |
 
 ## Règles à respecter
@@ -88,6 +90,7 @@ Activer le module, regarder le terminal. Après une modification du fichier : *M
 | `modules/memoires.py`          | piloter le récepteur (`regler_frequence`, `regler_mode`), fichier JSON |
 | `modules/enregistreur_wav.py`  | abonnement `audio`, fichier ouvert/fermé avec un verrou      |
 | `modules/journal_activite.py`  | deux sujets, file `deque` du DSP vers l'interface, CSV       |
+| `modules/adsb.py`              | sujet `iq`, décodage lourd dans un fil à part, `regler_taux`, fenêtre séparée (carte) |
 | `modules/_modele.py`           | modèle vide à copier                                         |
 
 ## Demander un module à une IA
