@@ -202,8 +202,18 @@ class FenetrePrincipale(QMainWindow):
         limite = r.taux / 2 * 0.92
         if f + bas < r.centre - limite or f + haut > r.centre + limite:
             # hors de la bande visible : on recentre, VFO légèrement à droite du centre (évite le pic DC)
-            r.centre = max(0.0, f - r.taux * 0.1)
-            self.moteur.regler_centre(r.centre)
+            centre = max(0.0, f - r.taux * 0.1)
+            plages = self.infos_materiel.get("plages") or []
+            if plages and not r.echantillonnage_direct:
+                # À la limite d'une bande, le décalage du VFO ne doit pas
+                # entraîner le tuner hors de sa plage de fonctionnement.
+                candidats = [min(max(f, mini), maxi) for mini, maxi in plages]
+                proche = min(candidats, key=lambda candidat: abs(candidat - f))
+                mini, maxi = next((lo, hi) for lo, hi in plages if lo <= proche <= hi)
+                centre = min(max(centre, mini), maxi)
+            if centre != r.centre:
+                r.centre = centre
+                self.moteur.regler_centre(centre)
         r.decalage = f - r.centre
         self.moteur.decalage = r.decalage
         self._maj_vfo()
