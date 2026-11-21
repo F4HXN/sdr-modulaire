@@ -68,6 +68,7 @@ class PilotageRigctl(Module):
         self.ordres: queue.Queue = queue.Queue()      # (genre, valeur) vers le thread de l'interface
         self.clients: dict[str, float] = {}           # adresse → dernier contact
         self.journal: list[str] = []
+        self.evenements: queue.Queue = queue.Queue()  # connexions, déconnexions (vers l'interface)
         self.premiere_f = None
         self.derniere_f = None
         self.nb_ordres = 0
@@ -125,6 +126,8 @@ class PilotageRigctl(Module):
     def _servir(self, conn, nom, fin):
         conn.settimeout(0.5)
         self.clients[nom] = time.monotonic()
+        self.evenements.put(f"connexion de {nom}")
+        raison = "le client a fermé la connexion"
         tampon = b""
         try:
             while not fin.is_set():
@@ -138,16 +141,25 @@ class PilotageRigctl(Module):
                 while b"\n" in tampon:
                     ligne, tampon = tampon.split(b"\n", 1)
                     self.clients[nom] = time.monotonic()
-                    reponse, fermer = self.executer(ligne.decode("ascii", "replace").strip())
+                    # latin-1 : Gpredict envoie l'octet 0x8b pour get_dcd
+                    texte = ligne.decode("latin-1").strip()
+                    try:
+                        reponse, fermer = self.executer(texte)
+                    except Exception as exc:          # une commande bizarre ne coupe jamais la liaison
+                        reponse, fermer = "RPRT -1\n", False
+                        self.evenements.put(f"commande {texte!r} : erreur {exc}")
                     if reponse:
-                        conn.sendall(reponse.encode("ascii"))
+                        conn.sendall(reponse.encode("latin-1"))
                     if fermer:
+                        raison = "le client a envoyé « q » (fin de session)"
                         return
-        except OSError:
-            pass
+            raison = "module arrêté ou rechargé"
+        except OSError as exc:
+            raison = f"erreur réseau ({exc})"
         finally:
             self.clients.pop(nom, None)
             conn.close()
+            self.evenements.put(f"déconnexion de {nom} : {raison}")
 
     def executer(self, ligne: str) -> tuple[str, bool]:
         """Exécute une commande rigctl ; renvoie (réponse, fermer la connexion)."""
@@ -204,7 +216,7 @@ class PilotageRigctl(Module):
             return f"{self.f_cache:.0f}\n", "get_split_freq"
         if cmd == "x":
             return f"{VERS_HAMLIB.get(self.mode_cache, 'FM')}\n{BANDES.get(self.mode_cache, 12500)}\n", "get_split_mode"
-        if cmd == "\x8b":
+        if cmd in ("\x8b", "\\get_dcd"):
             return "0\n", "get_dcd"
         if cmd == "\x88":
             return "1\n", "get_powerstat"
@@ -271,6 +283,11 @@ class PilotageRigctl(Module):
 
     def _appliquer(self):
         """Thread de l'interface : on applique le dernier ordre de chaque genre."""
+        while True:
+            try:
+                self._noter(self.evenements.get_nowait())
+            except queue.Empty:
+                break
         f = mode = None
         while True:
             try:
