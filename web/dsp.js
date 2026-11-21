@@ -175,10 +175,12 @@ export function creerDemod(mode, largeur) {
     const vers48 = new FirComplexe(passeBas(TAUX_INTER, 15000, 101), 5);
     return {
       domaine: "intermediaire", decalage: 0,
-      traiter(ir, ii) {
+      traiter(ir, ii, surMultiplex) {
         const [cr, ci] = canal.traiter(ir, ii);
         this.niveau = puissanceDb(cr, ci);
-        const fm = desac.traiter(disc.traiter(cr, ci));
+        const multiplex = disc.traiter(cr, ci);
+        this.stereo = surMultiplex?.(multiplex);
+        const fm = desac.traiter(multiplex);
         const [a] = vers48.traiter(fm, new Float32Array(fm.length));
         for (let k = 0; k < a.length; k++) a[k] *= 0.6;
         return a;
@@ -232,9 +234,14 @@ export function creerDemod(mode, largeur) {
 /** AGC audio : vise une crête de 0,5 ; attaque rapide, retour lent. */
 export class AGC {
   constructor() { this.g = 1; }
-  traiter(x) {
+  traiter(x, stereo) {
     let crete = 1e-6;
     for (let k = 0; k < x.length; k++) crete = Math.max(crete, Math.abs(x[k]));
+    if (stereo) {
+      for (const canal of stereo) {
+        for (const echantillon of canal) crete = Math.max(crete, Math.abs(echantillon));
+      }
+    }
     const cible = 0.5 / crete;
     this.g = cible < this.g ? cible : this.g + (cible - this.g) * 0.05;
     this.g = Math.min(this.g, 1000);
@@ -260,17 +267,24 @@ export class Chaine {
   }
   regler(mode, largeur) { this.mode = mode; this.largeur = largeur; this.demod = creerDemod(mode, largeur); }
   /** ir, ii : IQ complexes au taux de la clé (composante continue déjà retirée). */
-  traiter(ir, ii, decalage) {
+  traiter(ir, ii, decalage, surMultiplex) {
     const d = this.demod;
     this.nco.freq = decalage + d.decalage;
     let [r, i] = this.nco.melanger(ir, ii);
     [r, i] = this.dec1.traiter(r, i);
     if (d.domaine !== "intermediaire") [r, i] = this.dec2.traiter(r, i);
-    let audio = d.traiter(r, i);
+    let audio = d.traiter(r, i, surMultiplex);
     this.niveau = d.niveau;
-    audio = this.agcActif ? this.agc.traiter(audio) : audio;
-    if (this.niveau < this.squelch) audio = new Float32Array(audio.length);
-    for (let k = 0; k < audio.length; k++) audio[k] = Math.max(-1, Math.min(1, audio[k]));
+    this.stereo = d.stereo;
+    audio = this.agcActif ? this.agc.traiter(audio, this.stereo) : audio;
+    const muet = this.niveau < this.squelch;
+    const gainStereo = this.agcActif ? this.agc.g : 1;
+    for (const canal of this.stereo || []) {
+      for (let k = 0; k < canal.length; k++) {
+        canal[k] = muet ? 0 : Math.max(-1, Math.min(1, canal[k] * gainStereo));
+      }
+    }
+    for (let k = 0; k < audio.length; k++) audio[k] = muet ? 0 : Math.max(-1, Math.min(1, audio[k]));
     return audio;
   }
 }

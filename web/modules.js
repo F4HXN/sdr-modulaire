@@ -10,6 +10,10 @@
 // Contexte : frequence(), mode(), reglerFrequence(f), reglerMode(m), lire(clé, défaut), ecrire(clé, valeur).
 // Les rappels du bus doivent rester rapides : on stocke, et une minuterie met l'affichage à jour.
 
+import { FirComplexe, NCO, passeBas } from "./dsp.js?v=20261121-fm-stereo";
+import { StereoRds } from "./fm-stereo.js?v=20261121-fm-stereo";
+import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
+
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
 
 class SMetre {
@@ -111,4 +115,155 @@ class Journal {
   arreter() { clearInterval(this.minuterie); }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, Journal];
+const FREQUENCE_CAPTEURS = 433_920_000;
+const BANDE_CAPTEURS = 45_000;
+
+class Capteurs433 {
+  static nom = "Capteurs 433 MHz";
+  static description = "Sondes Nexus-T, Nexus-TH et Rubicson sur 433,92 MHz.";
+
+  demarrer() {
+    this.derniersIQ = -Infinity;
+    this.capteurs = new Map();
+    this.ctx.abonner("iq", (re, im, centre, taux) => this.recevoir(re, im, centre, taux));
+  }
+
+  recevoir(re, im, centre, taux) {
+    const maintenant = performance.now();
+    const decalage = FREQUENCE_CAPTEURS - centre;
+    this.couvert = Math.abs(decalage) + BANDE_CAPTEURS < 0.45 * taux;
+    const interrompu = maintenant - this.derniersIQ > 1000;
+    this.derniersIQ = maintenant;
+    if (!this.couvert) {
+      this.decodeur = null;
+      return;
+    }
+    if (!this.decodeur || interrompu || centre !== this.centre || taux !== this.taux) {
+      this.centre = centre;
+      this.taux = taux;
+      this.nco = new NCO(taux);
+      this.nco.freq = decalage;
+      const facteur = taux / TAUX_CAPTEURS;
+      this.filtre = new FirComplexe(passeBas(taux, BANDE_CAPTEURS, facteur * 12 + 1), facteur);
+      this.decodeur = new DecodeurOOK433(mesure => {
+        const cle = `${mesure.modele}/${mesure.identifiant}/${mesure.canal}`;
+        this.capteurs.delete(cle);
+        this.capteurs.set(cle, { ...mesure, heure: new Date().toLocaleTimeString("fr-FR") });
+        if (this.capteurs.size > 100) this.capteurs.delete(this.capteurs.keys().next().value);
+        this.actualiser = true;
+      });
+    }
+    this.decodeur.traiter(...this.filtre.traiter(...this.nco.melanger(re, im)));
+  }
+
+  creerPanneau() {
+    const accorder = el("button", { type: "button", textContent: "Accorder sur 433,92 MHz" });
+    accorder.onclick = () => {
+      this.ctx.reglerMode("AM");
+      this.ctx.reglerFrequence(FREQUENCE_CAPTEURS);
+    };
+    const statut = el("div", { className: "petit", textContent: "En attente de la clé RTL-SDR." });
+    const liste = el("ul", { className: "journal" });
+    const temperature = new Intl.NumberFormat("fr-FR", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+    this.minuterie = setInterval(() => {
+      if (performance.now() - this.derniersIQ > 1000) {
+        statut.textContent = "En attente des échantillons du récepteur.";
+      } else if (!this.couvert) {
+        statut.textContent = "433,92 MHz hors de la bande reçue. Cliquez sur Accorder.";
+      } else {
+        statut.textContent = "Écoute de 433,92 MHz";
+      }
+      if (!this.actualiser) return;
+      this.actualiser = false;
+      liste.replaceChildren(...Array.from(this.capteurs.values()).reverse().map(m => {
+        const humidite = m.humidite === null ? "" : ` · ${m.humidite} %`;
+        const pile = m.pile ? "pile OK" : "pile faible";
+        return el("li", { textContent: `${m.heure} · ${m.modele} #${m.identifiant}, canal ${m.canal} · ${temperature.format(m.temperature)} °C${humidite} · ${pile}` });
+      }));
+    }, 150);
+    const contenu = el("div", { className: "capteurs-contenu" }, accorder, statut, liste);
+    const agrandir = el("button", { type: "button", textContent: "Agrandir", className: "capteurs-agrandir" });
+    agrandir.setAttribute("aria-haspopup", "dialog");
+    const titre = el("h2", { id: "capteurs-titre", textContent: "Capteurs 433 MHz" });
+    const fermer = el("button", { type: "button", textContent: "Réduire", autofocus: true });
+    const dialogue = el("dialog", { className: "capteurs-dialogue" },
+      el("header", {}, titre, fermer));
+    dialogue.setAttribute("aria-labelledby", titre.id);
+    const panneau = el("div", {}, contenu, agrandir, dialogue);
+    agrandir.onclick = () => {
+      dialogue.append(contenu);
+      dialogue.showModal();
+    };
+    fermer.onclick = () => dialogue.close();
+    dialogue.addEventListener("close", () => {
+      panneau.prepend(contenu);
+      agrandir.focus();
+    });
+    return panneau;
+  }
+
+  arreter() {
+    clearInterval(this.minuterie);
+  }
+}
+
+class ModuleStereoRds {
+  static nom = "Stéréo et RDS en FM";
+  static description = "Séparation gauche/droite en WFM, nom de la station et radiotexte.";
+
+  demarrer() {
+    this.dernierBloc = -Infinity;
+    this.frequence = this.ctx.frequence();
+    this.mode = this.ctx.mode();
+    this.ctx.abonner("vfo", (frequence, mode) => {
+      if (frequence !== this.frequence || mode !== this.mode) this.decodeur = null;
+      this.frequence = frequence;
+      this.mode = mode;
+    });
+    this.ctx.abonner("fm", (multiplex, resultat) => {
+      const maintenant = performance.now();
+      if (!this.decodeur || maintenant - this.dernierBloc > 1000) this.decodeur = new StereoRds();
+      this.dernierBloc = maintenant;
+      resultat.stereo = this.decodeur.traiter(multiplex);
+    });
+  }
+
+  creerPanneau() {
+    const passerWfm = el("button", { type: "button", textContent: "Passer en WFM" });
+    passerWfm.onclick = () => this.ctx.reglerMode("WFM");
+    const voyant = el("span", { className: "voyant-stereo" });
+    const statutAudio = el("span", { className: "rds-audio" }, voyant);
+    const texteAudio = el("span", { textContent: "Mono" });
+    statutAudio.append(texteAudio);
+    const statutRds = el("span", { className: "petit" });
+    const statuts = el("div", { className: "rds-statuts" }, statutAudio, statutRds);
+    const station = el("div", { className: "rds-station" });
+    const message = el("div", { className: "rds-message" });
+    const actualiser = () => {
+      const maintenant = performance.now();
+      const enWfm = this.mode === "WFM";
+      const actif = enWfm && this.decodeur && maintenant - this.dernierBloc < 1000;
+      const stereo = Boolean(actif && this.decodeur.melange > 0.15);
+      const rds = enWfm ? this.decodeur?.donnees : null;
+      const recu = actif && maintenant - rds?.dernierGroupe < 5000;
+      passerWfm.hidden = enWfm;
+      voyant.classList.toggle("allume", stereo);
+      texteAudio.textContent = stereo ? "Stéréo" : "Mono";
+      statutRds.textContent = !enWfm ? "Activez le mode WFM" :
+        !actif ? "Réception FM arrêtée" :
+        recu ? "RDS reçu" : rds?.pi != null ? "RDS intermittent" : "En attente du RDS";
+      station.textContent = rds?.nom || (rds?.pi == null ? "" :
+        `PI ${rds.pi.toString(16).toUpperCase().padStart(4, "0")}`);
+      message.textContent = rds?.message || "";
+    };
+    this.minuterie = setInterval(actualiser, 200);
+    actualiser();
+    return el("div", {}, passerWfm, statuts, station, message);
+  }
+
+  arreter() {
+    clearInterval(this.minuterie);
+  }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds];

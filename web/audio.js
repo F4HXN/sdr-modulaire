@@ -5,25 +5,36 @@
 class SortieSDR extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.tampon = new Float32Array(48000);
+    this.tampons = [new Float32Array(48000), new Float32Array(48000)];
     this.lu = 0; this.ecrit = 0; this.dispo = 0;
     this.port.onmessage = e => this.ajouter(e.data);
   }
-  ajouter(bloc) {
-    const t = this.tampon, n = t.length;
-    for (let k = 0; k < bloc.length; k++) { t[this.ecrit] = bloc[k]; this.ecrit = (this.ecrit + 1) % n; }
-    this.dispo += bloc.length;
+  ajouter([gauche, droite = gauche]) {
+    const [g, d] = this.tampons, n = g.length;
+    for (let k = 0; k < gauche.length; k++) {
+      g[this.ecrit] = gauche[k];
+      d[this.ecrit] = droite[k];
+      this.ecrit = (this.ecrit + 1) % n;
+    }
+    this.dispo += gauche.length;
     if (this.dispo > n * 0.5) {            // plus d'une demi-seconde de retard : on le rattrape
       const saut = this.dispo - Math.floor(n * 0.15);
       this.lu = (this.lu + saut) % n; this.dispo -= saut;
     }
   }
   process(_entrees, sorties) {
-    const s = sorties[0][0], t = this.tampon, n = t.length;
-    for (let k = 0; k < s.length; k++) {
-      if (this.dispo > 0) { s[k] = t[this.lu]; this.lu = (this.lu + 1) % n; this.dispo--; } else s[k] = 0;
+    const [gauche, droite] = sorties[0], [g, d] = this.tampons;
+    for (let k = 0; k < gauche.length; k++) {
+      if (this.dispo) {
+        gauche[k] = droite ? g[this.lu] : (g[this.lu] + d[this.lu]) * 0.5;
+        if (droite) droite[k] = d[this.lu];
+        this.lu = (this.lu + 1) % g.length;
+        this.dispo--;
+      } else {
+        gauche[k] = 0;
+        if (droite) droite[k] = 0;
+      }
     }
-    for (let c = 1; c < sorties[0].length; c++) sorties[0][c].set(s);
     return true;
   }
 }

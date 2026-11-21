@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // SDR Web : récepteur SDR dans le navigateur (WebUSB), version web de SDR Modulaire.
 
-import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js";
+import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261121-fm-stereo";
 import { CleRtlSdr } from "./rtlsdr.js";
-import { SourceSimulation } from "./simulation.js";
-import { MODULES } from "./modules.js";
+import { SourceSimulation } from "./simulation.js?v=20261121-fm-stereo";
+import { MODULES } from "./modules.js?v=20261121-voyant-stereo";
 
 const $ = s => document.querySelector(s);
 const PAS = [100, 1000, 2500, 5000, 6250, 8330, 10000, 12500, 25000, 100000, 1000000];
@@ -20,7 +20,7 @@ const frequence = () => R.centre + R.decalage;
 const largeur = () => R.largeurs[R.mode] || LARGEURS[R.mode];
 
 // ---------------------------------------------------------------- bus des modules
-const abonnes = { niveau: new Set(), audio: new Set(), iq: new Set(), vfo: new Set() };
+const abonnes = { niveau: new Set(), audio: new Set(), iq: new Set(), vfo: new Set(), fm: new Set() };
 function publier(sujet, ...args) {
   for (const f of [...abonnes[sujet]]) {
     try { f(...args); } catch (e) { console.error(e); const m = f.module; if (m) { retirerModule(m.nom); statut(`Module « ${m.nom} » retiré après une erreur : ${e.message}`); } }
@@ -42,16 +42,24 @@ function traiterBloc(octets) {
   }
   if (abonnes.iq.size) publier("iq", ir, ii, R.centre, R.taux);
   chaine.agcActif = R.agc; chaine.squelch = R.squelch;
-  const a = chaine.traiter(ir, ii, R.decalage);
+  const surMultiplex = abonnes.fm.size ? multiplex => {
+    const resultat = {};
+    publier("fm", multiplex, resultat);
+    return resultat.stereo;
+  } : null;
+  const a = chaine.traiter(ir, ii, R.decalage, surMultiplex);
   publier("niveau", chaine.niveau);
   publier("audio", a, TAUX_AUDIO);
-  if (sortie) { const v = new Float32Array(a.length); for (let k = 0; k < a.length; k++) v[k] = a[k] * R.volume; sortie.port.postMessage(v, [v.buffer]); }
+  if (sortie) {
+    const canaux = (chaine.stereo || [a]).map(canal => Float32Array.from(canal, x => x * R.volume));
+    sortie.port.postMessage(canaux, canaux.map(canal => canal.buffer));
+  }
 }
 
 async function demarrerAudio() {
   if (!audio) {
     audio = new AudioContext({ sampleRate: TAUX_AUDIO });
-    await audio.audioWorklet.addModule("sdr-web/audio.js");
+    await audio.audioWorklet.addModule("sdr-web/audio.js?v=20261121-fm-stereo");
     sortie = new AudioWorkletNode(audio, "sortie-sdr", { outputChannelCount: [2] });
     sortie.connect(audio.destination);
   }

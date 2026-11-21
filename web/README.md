@@ -9,7 +9,9 @@ le traitement dans le navigateur. En ligne : https://rtl-sdr.fr/sdr-web.html
 | `dsp.js`        | NCO, filtres décimants à état, FFT, démodulateurs, AGC      | MIT |
 | `audio.js`      | sortie audio (AudioWorklet, tampon circulaire)              | MIT |
 | `simulation.js` | source simulée (émetteurs fictifs)                          | MIT |
-| `modules.js`    | modules à chaud : S-mètre, mémoires, enregistreur WAV, journal | MIT |
+| `modules.js`    | modules à chaud : S-mètre, mémoires, enregistreur WAV, journal, capteurs 433 MHz, stéréo et RDS | MIT |
+| `capteurs433.js` | décodeur OOK des sondes Nexus-T, Nexus-TH et Rubicson (433,92 MHz) | MIT |
+| `fm-stereo.js`  | décodage stéréo (pilote 19 kHz) et RDS de la FM large bande  | MIT |
 | `app.js`        | interface, spectre, chute d'eau, bus des modules            | MIT |
 
 La page HTML qui les assemble est celle du site (`sdr-web.html`), qui charge ces fichiers depuis `sdr-web/`.
