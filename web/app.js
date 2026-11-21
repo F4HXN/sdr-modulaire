@@ -2,7 +2,7 @@
 // SDR Web : récepteur SDR dans le navigateur (WebUSB), version web de SDR Modulaire.
 
 import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261121-fm-stereo";
-import { CleRtlSdr } from "./rtlsdr.js?v=20261121-r820t";
+import { CleRtlSdr } from "./rtlsdr.js?v=20261121-hf";
 import { SourceSimulation } from "./simulation.js?v=20261121-adsb";
 import { MODULES } from "./modules.js?v=20261121-centrage";
 
@@ -12,7 +12,7 @@ const TAILLE_FFT = 2048;
 
 // ---------------------------------------------------------------- réglages persistants
 const DEFAUT = { centre: 145_300_000, decalage: 200_000, taux: 960000, mode: "NFM", largeurs: {}, gain: null, ppm: 0,
-  agc: true, squelch: -120, volume: 0.5, pas: 12500, moyennage: 0.6, min: -100, max: -20, modules: ["S-mètre"] };
+  agc: true, direct: 0, convertisseur: 0, squelch: -120, volume: 0.5, pas: 12500, moyennage: 0.6, min: -100, max: -20, modules: ["S-mètre"] };
 const R = Object.assign({}, DEFAUT, JSON.parse(localStorage.getItem("sdr-web") || "{}"));
 const sauver = () => localStorage.setItem("sdr-web", JSON.stringify(R));
 addEventListener("beforeunload", sauver);
@@ -72,7 +72,8 @@ async function demarrer(type, usb = null) {   // usb : clé déjà autorisée (r
     await demarrerAudio();
     source = type === "cle" ? (usb ? new CleRtlSdr(usb) : await CleRtlSdr.choisir()) : new SourceSimulation();
     statut(type === "cle" ? "Ouverture de la clé…" : "Source simulée");
-    await source.ouvrir(R.taux, R.centre);
+    await source.ouvrir(R.taux, R.centre + R.convertisseur);
+    if (source.reglerDirect && R.direct) await source.reglerDirect(R.direct);
     if (source.reglerPpm) await source.reglerPpm(R.ppm);
     if (source.reglerGain && R.gain !== null) await source.reglerGain(R.gain);
   } catch (e) {
@@ -102,15 +103,16 @@ async function arreter() {
 
 let enAccord = Promise.resolve();
 function accorderCentre(c) {      // les réglages de la clé passent l'un après l'autre
-  R.centre = c;
-  if (source?.reglerFrequence) enAccord = enAccord.then(() => source?.reglerFrequence(c)).catch(e => erreur(e.message));
+  R.centre = c;   // fréquence affichée ; la clé, elle, reçoit c + décalage du convertisseur
+  if (source?.reglerFrequence) enAccord = enAccord.then(() => source?.reglerFrequence(c + R.convertisseur)).catch(e => erreur(e.message));
   else source?.regler?.(c);
   effacerSpectre();
 }
 
 // ---------------------------------------------------------------- accord
 function reglerFrequence(f, recentrer = true) {
-  const [mini, maxi] = source?.plage || [22e6, 1100e6];   // plage du tuner
+  const [a, b] = source?.plage || [22e6, 1100e6];   // plage de la clé, ramenée à l'affichage
+  const mini = Math.max(0, a - R.convertisseur), maxi = b - R.convertisseur;
   f = Math.round(Math.max(mini, Math.min(maxi, f)));
   const marge = R.taux * 0.4;
   if (recentrer && Math.abs(f - R.centre) > marge) accorderCentre(f - R.taux * 0.1);
@@ -161,6 +163,22 @@ $("#pas").onchange = e => { R.pas = Number(e.target.value); };
 $("#taux").onchange = async e => { R.taux = Number(e.target.value); if (source) await demarrer(source instanceof SourceSimulation ? "sim" : "cle", source.usb); };
 $("#largeur").value = largeur();
 $("#largeur").onchange = e => { R.largeurs[R.mode] = Number(e.target.value); chaine?.regler(R.mode, largeur()); };
+// Entrée HF : échantillonnage direct (branche Q de la Blog V3) ; décalage d'un convertisseur HF
+$("#hf").value = String(R.direct);
+$("#hf").onchange = e => {
+  R.direct = Number(e.target.value); sauver();
+  if (!source?.reglerDirect) return;
+  enAccord = enAccord.then(async () => {
+    await source.reglerDirect(R.direct);
+    afficherMateriel(); majGain();
+    const [a, b] = source.plage, f = frequence() + R.convertisseur;
+    // hors de la nouvelle plage : 7,1 MHz en HF, 145,5 MHz en retour sur le tuner
+    if (f < a || f > b) { reglerMode(R.direct ? "LSB" : "NFM"); reglerFrequence((R.direct ? 7_100_000 : 145_500_000) - R.convertisseur); }
+    else accorderCentre(R.centre);
+  }).catch(err => erreur(err.message));
+};
+$("#conv").value = R.convertisseur / 1e6;
+$("#conv").onchange = e => { R.convertisseur = Math.round((Number(e.target.value) || 0) * 1e6); sauver(); accorderCentre(R.centre); };
 $("#ppm").value = R.ppm;
 $("#ppm").onchange = e => { R.ppm = Number(e.target.value) || 0; if (source?.reglerPpm) enAccord = enAccord.then(() => source.reglerPpm(R.ppm)); };
 $("#agc").checked = R.agc; $("#agc").onchange = e => { R.agc = e.target.checked; };

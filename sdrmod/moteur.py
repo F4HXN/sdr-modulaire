@@ -40,6 +40,7 @@ class Moteur(QObject):
 
         # paramètres modifiables depuis l'interface (lus par le thread DSP)
         self.centre = 145_300_000.0
+        self.convertisseur = 0.0       # la clé est accordée sur centre + convertisseur
         self.taux = 2_400_000
         self.decalage = 0.0
         self.volume = 0.5
@@ -64,7 +65,7 @@ class Moteur(QObject):
     def demarrer(self, source: Source, mode: str, largeur: float, initialiser=None) -> None:
         """initialiser(source) est appelé après l'ouverture, avant le lancement des threads."""
         self.source = source
-        source.ouvrir(self.taux, self.centre)
+        source.ouvrir(self.taux, self.centre + self.convertisseur)
         if initialiser:
             initialiser(source)
         self._construire_chaine(mode, largeur)
@@ -105,7 +106,7 @@ class Moteur(QObject):
 
     def regler_centre(self, f: float) -> None:
         self.centre = f
-        self.commande_source("regler_frequence", f)
+        self.commande_source("regler_frequence", f + self.convertisseur)
 
     def regler_mode(self, mode: str, largeur: float) -> None:
         self._mode_demande = (mode, largeur)

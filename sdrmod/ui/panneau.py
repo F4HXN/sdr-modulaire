@@ -28,6 +28,7 @@ class PanneauReglages(QWidget):
     gain_change = Signal(object)        # float | None
     ppm_change = Signal(int)
     direct_change = Signal(int)
+    convertisseur_change = Signal(float)   # Hz
     bias_t_change = Signal(bool)
     largeur_change = Signal(float)
     agc_change = Signal(bool)
@@ -95,6 +96,15 @@ class PanneauReglages(QWidget):
         self.direct.setCurrentIndex(r.echantillonnage_direct)
         self.direct.currentIndexChanged.connect(self.direct_change)
         f.addRow("Échant. direct", self.direct)
+
+        self.convertisseur = QDoubleSpinBox()
+        self.convertisseur.setRange(-2000.0, 2000.0)
+        self.convertisseur.setDecimals(3)
+        self.convertisseur.setSuffix(" MHz")
+        self.convertisseur.setValue(r.convertisseur / 1e6)
+        self.convertisseur.setToolTip("Décalage d'un convertisseur HF (Ham It Up : 125 MHz). 0 sans convertisseur.")
+        self.convertisseur.editingFinished.connect(lambda: self.convertisseur_change.emit(self.convertisseur.value() * 1e6))
+        f.addRow("Convertisseur", self.convertisseur)
 
         self.bias = QCheckBox("Alimenter l'antenne (bias-T)")
         self.bias.setChecked(r.bias_t)

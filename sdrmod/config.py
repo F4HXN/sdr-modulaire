@@ -37,6 +37,7 @@ class Reglages:
     gain: float | None = None           # None = AGC du tuner
     ppm: int = 0
     echantillonnage_direct: int = 0     # 0 = non, 1 = branche I, 2 = branche Q
+    convertisseur: float = 0.0          # décalage d'un convertisseur HF en Hz (Ham It Up : 125e6), 0 sans
     bias_t: bool = False
 
     mode: str = "NFM"

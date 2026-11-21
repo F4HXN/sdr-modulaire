@@ -60,7 +60,7 @@ const R82XX_PASSE_BAS = [1700000, 1600000, 1550000, 1450000, 1200000, 900000, 70
 const bitrev = o => { const t = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15]; return (t[o & 15] << 4) | t[o >> 4]; };
 
 export class CleRtlSdr {
-  constructor(usb) { this.usb = usb; this.nom = "RTL-SDR"; this.ppm = 0; this.freq = 0; this.taux = 0; this.lecture = false; }
+  constructor(usb) { this.usb = usb; this.nom = "RTL-SDR"; this.ppm = 0; this.freq = 0; this.taux = 0; this.lecture = false; this.direct = 0; }
 
   /** Demande la clé à l'utilisateur (fenêtre du navigateur), puis l'ouvre. */
   static async choisir() {
@@ -128,12 +128,12 @@ export class CleRtlSdr {
     }
     if (this.tuner === "FC0013") {
       await this._fc0013Init();
-      this.plage = [22e6, 1100e6];
+      this.plageTuner = [22e6, 1100e6];
     } else {
       // RTL-SDR Blog V4 : R828D à quartz 28,8 MHz, convertisseur HF intégré
       this.blogV4 = this.fabricant === "RTLSDRBlog" && this.modele === "Blog V4";
       this.xtalTuner = this.tuner === "R828D" && !this.blogV4 ? 16_000_000 : XTAL;
-      this.plage = this.blogV4 ? [500e3, 1766e6] : [24e6, 1766e6];
+      this.plageTuner = this.blogV4 ? [500e3, 1766e6] : [24e6, 1766e6];
       await this.ecrireDemod(1, 0xb1, 0x1a, 1);   // pas de zéro-IF : le tuner sort sur une FI
       await this.ecrireDemod(0, 0x08, 0x4d, 1);   // entrée ADC « en phase » seulement
       await this._reglerFI(R82XX_IF);
@@ -189,7 +189,7 @@ export class CleRtlSdr {
     await this._correctionTaux();
     await this.ecrireDemod(1, 0x01, 0x14, 1);
     await this.ecrireDemod(1, 0x01, 0x10, 1);
-    if (this.r82) {   // R82xx : filtre de FI adapté au taux, puis nouvelle FI et nouvel accord
+    if (this.r82 && !this.direct) {   // R82xx : filtre de FI adapté au taux, puis nouvelle FI et nouvel accord
       await this.repeteurI2C(true);
       try { this.r82.fi = await this._r82xxBande(taux); } finally { await this.repeteurI2C(false); }
       await this._reglerFI(this.r82.fi);
@@ -212,11 +212,48 @@ export class CleRtlSdr {
     if (ppm === this.ppm) return;
     this.ppm = ppm;
     await this._correctionTaux();
-    if (this.r82) await this._reglerFI(this.r82.fi);
+    if (this.r82 && !this.direct) await this._reglerFI(this.r82.fi);
     if (this.freq) await this.reglerFrequence(this.freq);
   }
+  /** Plage utilisable : celle du tuner, ou 0–28,8 MHz en échantillonnage direct. */
+  get plage() { return this.direct ? [10e3, 28_800_000] : this.plageTuner; }
+
+  /**
+   * Échantillonnage direct (rtlsdr_set_direct_sampling) : 0 = tuner, 1 = branche I, 2 = branche Q
+   * (entrée HF de la RTL-SDR Blog V3). Le tuner est mis en veille et le RTL2832U accorde seul la HF.
+   */
+  async reglerDirect(mode) {
+    mode = Number(mode) || 0;
+    if (mode === this.direct) return;
+    if (mode) {
+      if (this.r82) { await this.repeteurI2C(true); try { await this._r82xxVeille(); } finally { await this.repeteurI2C(false); } }
+      await this.ecrireDemod(1, 0xb1, 0x1a, 1);             // pas de zéro-IF
+      await this.ecrireDemod(1, 0x15, 0x00, 1);             // pas d'inversion du spectre
+      await this.ecrireDemod(0, 0x08, 0x4d, 1);             // entrée ADC « en phase » seulement
+      await this.ecrireDemod(0, 0x06, mode > 1 ? 0x90 : 0x80, 1);   // échange I/Q : choix de l'entrée
+    } else {
+      await this.repeteurI2C(true);
+      try {
+        if (this.r82) { await this._r82xxInit(); this.r82.fi = await this._r82xxBande(this.taux); }
+        else await this._fc0013Init();
+      } finally { await this.repeteurI2C(false); }
+      if (this.r82) {
+        await this._reglerFI(this.r82.fi);
+        await this.ecrireDemod(1, 0x15, 0x01, 1);
+      } else {
+        await this._reglerFI(0);
+        await this.ecrireDemod(0, 0x08, 0xcd, 1);
+        await this.ecrireDemod(1, 0xb1, 0x1b, 1);
+      }
+      await this.ecrireDemod(0, 0x06, 0x80, 1);
+    }
+    this.direct = mode;
+    if (this.freq) await this.reglerFrequence(this.freq);
+  }
+
   async reglerFrequence(f) {
     f = Math.round(f);
+    if (this.direct) { await this._reglerFI(f); this.freq = f; return; }   // le RTL2832U accorde seul
     await this.repeteurI2C(true);
     try { await (this.r82 ? this._r82xxFrequence(f) : this._fc0013Frequence(f)); } finally { await this.repeteurI2C(false); }
     this.freq = f;
@@ -224,6 +261,7 @@ export class CleRtlSdr {
   gains() { return this.r82 ? R82XX_GAINS.map(g => g / 10) : [...new Set(GAINS_FC0013.map(g => g[0] / 10))]; }
   /** gain en dB, ou null pour l'AGC du tuner. */
   async reglerGain(gain) {
+    if (this.direct) return;                       // tuner en veille : pas de gain
     if (this.r82) {
       await this.repeteurI2C(true);
       try { await this._r82xxGain(gain === null ? null : Math.round(gain * 10)); } finally { await this.repeteurI2C(false); }
@@ -474,6 +512,12 @@ export class CleRtlSdr {
     }
     await this._rMasque(0x05, lna, 0x0f);
     await this._rMasque(0x07, mix, 0x0f);
+  }
+
+  /** Veille du tuner (r82xx_standby), avant l'échantillonnage direct. */
+  async _r82xxVeille() {
+    for (const [reg, val] of [[0x06, 0xb1], [0x05, 0xa0], [0x07, 0x3a], [0x08, 0x40], [0x09, 0xc0], [0x0a, 0x36],
+      [0x0c, 0x35], [0x0f, 0x68], [0x11, 0x03], [0x17, 0xf4], [0x19, 0x0c]]) await this._rReg(reg, val);
   }
 
   /** Filtre de FI selon la bande voulue ; renvoie la nouvelle FI. */

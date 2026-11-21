@@ -59,6 +59,7 @@ class FenetrePrincipale(QMainWindow):
         self.moteur = Moteur(self.bus, self.modes, self.sortie)
         m = self.moteur
         m.centre, m.taux, m.decalage = r.centre, r.taux, r.decalage
+        m.convertisseur = r.convertisseur
         m.volume, m.squelch, m.agc_actif = r.volume, r.squelch, r.agc
         m.taille_fft, m.moyennage = r.taille_fft, r.moyennage
 
@@ -171,6 +172,7 @@ class FenetrePrincipale(QMainWindow):
         p.gain_change.connect(self._changer_gain)
         p.ppm_change.connect(lambda v: self._source("ppm", "regler_ppm", v))
         p.direct_change.connect(lambda v: self._source("echantillonnage_direct", "regler_echantillonnage_direct", v))
+        p.convertisseur_change.connect(self._changer_convertisseur)
         p.bias_t_change.connect(lambda v: self._source("bias_t", "regler_bias_t", v))
         p.largeur_change.connect(self._changer_largeur)
         p.agc_change.connect(lambda v: self._param("agc", "agc_actif", v))
@@ -203,7 +205,7 @@ class FenetrePrincipale(QMainWindow):
         if f + bas < r.centre - limite or f + haut > r.centre + limite:
             # hors de la bande visible : on recentre, VFO légèrement à droite du centre (évite le pic DC)
             centre = max(0.0, f - r.taux * 0.1)
-            plages = self.infos_materiel.get("plages") or []
+            plages = self._plages()
             if plages and not r.echantillonnage_direct:
                 # À la limite d'une bande, le décalage du VFO ne doit pas
                 # entraîner le tuner hors de sa plage de fonctionnement.
@@ -246,7 +248,7 @@ class FenetrePrincipale(QMainWindow):
         r = self.reglages
         f = r.frequence
         bas, haut = self._bande()
-        plages = self.infos_materiel.get("plages") or []
+        plages = self._plages()
         hors = bool(plages) and not any(a <= f <= b for a, b in plages)
         self.afficheur.hors_plage = hors
         self._avertissement = f"⚠ Hors couverture du tuner ({texte_plages(plages)})" if hors else ""
@@ -262,6 +264,19 @@ class FenetrePrincipale(QMainWindow):
     def _param(self, cle: str, attr: str, valeur) -> None:
         setattr(self.reglages, cle, valeur)
         setattr(self.moteur, attr, valeur)
+
+    def _plages(self) -> list[tuple[float, float]]:
+        """Plages du tuner ramenées aux fréquences affichées (décalage du convertisseur HF)."""
+        c = self.reglages.convertisseur
+        return [(max(0.0, a - c), b - c) for a, b in (self.infos_materiel.get("plages") or []) if b - c > 0]
+
+    def _changer_convertisseur(self, hz: float) -> None:
+        r = self.reglages
+        if hz == r.convertisseur:
+            return
+        r.convertisseur = self.moteur.convertisseur = hz
+        self.moteur.regler_centre(r.centre)              # la clé est réaccordée avec le nouveau décalage
+        self._maj_vfo()
 
     def _source(self, cle: str, methode: str, valeur) -> None:
         setattr(self.reglages, cle, valeur)
@@ -314,6 +329,7 @@ class FenetrePrincipale(QMainWindow):
         r = self.reglages
         m = self.moteur
         m.centre, m.taux, m.decalage = r.centre, r.taux, r.decalage
+        m.convertisseur = r.convertisseur
         if r.source == "rtlsdr":
             source = SOURCES["rtlsdr"](index=r.rtlsdr_index, serie=r.rtlsdr_serie)
         else:
