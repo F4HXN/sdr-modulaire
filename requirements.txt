@@ -1,0 +1,7 @@
+numpy>=1.24
+scipy>=1.10
+PySide6>=6.5
+pyqtgraph>=0.13
+sounddevice>=0.4
+pyrtlsdr>=0.2.93,<0.3   # 0.3 exige rtlsdr_set_dithering, absent de la librtlsdr des distributions
+setuptools<81           # pyrtlsdr 0.2.x importe pkg_resources
