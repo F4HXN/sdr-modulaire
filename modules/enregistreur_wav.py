@@ -40,7 +40,7 @@ class EnregistreurWav(Module):
         self.lbl.setWordWrap(True)
         lay.addWidget(self.bouton)
         lay.addWidget(self.lbl)
-        lay.addStretch(1)
+        w.setMaximumHeight(w.sizeHint().height() + 20)   # panneau compact, sans espace vide
         self.minuterie = QTimer(w, interval=500, timeout=self._rafraichir)
         self.minuterie.start()
         return w
