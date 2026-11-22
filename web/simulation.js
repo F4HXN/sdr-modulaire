@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Source simulée : quelques émetteurs fictifs autour de la fréquence centrale, pour essayer sans clé.
-import { encoderIndicatif, encoderPosition, encoderVitesse, impulsion } from "./adsb.js?v=20261121-adsb";
+import { encoderIndicatif, encoderPosition, encoderVitesse, impulsion } from "./adsb.js?v=20261122-diag";
 
 // Capteur Nexus-TH fictif : ID 42, canal 1, 23,5 °C et 56 %.
 const MOTIF_CAPTEUR = [...BigInt("0x2a80ebf38").toString(2).padStart(36, "0")];

@@ -40,6 +40,8 @@ export class DemodModeS {
     this.reste = new Float32Array(0);
     this.bruit = 0.01;
     this.messages = 0; this.corriges = 0;
+    // Diagnostic (panneau du module) : préambules vus, messages Mode S d'autres types, CRC faux, crête.
+    this.preambules = 0; this.autresDF = 0; this.crcFaux = 0; this.crete = 0;
   }
 
   traiter(re, im) {
@@ -57,6 +59,8 @@ export class DemodModeS {
     ech.sort((a, b) => a - b);
     const plancher = ech.length ? ech[Math.floor(ech.length / 2)] : 0;
     this.bruit = 0.9 * this.bruit + 0.1 * plancher;
+    let crete = 0; for (let k = 0; k < n; k += 7) if (m[k] > crete) crete = m[k];
+    this.crete = 0.8 * this.crete + 0.2 * crete;
 
     const s = this.s, demi = s / 2, seuil = this.bruit * 2.2, fin = n - this.garde;
     const phases = s > 2.2 ? [0, 0.4, 0.8] : [0, 0.5];
@@ -65,7 +69,7 @@ export class DemodModeS {
     while (k < fin) {
       // Test rapide : une impulsion au début, au-dessus du bruit.
       if (m[k] < seuil && m[k + 1] < seuil) { k++; continue; }
-      let trouve = false;
+      let trouve = false, vu = false;
       for (const ph of phases) {
         const p = k + ph;
         const i1 = E(p, p + demi), i2 = E(p + s, p + s + demi), i3 = E(p + 3.5 * s, p + 4 * s), i4 = E(p + 4.5 * s, p + 5 * s);
@@ -73,6 +77,7 @@ export class DemodModeS {
         // Silences loin des impulsions (le filtre de la clé étale les fronts).
         const calme = (E(p + 2 * s, p + 3 * s) + E(p + 5.75 * s, p + 7.5 * s)) / (2.75 * s);
         if (haut < seuil || haut < 2 * calme) continue;
+        if (!vu) { this.preambules++; vu = true; }   // une seule fois par position, quelle que soit la phase
         // 112 bits : un 1 met l'énergie dans la première moitié de la microseconde.
         o.fill(0);
         let faibles = 0;
@@ -82,14 +87,18 @@ export class DemodModeS {
           if (Math.abs(a - c) < 0.2 * haut * demi) faibles++;
         }
         const df = o[0] >> 3;
-        if (df !== 17 && df !== 18) continue;
+        if (df !== 17 && df !== 18) {
+          // DF11 (squitter court, 56 bits) : CRC des 32 premiers bits, à l'identifiant d'interrogateur près
+          if (df === 11 && ((crc(o, 4) ^ ((o[4] << 16) | (o[5] << 8) | o[6])) & ~0x7f) === 0) this.autresDF++;
+          continue;
+        }
         if (faibles > 40) continue;
         let corrige = false;
         const syn = syndrome(o);
         if (syn) {
           if (faibles > 10) continue;          // correction réservée aux messages nets
           const b = UN_BIT.get(syn);
-          if (b === undefined) continue;
+          if (b === undefined) { this.crcFaux++; continue; }
           o[b >> 3] ^= 0x80 >> (b & 7); corrige = true; this.corriges++;
         }
         this.messages++;

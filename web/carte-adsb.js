@@ -3,7 +3,7 @@
 // avions orientés selon leur cap avec leur trace. Molette : zoom ; glisser : déplacer ;
 // clic : choisir un avion ; double-clic : recentrer.
 
-import { distanceKm } from "./adsb.js?v=20261121-adsb";
+import { distanceKm } from "./adsb.js?v=20261122-diag";
 
 const KM_DEG = 111.32;
 const decoder = l => { const p = []; let x = 0, y = 0; for (let i = 0; i < l.length; i += 2) { x += l[i]; y += l[i + 1]; p.push([x / 100, y / 100]); } return p; };

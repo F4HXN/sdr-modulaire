@@ -15,8 +15,8 @@
 import { FirComplexe, NCO, passeBas, LARGEURS, FFT } from "./dsp.js?v=20261121-fm-stereo";
 import { StereoRds } from "./fm-stereo.js?v=20261121-fm-stereo";
 import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
-import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261121-adsb";
-import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261121-monde";
+import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261122-diag";
+import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261122-diag";
 import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
@@ -283,9 +283,10 @@ class ADSB {
     this.trafic = new Trafic();
     this.trafic.station = this.ctx.lire("station", null);
     this.derniersIQ = -Infinity; this.etat = "attente"; this.messages = 0; this.debit = 0;
+    this.echantillons = 0; this.tauxRecu = 0;
     this.ctx.abonner("iq", (re, im, centre, taux) => {
       const maintenant = performance.now(), interrompu = maintenant - this.derniersIQ > 1000;
-      this.derniersIQ = maintenant;
+      this.derniersIQ = maintenant; this.echantillons += re.length; this.tauxRecu = taux;
       if (taux < TAUX_ADSB) { this.etat = "taux"; this.demod = null; return; }
       if (Math.abs(FREQUENCE_ADSB - centre) > 0.3 * taux) { this.etat = "hors"; this.demod = null; return; }
       this.etat = "ecoute";
@@ -308,6 +309,7 @@ class ADSB {
     const ouvrir = el("button", { type: "button", textContent: "Ouvrir la carte", className: "adsb-ouvrir" });
     ouvrir.setAttribute("aria-haspopup", "dialog");
     this.statut = el("div", { className: "petit" });
+    this.diag = el("div", { className: "petit adsb-diag", title: "Diagnostic de réception, par seconde" });
     this.liste = el("ul", { className: "journal adsb-mini" });
 
     // Fenêtre de la carte.
@@ -343,10 +345,23 @@ class ADSB {
     recentrer.onclick = () => this.carte.centrer();
     this.dialogue.addEventListener("close", () => ouvrir.focus());
 
-    let avant = 0, tAvant = performance.now();
+    let avant = 0, tAvant = performance.now(), dAvant = { ech: 0, pre: 0, df: 0, crc: 0 };
     this.minuterie = setInterval(() => {
       const maintenant = performance.now();
-      if (maintenant - tAvant >= 1000) { this.debit = (this.messages - avant) * 1000 / (maintenant - tAvant); avant = this.messages; tAvant = maintenant; this.trafic.nettoyer(); }
+      if (maintenant - tAvant >= 1000) {
+        const dt = (maintenant - tAvant) / 1000, d = this.demod;
+        this.debit = (this.messages - avant) / dt; avant = this.messages; tAvant = maintenant; this.trafic.nettoyer();
+        // Diagnostic : part des échantillons reçus, niveaux, préambules, Mode S courts, CRC faux (par seconde).
+        const ech = this.echantillons, pre = d?.preambules || 0, df = d?.autresDF || 0, crc = d?.crcFaux || 0;
+        if (this.etat === "ecoute" && d) {
+          const recus = Math.min(999, Math.round(100 * (ech - dAvant.ech) / dt / this.tauxRecu));
+          const db = x => (20 * Math.log10(Math.max(x, 1e-6))).toFixed(0);
+          this.diag.textContent = `Diagnostic : échantillons ${recus} % · bruit ${db(d.bruit)} dB · crête ${db(d.crete)} dB` +
+            ` · préambules ${Math.max(0, Math.round((pre - dAvant.pre) / dt))}/s · DF11 ${Math.max(0, Math.round((df - dAvant.df) / dt))}/s` +
+            ` · CRC faux ${Math.max(0, Math.round((crc - dAvant.crc) / dt))}/s`;
+        } else this.diag.textContent = "";
+        dAvant = { ech, pre, df, crc };
+      }
       if (maintenant - this.derniersIQ > 1000) this.etat = "attente";
       this.statut.textContent = {
         attente: "En attente des échantillons du récepteur.",
@@ -361,7 +376,7 @@ class ADSB {
         this.carte.avions = avions; this.carte.dessiner(); this.majTableau();
       }
     }, 250);
-    return el("div", {}, accorder, this.statut, this.liste, ouvrir, this.dialogue);
+    return el("div", {}, accorder, this.statut, this.diag, this.liste, ouvrir, this.dialogue);
   }
 
   trier() {   // ordre stable : par distance si la station est connue, sinon par indicatif
