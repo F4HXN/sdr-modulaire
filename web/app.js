@@ -437,4 +437,15 @@ reglerMode(R.mode);
 majVfo(); majEtat(); listeModules();
 [...R.modules].forEach(activerModule);
 requestAnimationFrame(dessiner);
+// Présence : toutes les 30 s, un numéro tiré au hasard à l'ouverture de la page (gardé en mémoire,
+// rien n'est stocké dans le navigateur) et si une clé est en réception. Sert seulement à compter
+// les utilisateurs de SDR Web en ce moment (stats/presence.py du serveur, page /visites/).
+const PRESENCE = crypto.getRandomValues(new Uint32Array(2)).reduce((s, x) => s + x.toString(36).padStart(7, "0"), "");
+const presence = (fin = false) => {
+  const cle = source && !(source instanceof SourceSimulation) ? 1 : 0;
+  const url = `/sdr-web/presence?s=${PRESENCE}&cle=${cle}${fin ? "&fin=1" : ""}`;
+  if (fin) navigator.sendBeacon?.(url); else fetch(url, { cache: "no-store", keepalive: true }).catch(() => {});
+};
+presence(); setInterval(presence, 30000);
+addEventListener("pagehide", () => presence(true));
 navigator.usb?.addEventListener("disconnect", e => { if (source?.usb === e.device) { erreur("La clé a été débranchée."); source = null; majEtat(); } });
