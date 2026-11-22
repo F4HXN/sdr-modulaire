@@ -2,7 +2,7 @@
 // SDR Web : récepteur SDR dans le navigateur (WebUSB), version web de SDR Modulaire.
 
 import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261121-fm-stereo";
-import { CleRtlSdr } from "./rtlsdr.js?v=20261121-hf";
+import { CleRtlSdr } from "./rtlsdr.js?v=20261122-pll";
 import { SourceSimulation } from "./simulation.js?v=20261122-diag";
 import { MODULES } from "./modules.js?v=20261122-diag";
 

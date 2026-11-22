@@ -472,7 +472,9 @@ export class CleRtlSdr {
     await this._rMasque(0x08, 0x00, 0x3f);
     await this._rMasque(0x09, 0x00, 0x3f);
     await this._r82xxPll(lo);
-    if (!r.verrou) return;
+    // Comme librtlsdr : un synthétiseur qui ne s'accroche pas est une erreur (sinon la clé reste
+    // accordée ailleurs et l'on ne reçoit rien, sans aucun message).
+    if (!r.verrou) throw new Error(`Tuner : la fréquence ${(freq / 1e6).toFixed(3)} MHz n'a pas pu être accrochée (PLL non verrouillée)`);
     if (v4) {
       const MHZ = x => x * 1e6;
       await this._rMasque(0x17, (freq <= MHZ(2.2) || (freq >= MHZ(85) && freq <= MHZ(112)) || (freq >= MHZ(172) && freq <= MHZ(242))) ? 0x00 : 0x08, 0x08);
