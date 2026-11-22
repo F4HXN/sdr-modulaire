@@ -1,7 +1,9 @@
 """Ajout de modules : catalogue de rtl-sdr.fr (installation, mises à jour) ou fichier local.
 
 Les modules sont copiés dans ~/.config/sdr-modulaire/modules/, après vérification :
-nom de fichier simple, taille raisonnable, empreinte SHA-256 du catalogue, syntaxe Python.
+catalogue signé en Ed25519 par l'auteur (sdrmod/signature.py), modules téléchargés
+uniquement depuis https://rtl-sdr.fr/, nom de fichier simple, taille raisonnable,
+empreinte SHA-256 du catalogue, syntaxe Python.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import shutil
 import threading
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
@@ -20,8 +23,11 @@ from PySide6.QtWidgets import (QAbstractItemView, QDialog, QDialogButtonBox, QFi
                                QTableWidgetItem, QVBoxLayout)
 
 from ..modules import DOSSIERS_MODULES
+from ..signature import verifier_catalogue
 
 CATALOGUE = "https://rtl-sdr.fr/catalogue-modules.json"
+SIGNATURE = CATALOGUE + ".sig"                  # signature Ed25519 du catalogue, en base64
+BASE_AUTORISEE = "https://rtl-sdr.fr/"          # seule origine acceptée pour les modules
 DOSSIER_FOURNIS = DOSSIERS_MODULES[0]           # modules livrés avec l'application
 DOSSIER_UTILISATEUR = DOSSIERS_MODULES[-1]      # ~/.config/sdr-modulaire/modules
 NOM_VALIDE = re.compile(r"^[a-z0-9][a-z0-9_]*\.py$")
@@ -37,6 +43,28 @@ def telecharger(url: str) -> bytes:
     if len(donnees) > TAILLE_MAX:
         raise ValueError("fichier trop gros")
     return donnees
+
+
+def verifier_base(base) -> str:
+    """Rend la base de téléchargement du catalogue, ou lève ValueError si elle sort de rtl-sdr.fr."""
+    if not isinstance(base, str):
+        raise ValueError("base du catalogue absente")
+    morceaux = urlsplit(base)
+    if (morceaux.scheme != "https" or morceaux.netloc != "rtl-sdr.fr" or not base.startswith(BASE_AUTORISEE)
+            or not base.endswith("/") or ".." in morceaux.path or morceaux.query or morceaux.fragment):
+        raise ValueError(f"base du catalogue refusée ({base}) : seule {BASE_AUTORISEE} est acceptée")
+    return base
+
+
+def lire_catalogue_signe(donnees: bytes, signature: bytes) -> tuple[list[dict], str]:
+    """Vérifie la signature puis rend (modules, base). Lève ValueError si le catalogue est refusé."""
+    verifier_catalogue(donnees, signature)
+    cat = json.loads(donnees.decode("utf-8"))
+    base = verifier_base(cat.get("base", BASE_AUTORISEE))
+    modules = [m for m in cat.get("modules", [])
+               if isinstance(m, dict) and NOM_VALIDE.match(str(m.get("fichier", "")))
+               and re.fullmatch(r"[0-9a-f]{64}", str(m.get("sha256", "")))]
+    return modules, base
 
 
 def verifier_module(nom_fichier: str, donnees: bytes) -> None:
@@ -88,7 +116,7 @@ class DialogueAjoutModules(QDialog):
         super().__init__(parent or fenetre)
         self.fenetre = fenetre
         self.entrees: list[dict] = []
-        self.base = "https://rtl-sdr.fr/"
+        self.base = BASE_AUTORISEE
         self.setWindowTitle("Ajouter des modules")
         self.resize(760, 420)
         self.signaux = _Signaux()
@@ -142,9 +170,8 @@ class DialogueAjoutModules(QDialog):
 
         def travail():
             try:
-                cat = json.loads(telecharger(CATALOGUE).decode("utf-8"))
-                modules = [m for m in cat.get("modules", []) if NOM_VALIDE.match(m.get("fichier", ""))]
-                self.base = cat.get("base", "https://rtl-sdr.fr/")
+                donnees, signature = telecharger(CATALOGUE), telecharger(SIGNATURE)
+                modules, self.base = lire_catalogue_signe(donnees, signature)
                 self.signaux.catalogue.emit(modules, "")
             except Exception as exc:   # réseau, JSON…
                 self.signaux.catalogue.emit([], str(exc))
@@ -153,12 +180,14 @@ class DialogueAjoutModules(QDialog):
     def _catalogue_recu(self, modules, erreur) -> None:
         self.b_actualiser.setEnabled(True)
         if erreur:
+            self.entrees = []                    # rien d'installable sans catalogue authentifié
+            self._remplir()
             self.statut.setText(f"Catalogue indisponible ({erreur}). Vous pouvez installer un fichier "
                                 "téléchargé à la main avec « Installer depuis un fichier… ».")
             return
         self.entrees = modules
         self._remplir()
-        self.statut.setText(f"{len(modules)} module(s) au catalogue.")
+        self.statut.setText(f"{len(modules)} module(s) au catalogue (signature vérifiée).")
 
     def _remplir(self) -> None:
         for i in range(self.tableau.rowCount()):     # les anciens boutons sont supprimés
@@ -187,7 +216,7 @@ class DialogueAjoutModules(QDialog):
 
         def travail():
             try:
-                donnees = telecharger(self.base + e["fichier"])
+                donnees = telecharger(verifier_base(self.base) + e["fichier"])
                 if hashlib.sha256(donnees).hexdigest() != e["sha256"]:
                     raise ValueError("empreinte différente de celle du catalogue (fichier modifié ou incomplet)")
                 self.signaux.fichier.emit(e["fichier"], donnees, "")
