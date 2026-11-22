@@ -220,6 +220,34 @@ class SortieStereo:
                 sortie[:, i] = np.clip(anneau.lire(n) * self.volume, -1, 1)
 
 
+class TexteAdapte(QLabel):
+    """Libellé à retour à la ligne qui réserve toute sa hauteur.
+
+    Dans un dock, Qt ne tient pas compte de heightForWidth : un QLabel à plusieurs lignes
+    reçoit la hauteur d'une seule et son texte est coupé. On impose donc la hauteur
+    nécessaire à la largeur réelle, à chaque redimensionnement et à chaque nouveau texte.
+    """
+
+    def __init__(self, texte=""):
+        super().__init__(texte)
+        self.setWordWrap(True)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+
+    def _ajuster(self):
+        hauteur = self.heightForWidth(max(self.width(), 1))
+        if hauteur > 0 and hauteur != self.minimumHeight():
+            self.setMinimumHeight(hauteur)
+
+    def setText(self, texte):
+        if texte != self.text():
+            super().setText(texte)
+            self._ajuster()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._ajuster()
+
+
 class StereoRdsFM(Module):
     nom = "Stéréo et RDS en FM"
     description = "Réception FM stéréo, nom de station et radiotexte RDS en mode WFM."
@@ -285,12 +313,11 @@ class StereoRdsFM(Module):
         self.bouton_wfm = QPushButton("Passer en WFM")
         self.bouton_wfm.clicked.connect(lambda: self.ctx.regler_mode("WFM"))
         disposition.addWidget(self.bouton_wfm)
-        self.statut = QLabel()
-        self.station = QLabel()
-        self.message = QLabel()
+        self.statut = TexteAdapte()
+        self.station = TexteAdapte()
+        self.message = TexteAdapte()
         for label in (self.statut, self.station, self.message):
             label.setTextFormat(Qt.TextFormat.PlainText)
-            label.setWordWrap(True)
             disposition.addWidget(label)
         options = QToolButton()
         options.setText("Réglages audio")
@@ -313,8 +340,7 @@ class StereoRdsFM(Module):
         self.ecoute = QCheckBox("Écouter sur la sortie stéréo")
         self.ecoute.toggled.connect(self._ecouter)
         formulaire.addWidget(self.ecoute)
-        aide = QLabel("Pour écouter, mettez le volume principal à zéro et réglez le volume stéréo ici.")
-        aide.setWordWrap(True)
+        aide = TexteAdapte("Pour écouter, mettez le volume principal à zéro et réglez le volume stéréo ici.")
         formulaire.addWidget(aide)
         volume = QSlider(Qt.Orientation.Horizontal)
         volume.setAccessibleName("Volume stéréo")
