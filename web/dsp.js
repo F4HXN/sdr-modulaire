@@ -142,6 +142,26 @@ function puissanceDb(ir, ii) {
   return 10 * Math.log10(s / Math.max(1, ir.length) + 1e-20);
 }
 
+// ------------------------------------------------------------ mesure de la modulation
+// Chaque démodulateur renseigne this.modulation = { type, valeur, nominal, max, unite } :
+//   FM  : excursion crête en kHz (avant désaccentuation) ; nominal ±2,5 / ±5 kHz en NFM, ±75 kHz en WFM
+//   AM  : taux de modulation crête en % (100 % = nominal, au-delà : surmodulation)
+//   BLU, CW : niveau au-dessus du plancher de bruit en dB (pas de porteuse à mesurer)
+// Crêtes prises au 99e centile pour ne pas suivre les craquements isolés.
+function centiles(x, bas, haut, pas = 1) {
+  const t = new Float32Array(Math.ceil(x.length / pas));
+  for (let k = 0, j = 0; k < x.length; k += pas, j++) t[j] = x[k];
+  t.sort();
+  return [t[Math.floor(bas * (t.length - 1))] || 0, t[Math.floor(haut * (t.length - 1))] || 0];
+}
+/** Excursion crête (Hz) d'une sortie de discriminateur (radians par échantillon). */
+function excursion(d, fs, pas) {
+  let m = 0; for (let k = 0; k < d.length; k += pas) m += d[k];
+  m /= Math.ceil(d.length / pas);                      // désaccord : décalage moyen retiré
+  const [a, b] = centiles(d, 0.01, 0.99, pas);
+  return Math.max(b - m, m - a) * fs / (2 * Math.PI);
+}
+
 class Discriminateur {
   constructor() { this.pr = 1; this.pi = 0; }
   traiter(ir, ii) {
@@ -179,6 +199,7 @@ export function creerDemod(mode, largeur) {
         const [cr, ci] = canal.traiter(ir, ii);
         this.niveau = puissanceDb(cr, ci);
         const multiplex = disc.traiter(cr, ci);
+        this.modulation = { type: "FM", valeur: excursion(multiplex, TAUX_INTER, 4) / 1000, nominal: 75, max: 100, unite: "kHz" };
         this.stereo = surMultiplex?.(multiplex);
         const fm = desac.traiter(multiplex);
         const [a] = vers48.traiter(fm, new Float32Array(fm.length));
@@ -194,7 +215,9 @@ export function creerDemod(mode, largeur) {
       domaine: "audio", decalage: 0,
       traiter(ir, ii) {
         const [cr, ci] = canal.traiter(ir, ii); this.niveau = puissanceDb(cr, ci);
-        const a = dc.traiter(desac.traiter(disc.traiter(cr, ci)));
+        const d = disc.traiter(cr, ci), nominal = largeur >= 20000 ? 5 : 2.5;
+        this.modulation = { type: "FM", valeur: excursion(d, TAUX_AUDIO, 1) / 1000, nominal, max: nominal * 1.6, unite: "kHz" };
+        const a = dc.traiter(desac.traiter(d));
         const g = TAUX_AUDIO / (2 * Math.PI * 2500);   // ±2,5 kHz → ±1
         for (let k = 0; k < a.length; k++) a[k] *= g;
         return a;
@@ -208,7 +231,12 @@ export function creerDemod(mode, largeur) {
       traiter(ir, ii) {
         const [cr, ci] = canal.traiter(ir, ii); this.niveau = puissanceDb(cr, ci);
         const e = new Float32Array(cr.length);
-        for (let k = 0; k < cr.length; k++) e[k] = Math.hypot(cr[k], ci[k]);
+        let porteuse = 0;
+        for (let k = 0; k < cr.length; k++) { e[k] = Math.hypot(cr[k], ci[k]); porteuse += e[k]; }
+        porteuse /= Math.max(1, cr.length);
+        const [a, b] = centiles(e, 0.01, 0.99);
+        const taux = porteuse > 0 ? 100 * Math.max(b - porteuse, porteuse - a) / porteuse : 0;
+        this.modulation = { type: "AM", valeur: taux, nominal: 100, max: 125, unite: "%" };
         return dc.traiter(e);
       },
     };
@@ -226,6 +254,9 @@ export function creerDemod(mode, largeur) {
     domaine: "audio", decalage: -bfo,   // CW : la porteuse est entendue à 700 Hz
     traiter(ir, ii) {
       const [cr, ci] = blu.traiter(ir, ii); this.niveau = puissanceDb(cr, ci);
+      // Plancher de bruit : suit aussitôt les baisses, remonte de 1 dB/s environ.
+      this.plancher = this.plancher === undefined ? this.niveau : Math.min(this.niveau, this.plancher + 0.05);
+      this.modulation = { type: cw ? "CW" : "BLU", valeur: Math.max(0, this.niveau - this.plancher), nominal: null, max: 40, unite: "dB" };
       return cr;
     },
   };
@@ -278,6 +309,7 @@ export class Chaine {
     this.stereo = d.stereo;
     audio = this.agcActif ? this.agc.traiter(audio, this.stereo) : audio;
     const muet = this.niveau < this.squelch;
+    this.modulation = d.modulation && { ...d.modulation, valeur: muet ? 0 : d.modulation.valeur };
     const gainStereo = this.agcActif ? this.agc.g : 1;
     for (const canal of this.stereo || []) {
       for (let k = 0; k < canal.length; k++) {

@@ -6,14 +6,14 @@
 //   demarrer()        : état initial et abonnements (this.ctx.abonner(sujet, rappel))
 //   creerPanneau()    : facultatif, renvoie un élément HTML affiché dans la colonne des modules
 //   arreter()         : minuteries, fichiers… (les abonnements sont retirés automatiquement)
-// Sujets : "niveau" (dBFS), "audio" (Float32Array 48 kHz), "iq" (re, im, centre, taux), "vfo" (fréquence, mode).
+// Sujets : "niveau" (dBFS, puis la mesure de modulation du démodulateur, voir dsp.js), "audio" (Float32Array 48 kHz), "iq" (re, im, centre, taux), "vfo" (fréquence, mode).
 // Contexte : frequence(), mode(), reglerFrequence(f), reglerMode(m), taux(), reglerTaux(t) (asynchrone),
 //            gains() (dB), gain() (dB, null = automatique), reglerGain(g) (null = automatique),
 //            lire(clé, défaut), ecrire(clé, valeur).
 // Les rappels du bus doivent rester rapides : on stocke, et une minuterie met l'affichage à jour.
 
-import { FirComplexe, NCO, passeBas, LARGEURS, FFT } from "./dsp.js?v=20261121-fm-stereo";
-import { StereoRds } from "./fm-stereo.js?v=20261121-fm-stereo";
+import { FirComplexe, NCO, passeBas, LARGEURS, FFT } from "./dsp.js?v=20261122-modulation";
+import { StereoRds } from "./fm-stereo.js?v=20261122-modulation";
 import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
 import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261122-niveau";
 import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261122-niveau";
@@ -78,43 +78,79 @@ function texteS(db) {
   return `S9+${Math.min(60, Math.round((db - S9_DBFS) / 10) * 10 || 0)}`;
 }
 
+/** Échelle du cadran : position 0..1, graduations, début de la zone rouge, texte. */
+function echelleSignal() {
+  const grad = [];
+  for (let n = 1; n <= 9; n++) grad.push({ p: positionS(S_MIN + 6 * n), longue: n % 2 === 1, texte: n % 2 ? String(n) : "", rouge: false });
+  for (let d = 10; d <= 60; d += 10) grad.push({ p: positionS(S9_DBFS + d), longue: d % 20 === 0, texte: d % 20 ? "" : `+${d}`, rouge: true });
+  return { cle: "signal", pos: positionS, grad, rouge: 0.6, titre: "S",
+    texte: (v, c) => `${texteS(v)} · ${v.toFixed(1)} dBFS · crête ${texteS(c)}` };
+}
+function echelleModulation(m) {
+  const pas = { kHz: m.max <= 4 ? 1 : m.max <= 8 ? 2 : 25, "%": 25, dB: 10 }[m.unite] || m.max / 4;
+  const grad = [];
+  for (let v = 0; v <= m.max + 1e-9; v += pas / 2) {
+    const longue = Math.abs(v / pas - Math.round(v / pas)) < 1e-6;
+    grad.push({ p: v / m.max, longue, texte: longue ? String(+v.toFixed(1)) : "", rouge: m.nominal !== null && v > m.nominal + 1e-9 });
+  }
+  const nom = { FM: "Excursion", AM: "Modulation", BLU: "Voix", CW: "Signal CW" }[m.type];
+  const f = v => m.unite === "kHz" ? `${v.toFixed(v < 10 ? 1 : 0)} kHz` : m.unite === "%" ? `${Math.round(v)} %` : `+${Math.round(v)} dB`;
+  return { cle: `${m.type}/${m.nominal}/${m.max}`, pos: v => Math.max(0, v) / m.max, grad,
+    rouge: m.nominal === null ? null : m.nominal / m.max, titre: m.unite === "dB" ? "dB" : m.unite,
+    texte: (v, c) => `${nom} ${f(v)} · crête ${f(c)}${m.unite === "dB" ? " au-dessus du bruit" : m.nominal !== null && c > 1.05 * m.nominal ? " · surmodulation" : ""}` };
+}
+
 class SMetre {
   static nom = "S-mètre";
-  static description = "Cadran à aiguille et barre de LED (points S, +dB), niveau en dBFS et maintien de crête.";
+  static description = "Cadran à aiguille et barre de LED : modulation (excursion FM, taux AM, niveau BLU) ou force du signal (points S).";
   demarrer() {
-    this.niveau = -120; this.crete = -120; this.aiguille = 0; this.tCrete = 0;
-    this.ctx.abonner("niveau", db => { this.niveau = db; });
+    this.vue = this.ctx.lire("vue", "modulation");
+    this.niveau = -120; this.modulation = null;
+    this.valeur = 0; this.crete = 0; this.aiguille = 0; this.tCrete = 0;
+    this.ctx.abonner("niveau", (db, m) => { this.niveau = db; this.modulation = m || null; });
+  }
+  echelle() {
+    return this.vue === "modulation" && this.modulation ? echelleModulation(this.modulation) : echelleSignal();
   }
   creerPanneau() {
+    const boutons = ["modulation", "signal"].map(v => {
+      const b = el("button", { type: "button", textContent: v === "modulation" ? "Modulation" : "Signal" });
+      b.onclick = () => { this.vue = v; this.ctx.ecrire("vue", v); maj(); };
+      return b;
+    });
+    const maj = () => boutons.forEach((b, i) => b.setAttribute("aria-pressed", String(["modulation", "signal"][i] === this.vue)));
+    maj();
+    const choix = el("div", { className: "smetre-choix", role: "group", ariaLabel: "Mesure affichée" }, ...boutons);
     this.toile = el("canvas", { className: "smetre-cadran" });
     this.toile.setAttribute("aria-hidden", "true");
-    this.leds = Array.from({ length: NB_LED }, (_, i) => {
-      const p = (i + 0.5) / NB_LED;
-      return el("i", { className: p < 0.6 ? "v" : p < 0.75 ? "j" : "r" });
-    });
+    this.leds = Array.from({ length: NB_LED }, () => el("i"));
     const barre = el("div", { className: "smetre-leds" }, ...this.leds);
     this.txt = el("div", { className: "smetre-txt", role: "status" });
-    let avant = performance.now(), dernierTexte = 0;
+    let avant = performance.now(), dernierTexte = 0, cleEchelle = "";
     const animer = maintenant => {
       this.anim = requestAnimationFrame(animer);
       const dt = Math.min(0.1, (maintenant - avant) / 1000); avant = maintenant;
-      // Balistique d'un galvanomètre : montée rapide, retombée plus lente.
-      const cible = positionS(this.niveau);
-      this.aiguille += (cible - this.aiguille) * (1 - Math.exp(-dt / (cible > this.aiguille ? 0.05 : 0.35)));
-      if (this.niveau >= this.crete) { this.crete = this.niveau; this.tCrete = maintenant; }
-      else if (maintenant - this.tCrete > 1500) this.crete = Math.max(this.niveau, this.crete - 20 * dt);
-      this.dessiner();
-      const allumees = Math.round(this.aiguille * NB_LED), iCrete = Math.min(NB_LED - 1, Math.floor(positionS(this.crete) * NB_LED));
-      this.leds.forEach((led, i) => { led.classList.toggle("on", i < allumees); led.classList.toggle("crete", i === iCrete && i >= allumees); });
-      if (maintenant - dernierTexte > 200) {
-        dernierTexte = maintenant;
-        this.txt.textContent = `${texteS(this.niveau)} · ${this.niveau.toFixed(1)} dBFS · crête ${texteS(this.crete)}`;
+      const e = this.echelle();
+      if (e.cle !== cleEchelle) {              // nouvelle échelle : crête remise à zéro, couleurs des LED
+        cleEchelle = e.cle; this.crete = -Infinity;
+        const r = e.rouge ?? 2;
+        this.leds.forEach((led, i) => { const p = (i + 0.5) / NB_LED; led.className = p < r - 0.12 ? "v" : p < r ? "j" : "r"; });
       }
+      const v = this.vue === "modulation" && this.modulation ? this.modulation.valeur : this.niveau;
+      // Balistique d'un galvanomètre : montée rapide, retombée plus lente.
+      const cible = Math.max(0, Math.min(1.02, e.pos(v)));
+      this.aiguille += (cible - this.aiguille) * (1 - Math.exp(-dt / (cible > this.aiguille ? 0.05 : 0.35)));
+      if (v >= this.crete) { this.crete = v; this.tCrete = maintenant; }
+      else if (maintenant - this.tCrete > 1500) this.crete = Math.max(v, this.crete - (e.cle === "signal" ? 20 : 0.4 * (this.modulation?.max || 1)) * dt);
+      this.dessiner(e);
+      const allumees = Math.round(Math.min(1, this.aiguille) * NB_LED), iCrete = Math.min(NB_LED - 1, Math.floor(e.pos(this.crete) * NB_LED));
+      this.leds.forEach((led, i) => { led.classList.toggle("on", i < allumees); led.classList.toggle("crete", i === iCrete && i >= allumees); });
+      if (maintenant - dernierTexte > 200) { dernierTexte = maintenant; this.txt.textContent = e.texte(v, this.crete); }
     };
     this.anim = requestAnimationFrame(animer);
-    return el("div", { className: "smetre" }, this.toile, barre, this.txt);
+    return el("div", { className: "smetre" }, choix, this.toile, barre, this.txt);
   }
-  dessiner() {
+  dessiner(e) {
     const c = this.toile, r = devicePixelRatio || 1, W = c.clientWidth, H = c.clientHeight;
     if (!W || !H) return;
     if (c.width !== Math.round(W * r) || c.height !== Math.round(H * r)) { c.width = Math.round(W * r); c.height = Math.round(H * r); }
@@ -127,32 +163,30 @@ class SMetre {
     const fond = g.createLinearGradient(0, 0, 0, H);
     fond.addColorStop(0, "#f3e6bf"); fond.addColorStop(1, "#d9c792");
     g.fillStyle = fond; g.beginPath(); g.roundRect(0, 0, W, H, 8); g.fill();
-    // Arcs : noir jusqu'à S9, rouge au-delà.
-    g.lineWidth = 2.5;
-    g.strokeStyle = "#1c1c1c"; g.beginPath(); g.arc(cx, cy, rayon * 0.86, angle(0), angle(0.6)); g.stroke();
-    g.strokeStyle = "#d22"; g.lineWidth = 5; g.beginPath(); g.arc(cx, cy, rayon * 0.86 + 1, angle(0.6), angle(1)); g.stroke();
-    // Graduations et chiffres.
+    // Arcs : noir, puis rouge dans la zone de dépassement.
+    const rouge = e.rouge ?? 1;
+    g.lineWidth = 2.5; g.strokeStyle = "#1c1c1c"; g.beginPath(); g.arc(cx, cy, rayon * 0.86, angle(0), angle(rouge)); g.stroke();
+    if (rouge < 1) { g.strokeStyle = "#d22"; g.lineWidth = 5; g.beginPath(); g.arc(cx, cy, rayon * 0.86 + 1, angle(rouge), angle(1)); g.stroke(); }
     g.textAlign = "center"; g.textBaseline = "middle";
-    const graduer = (p, longue, texte, rouge) => {
-      const [x1, y1] = point(p, rayon * 0.86), [x2, y2] = point(p, rayon * (longue ? 0.79 : 0.82));
-      g.strokeStyle = rouge ? "#d22" : "#1c1c1c"; g.lineWidth = longue ? 2 : 1.2;
-      g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
-      if (texte) { const [xt, yt] = point(p, rayon * 0.95); g.fillStyle = rouge ? "#c11" : "#1c1c1c"; g.fillText(texte, xt, yt); }
-    };
     g.font = `600 ${Math.max(9, Math.round(W / 22))}px "Share Tech Mono", monospace`;
-    for (let s = 1; s <= 9; s++) graduer(positionS(S_MIN + 6 * s), s % 2 === 1, s % 2 === 1 ? String(s) : "", false);
-    for (let d = 10; d <= 60; d += 10) graduer(positionS(S9_DBFS + d), d % 20 === 0, d % 20 === 0 ? `+${d}` : "", true);
+    for (const t of e.grad) {
+      const [x1, y1] = point(t.p, rayon * 0.86), [x2, y2] = point(t.p, rayon * (t.longue ? 0.79 : 0.82));
+      g.strokeStyle = t.rouge ? "#d22" : "#1c1c1c"; g.lineWidth = t.longue ? 2 : 1.2;
+      g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+      if (t.texte) { const [xt, yt] = point(t.p, rayon * 0.95); g.fillStyle = t.rouge ? "#c11" : "#1c1c1c"; g.fillText(t.texte, xt, yt); }
+    }
     g.fillStyle = "#3a3320"; g.font = `700 ${Math.max(10, Math.round(W / 18))}px "Orbitron", sans-serif`;
-    g.fillText("S", cx, cy - rayon * 0.5);
-    // Repère de crête (petit triangle rouge) et aiguille.
-    const [xc, yc] = point(Math.min(1, positionS(this.crete)), rayon * 0.74);
-    g.fillStyle = "#d22"; g.beginPath(); g.arc(xc, yc, 2.5, 0, 2 * Math.PI); g.fill();
-    const [xa, ya] = point(Math.max(0, Math.min(1, this.aiguille)), rayon * 0.9);
+    g.fillText(e.titre, cx, cy - rayon * 0.5);
+    // Repère de crête (point rouge) et aiguille.
+    if (Number.isFinite(this.crete)) {
+      const [xc, yc] = point(Math.max(0, Math.min(1, e.pos(this.crete))), rayon * 0.74);
+      g.fillStyle = "#d22"; g.beginPath(); g.arc(xc, yc, 2.5, 0, 2 * Math.PI); g.fill();
+    }
+    const [xa, ya] = point(Math.max(0, Math.min(1.02, this.aiguille)), rayon * 0.9);
     g.save(); g.beginPath(); g.roundRect(0, 0, W, H, 8); g.clip();
     g.strokeStyle = "rgba(0,0,0,.25)"; g.lineWidth = 3; g.beginPath(); g.moveTo(cx + 2, cy + 2); g.lineTo(xa + 2, ya + 2); g.stroke();
     g.strokeStyle = "#111"; g.lineWidth = 1.8; g.beginPath(); g.moveTo(cx, cy); g.lineTo(xa, ya); g.stroke();
     g.restore();
-    // Cache du pivot.
     g.fillStyle = "#2a2a2a"; g.beginPath(); g.roundRect(0, H - 10, W, 10, [0, 0, 8, 8]); g.fill();
   }
   arreter() { cancelAnimationFrame(this.anim); }
