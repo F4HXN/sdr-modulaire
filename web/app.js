@@ -32,7 +32,11 @@ let source = null, chaine = null, fft = null, audio = null, sortie = null, minut
 const etatDC = { dr: 0, di: 0 };
 let moyenne = null, dernierSpectre = null;
 
+// Confirmation d'ouverture de la clé : au premier bloc d'échantillons reçu, ou erreur au bout de 3 s.
+let attenteEchantillons = null;
+const nomCle = () => { const i = source?.infos?.() || {}; return [i.modele || "clé RTL-SDR", i.tuner && `tuner ${i.tuner}`].filter(Boolean).join(", "); };
 function traiterBloc(octets) {
+  if (attenteEchantillons) { clearTimeout(attenteEchantillons); attenteEchantillons = null; statut(`✓ Clé ouverte, réception en cours : ${nomCle()}.`); $("#statut").className = "ok"; }
   const [ir, ii] = octetsVersIQ(octets, etatDC);
   if (ir.length >= TAILLE_FFT) {
     const db = fft.spectre(ir, ii, 0);
@@ -77,9 +81,10 @@ async function demarrer(type, usb = null) {   // usb : clé déjà autorisée (r
     if (source.reglerPpm) await source.reglerPpm(R.ppm);
     if (source.reglerGain && R.gain !== null) await source.reglerGain(R.gain);
   } catch (e) {
+    const cle = type === "cle" && source;
     source = null; majEtat();
     if (e.name === "NotFoundError") statut("Aucune clé choisie.");
-    else erreur(e.message);
+    else erreur(cle ? `✗ La clé n'a pas pu être ouverte : ${e.message}` : e.message);
     return;
   }
   chaine = new Chaine(R.taux); chaine.regler(R.mode, largeur());
@@ -88,6 +93,12 @@ async function demarrer(type, usb = null) {   // usb : clé déjà autorisée (r
   if (source instanceof SourceSimulation) minuterie = setInterval(() => traiterBloc(source.lire(bloc)), 50);
   else {
     source.surErreur = e => { erreur("Lecture interrompue : " + e.message); arreter(); };
+    statut(`Clé ouverte (${nomCle()}), en attente des échantillons…`);
+    clearTimeout(attenteEchantillons);
+    attenteEchantillons = setTimeout(() => {
+      attenteEchantillons = null;
+      erreur("✗ La clé est ouverte mais n'envoie aucun échantillon : débranchez-la, rebranchez-la puis cliquez à nouveau sur « Connecter la clé ».");
+    }, 3000);
     source.demarrerLecture(Math.ceil((bloc * 2) / 512) * 512, traiterBloc);
   }
   afficherMateriel(); majEtat(); majVfo();
@@ -95,6 +106,7 @@ async function demarrer(type, usb = null) {   // usb : clé déjà autorisée (r
 
 async function arreter() {
   clearInterval(minuterie); minuterie = null;
+  clearTimeout(attenteEchantillons); attenteEchantillons = null;
   const s = source; source = null;
   effacerSpectre();
   if (s) await s.fermer();
