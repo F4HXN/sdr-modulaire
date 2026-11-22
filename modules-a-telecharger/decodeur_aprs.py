@@ -74,6 +74,7 @@ class _Tranche:
         self.reg = 0               # 8 derniers bits (recherche des fanions)
         self.uns = 0
         self.bits: list[int] | None = None   # bits de la trame en cours (None : hors trame)
+        self.abimees = 0
 
     def traiter(self, d: np.ndarray, t0: int, sortie: list) -> None:
         d, self.zi = signal.sosfilt(self.sos, d, zi=self.zi)
@@ -102,6 +103,8 @@ class _Tranche:
                     o = bytes(sum(bits[i + k] << k for k in range(8)) for i in range(0, len(bits), 8))
                     if crc_ax25(o[:-2]) == o[-2] | (o[-1] << 8):
                         sortie.append((t, o[:-2]))
+                    elif self.g == 1.0:
+                        self.abimees += 1          # diagnostic : AFSK présente mais trame déformée
             self.bits, self.uns = [], 0
             return
         if self.bits is None:
@@ -156,6 +159,11 @@ class DemodAFSK:
             nouvelles.append(o)
         self.recentes = [(t, o) for t, o in self.recentes if self.t - t < 2 * self.fs]
         return nouvelles
+
+    @property
+    def abimees(self) -> int:
+        """Trames AFSK vues avec un CRC faux (diagnostic de réception)."""
+        return sum(t.abimees for t in self.tranches if t.g == 1.0)
 
 
 # ======================================================================= AX.25 → texte
@@ -639,7 +647,8 @@ class DecodeurAPRS(Module):
         self.frequence = FREQUENCES[0][0]
         self.blocs: queue.Queue = queue.Queue(maxsize=16)
         self.trames: queue.Queue = queue.Queue()
-        self.etat = {"instant": 0.0, "couvert": False, "saturation": 0.0, "perdus": 0}
+        self.etat = {"instant": 0.0, "couvert": False, "saturation": 0.0, "perdus": 0,
+                     "crete": None, "bruit": None, "abimees": 0, "calcul": 0.0}
         self.nombre = 0
         self.journal = None
         self.fenetre = None
@@ -669,6 +678,7 @@ class DecodeurAPRS(Module):
             if tache is None:
                 break
             iq, centre, taux = tache
+            debut = time.perf_counter()
             f = self.frequence
             couvert = abs(f - centre) + 10_000 < 0.42 * taux
             sat = float(np.mean((np.abs(iq.real) > 0.95) | (np.abs(iq.imag) > 0.95)))
@@ -687,6 +697,11 @@ class DecodeurAPRS(Module):
                 prec = 0j
                 demod = DemodAFSK()
             canal = dec2.traiter(dec1.traiter(nco.melanger(iq)))
+            # niveau du canal : crête de la seconde écoulée et plancher (minimum glissant), en dB
+            p = 10 * math.log10(float(np.mean(np.abs(canal) ** 2)) + 1e-20)
+            e = self.etat
+            e["bruit"] = p if e["bruit"] is None else min(p, e["bruit"] + 0.02)
+            e["crete"] = p if e["crete"] is None else max(p, e["crete"] - 0.5)
             z = np.concatenate(([prec], canal))
             prec = canal[-1] if len(canal) else prec
             fm = np.angle(z[1:] * np.conj(z[:-1])).astype(np.complex64)       # discriminateur FM
@@ -695,6 +710,8 @@ class DecodeurAPRS(Module):
                 texte = trame_vers_texte(o)
                 if texte:
                     self.trames.put(texte)
+            self.etat["abimees"] = demod.abimees
+            self.etat["calcul"] = 0.9 * self.etat["calcul"] + 0.1 * (time.perf_counter() - debut) / (len(iq) / taux)
 
     # ------------------------------------------------------------- interface
     def creer_widget(self) -> QWidget:
@@ -717,6 +734,13 @@ class DecodeurAPRS(Module):
         self.statut = QLabel("—")
         self.statut.setWordWrap(True)
         lay.addWidget(self.statut)
+        self.diag = QLabel("")
+        self.diag.setWordWrap(True)
+        self.diag.setStyleSheet("color: gray")
+        self.diag.setToolTip("Diagnostic de réception : crête du canal au-dessus du bruit (une émission APRS "
+                             "fait monter ce chiffre), trames vues mais déformées, blocs jetés faute de temps "
+                             "de calcul, part du temps réel utilisée par le module")
+        lay.addWidget(self.diag)
         self.liste = QListWidget()
         self.liste.setWordWrap(True)
         hauteur = self.liste.fontMetrics().lineSpacing()
@@ -844,6 +868,12 @@ class DecodeurAPRS(Module):
             if e["saturation"] > 0.001:
                 texte += f" · SATURATION {100 * e['saturation']:.1f} % : baissez le gain RF ou éloignez l'émetteur"
         self.statut.setText(texte)
+        if e["couvert"] and e["crete"] is not None and time.monotonic() - e["instant"] <= 1:
+            self.diag.setText(f"Canal : crête +{e['crete'] - e['bruit']:.0f} dB au-dessus du bruit · "
+                              f"{e['abimees']} trame(s) abîmée(s) · {e['perdus']} bloc(s) perdu(s) · "
+                              f"calcul {100 * e['calcul']:.0f} %")
+        else:
+            self.diag.setText("")
         if self.fenetre is not None and self.fenetre.isVisible():
             self.fenetre.etat.setText(texte)
         if self.carte is not None and self.carte.isVisible():
