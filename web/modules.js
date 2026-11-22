@@ -1072,9 +1072,9 @@ class DecodeurCW {
       a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
     };
     // Agrandir : le texte passe dans une fenêtre flottante, déplaçable et redimensionnable (taille et place retenues).
-    const contenu = el("div", { className: "cw-contenu" }, this.zone, this.statut,
-      el("div", { className: "scanner-choix cw-actions" }, mode, effacer, copier, enregistrer));
-    const agrandir = el("button", { type: "button", textContent: "Agrandir", className: "capteurs-agrandir" });
+    const agrandir = el("button", { type: "button", textContent: "Agrandir", className: "cw-agrandir" });
+    const actions = el("div", { className: "scanner-choix cw-actions" }, mode, effacer, copier, enregistrer, agrandir);
+    const contenu = el("div", { className: "cw-contenu" }, this.zone, this.statut, actions);
     agrandir.setAttribute("aria-haspopup", "dialog");
     const titre = el("h2", { id: "cw-titre", textContent: "Décodeur CW" });
     const plusPetit = el("button", { type: "button", textContent: "A−", title: "Texte plus petit" });
@@ -1089,14 +1089,15 @@ class DecodeurCW {
     dialogue.setAttribute("aria-labelledby", titre.id);
     police(0);
     const ouvrir = fenetreFlottante(dialogue, entete, this.ctx);
-    const panneau = el("div", {}, contenu, agrandir, dialogue);
+    const attente = el("div", { className: "petit", textContent: "Texte affiché dans la fenêtre agrandie." });
+    const panneau = el("div", {}, contenu, dialogue);
     agrandir.onclick = () => {
       if (dialogue.open) { fermer.focus(); return; }
-      dialogue.append(contenu); agrandir.textContent = "Fenêtre ouverte";
+      agrandir.remove(); dialogue.append(contenu); panneau.prepend(attente);
       ouvrir(); this.zone.scrollTop = this.zone.scrollHeight; fermer.focus();
     };
     fermer.onclick = () => dialogue.close();
-    dialogue.addEventListener("close", () => { panneau.prepend(contenu); agrandir.textContent = "Agrandir"; agrandir.focus(); });
+    dialogue.addEventListener("close", () => { attente.remove(); actions.append(agrandir); panneau.prepend(contenu); agrandir.focus(); });
     this.dialogue = dialogue;
     this.minuterie = setInterval(() => this.rafraichir(), 250);
     this.rafraichir();

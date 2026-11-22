@@ -25,7 +25,7 @@ import numpy as np
 from PySide6.QtCore import QByteArray, Qt, QTimer
 from PySide6.QtGui import QFont, QGuiApplication, QTextCursor
 from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
-                               QVBoxLayout, QWidget)
+                               QSizePolicy, QVBoxLayout, QWidget)
 from scipy import signal
 
 from sdrmod.modules import Module
@@ -312,15 +312,25 @@ class DecodeurCW(Module):
 
     # ------------------------------------------------------------- interface
     def creer_widget(self) -> QWidget:
+        # Panneau compact dans la colonne des modules : 4 à 5 lignes de texte ; le texte en grand
+        # est dans la fenêtre « Agrandir ».
         w = QWidget()
+        w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         lay = QVBoxLayout(w)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
         self.zone = QPlainTextEdit()
         self.zone.setReadOnly(True)
-        self.zone.setFont(QFont("DejaVu Sans Mono", 13))
+        self.zone.setFont(QFont("DejaVu Sans Mono", 11))
         self.zone.setMaximumBlockCount(2000)
         self.zone.setPlaceholderText("Mode CW, squelch ouvert, cale-toi sur une station…")
-        lay.addWidget(self.zone, 1)
+        ligne_h = self.zone.fontMetrics().lineSpacing()
+        self.zone.setMinimumHeight(2 * ligne_h + 12)
+        self.zone.setMaximumHeight(5 * ligne_h + 12)
+        self.zone.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        lay.addWidget(self.zone)
         self.etat = QLabel("—")
+        self.etat.setWordWrap(True)
         lay.addWidget(self.etat)
         ligne = QHBoxLayout()
         b_cw = QPushButton("Mode CW")
