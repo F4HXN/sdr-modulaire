@@ -447,6 +447,17 @@ const presence = (fin = false) => {
   const url = `/sdr-web/presence?s=${PRESENCE}&cle=${cle}${fin ? "&fin=1" : ""}`;
   if (fin) navigator.sendBeacon?.(url); else fetch(url, { cache: "no-store", keepalive: true }).catch(() => {});
 };
+// Nombre d'utilisateurs affiché dans la barre (presence.json, mis à jour toutes les 15 s par le serveur).
+const afficherEnLigne = () => fetch("/visites/presence.json", { cache: "no-store" })
+  .then(r => r.ok ? r.json() : null)
+  .then(p => {
+    if (!p || !Number.isFinite(p.en_ligne)) return;
+    const n = Math.max(1, p.en_ligne), cles = Math.max(p.avec_cle || 0, source && !(source instanceof SourceSimulation) ? 1 : 0);
+    const zone = $("#en-ligne");
+    zone.textContent = `${n} utilisateur${n > 1 ? "s" : ""} en ce moment${cles ? ` · ${cles} avec une clé` : ""}`;
+    zone.hidden = false;
+  }).catch(() => {});
 presence(); setInterval(presence, 30000);
+afficherEnLigne(); setInterval(afficherEnLigne, 30000);
 addEventListener("pagehide", () => presence(true));
 navigator.usb?.addEventListener("disconnect", e => { if (source?.usb === e.device) { erreur("La clé a été débranchée."); source = null; majEtat(); } });
