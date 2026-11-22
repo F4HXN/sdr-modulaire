@@ -24,6 +24,33 @@ from sdrmod.modules import Module
 
 MODES = {"FT8": (15, "-8"), "FT4": (7.5, "-5")}
 TAUX_JT9 = 12_000
+# Fréquences d'appel (Hz) de la table par défaut de WSJT-X : (bande, FT8, FT4), None si le mode n'y est pas.
+BANDES = [
+    ("160 m", 1_840_000, None), ("80 m", 3_573_000, 3_575_000), ("60 m", 5_357_000, 5_357_000),
+    ("40 m", 7_074_000, 7_047_500), ("30 m", 10_136_000, 10_140_000), ("20 m", 14_074_000, 14_080_000),
+    ("17 m", 18_100_000, 18_104_000), ("15 m", 21_074_000, 21_140_000), ("12 m", 24_915_000, 24_919_000),
+    ("10 m", 28_074_000, 28_180_000), ("6 m", 50_313_000, 50_318_000), ("4 m", 70_154_000, None),
+    ("2 m", 144_174_000, 144_170_000), ("70 cm", 432_174_000, None),
+]
+
+
+def frequence_bande(bande: str, mode: str) -> int | None:
+    """Fréquence d'appel d'une bande dans un mode, ou None."""
+    for nom, ft8, ft4 in BANDES:
+        if nom == bande:
+            return ft8 if mode == "FT8" else ft4
+    return None
+
+
+def bande_de(frequence: float, mode: str) -> str | None:
+    """Bande dont la fréquence d'appel (à 500 Hz près) est celle du VFO dans ce mode, ou None."""
+    for nom, ft8, ft4 in BANDES:
+        f = ft8 if mode == "FT8" else ft4
+        if f is not None and abs(frequence - f) < 500:
+            return nom
+    return None
+
+
 MESSAGE = re.compile(r"^\d{6}\s+(-?\d+)\s+([+-]?[\d.]+)\s+(\d+)\s+[~+]\s+(.+)$")
 
 
@@ -63,7 +90,9 @@ class DecodeurFT(Module):
 
     def demarrer(self) -> None:
         self.executable = shutil.which("jt9")
-        self.reglage = ("FT8", self.ctx.frequence(), self.ctx.mode(), 0)
+        frequence = self.ctx.frequence()
+        mode = "FT4" if bande_de(frequence, "FT4") and not bande_de(frequence, "FT8") else "FT8"
+        self.reglage = (mode, frequence, self.ctx.mode(), 0)
         self.tampon = None
         self.fin_audio = None
         self.flux = None
@@ -145,19 +174,23 @@ class DecodeurFT(Module):
         layout = QVBoxLayout(self.contenu)
         layout.setContentsMargins(0, 0, 0, 0)
         ligne = QHBoxLayout()
-        choix = QComboBox()
-        choix.addItems(list(MODES))
-        choix.setAccessibleName("Mode numérique")
-        choix.currentTextChanged.connect(self._choisir)
-        usb = QPushButton("Mode USB")
-        usb.clicked.connect(lambda: self.ctx.regler_mode("USB"))
+        self.choix = QComboBox()
+        self.choix.addItems(list(MODES))
+        self.choix.setCurrentText(self.reglage[0])
+        self.choix.setAccessibleName("Mode numérique")
+        self.choix.currentTextChanged.connect(self._choisir)
+        self.bande = QComboBox()
+        self.bande.setAccessibleName("Bande")
+        self.bande.setToolTip("Accorde le récepteur en USB sur la fréquence d'appel de la bande")
+        self.bande.activated.connect(self._accorder)
+        self._remplir_bandes()
         effacer = QPushButton("Effacer")
         effacer.clicked.connect(lambda: self.zone.clear())
         self.ouvrir = QPushButton("Agrandir")
         self.ouvrir.clicked.connect(self.agrandir)
         self.reduire = QPushButton("Réduire")
         self.reduire.hide()
-        for bouton in (choix, usb, effacer, self.ouvrir, self.reduire):
+        for bouton in (self.choix, self.bande, effacer, self.ouvrir, self.reduire):
             ligne.addWidget(bouton)
         layout.addLayout(ligne)
         self.zone = QPlainTextEdit()
@@ -183,9 +216,42 @@ class DecodeurFT(Module):
         self._rafraichir()
         return panneau
 
+    def _remplir_bandes(self) -> None:
+        """Liste des bandes du mode choisi ; « Bande… » quand le VFO n'est sur aucune fréquence d'appel."""
+        mode = self.reglage[0]
+        self.bande.blockSignals(True)
+        self.bande.clear()
+        self.bande.addItem("Bande…", None)
+        for nom, ft8, ft4 in BANDES:
+            f = ft8 if mode == "FT8" else ft4
+            if f is not None:
+                self.bande.addItem(f"{nom} · {f / 1e6:.{3 if f % 1000 == 0 else 4}f}".replace(".", ","), nom)
+        self.bande.blockSignals(False)
+        self._suivre_vfo()
+
+    def _suivre_vfo(self) -> None:
+        i = self.bande.findData(bande_de(self.reglage[1], self.reglage[0]))
+        i = max(i, 0)
+        if self.bande.currentIndex() != i:
+            self.bande.setCurrentIndex(i)
+
+    def _accorder(self, index: int) -> None:
+        f = frequence_bande(self.bande.itemData(index), self.reglage[0])
+        if f is not None:
+            self.ctx.regler_mode("USB")
+            self.ctx.regler_frequence(f)
+            self._suivre_vfo()
+
     def _choisir(self, mode: str) -> None:
+        bande = bande_de(self.reglage[1], self.reglage[0])
         self.reglage = (mode, *self.reglage[1:3], self.reglage[3] + 1)
         self.zone.clear()
+        self._remplir_bandes()
+        f = frequence_bande(bande, mode) if bande else None
+        if f is not None:                                # même bande, fréquence d'appel de l'autre mode
+            self.ctx.regler_mode("USB")
+            self.ctx.regler_frequence(f)
+            self._suivre_vfo()
 
     def agrandir(self) -> None:
         self.disposition.removeWidget(self.contenu)
@@ -208,6 +274,7 @@ class DecodeurFT(Module):
         self.ouvrir.show()
 
     def _rafraichir(self) -> None:
+        self._suivre_vfo()
         while True:
             try:
                 reglage, lignes, bilan = self.resultats.get_nowait()
@@ -220,7 +287,7 @@ class DecodeurFT(Module):
         if not self.executable:
             statut = "jt9 introuvable. Installez WSJT-X."
         elif self.reglage[2] != "USB":
-            statut = "Sélectionnez USB et accordez-vous sur une fréquence FT8 ou FT4."
+            statut = "Choisissez une bande : le récepteur passe en USB sur la fréquence d'appel."
         elif time.time_ns() - self.dernier_audio > 1_000_000_000:
             statut = "En attente du signal audio."
         elif self.bilan and self.bilan[0] == self.reglage:

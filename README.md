@@ -176,8 +176,8 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
   Carte des stations comme pour l'ADS-B (positions non compressées, compressées, Mic-E, objets, items).
   Aussi dans SDR Web (`web/aprs.js`, même algorithme, mêmes trames).
 - **Décodeur FT8 / FT4** : messages FT8 (créneaux de 15 s) et FT4 (7,5 s) reçus en USB, décodés par `jt9`
-  de WSJT-X (`sudo apt install wsjtx`). Horloge synchronisée (NTP) requise ; fréquences usuelles : 7,074 ·
-  14,074 · 21,074 MHz en FT8, 7,0475 · 14,080 MHz en FT4 (clé qui reçoit la HF ou convertisseur).
+  de WSJT-X (`sudo apt install wsjtx`). Horloge synchronisée (NTP) requise. Liste « Bande » : 160 m à 70 cm,
+  fréquences d'appel de WSJT-X, accord en USB d'un clic (clé qui reçoit la HF ou convertisseur).
   Aussi dans SDR Web (`web/ft8-worker.js`, moteur ft8_lib compilé en WebAssembly dans `web/ft8-lib/`).
 
 ## Pistes

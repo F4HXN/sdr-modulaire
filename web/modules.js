@@ -1336,6 +1336,16 @@ class DecodeurAPRS {
 }
 
 const CRENEAUX_FT = { FT8: 15000, FT4: 7500 };
+// Fréquences d'appel (Hz) de la table par défaut de WSJT-X : [bande, FT8, FT4], null si le mode n'y est pas.
+const BANDES_FT = [
+  ["160 m", 1_840_000, null], ["80 m", 3_573_000, 3_575_000], ["60 m", 5_357_000, 5_357_000],
+  ["40 m", 7_074_000, 7_047_500], ["30 m", 10_136_000, 10_140_000], ["20 m", 14_074_000, 14_080_000],
+  ["17 m", 18_100_000, 18_104_000], ["15 m", 21_074_000, 21_140_000], ["12 m", 24_915_000, 24_919_000],
+  ["10 m", 28_074_000, 28_180_000], ["6 m", 50_313_000, 50_318_000], ["4 m", 70_154_000, null],
+  ["2 m", 144_174_000, 144_170_000], ["70 cm", 432_174_000, null],
+];
+const frequenceBandeFT = (bande, mode) => { const b = BANDES_FT.find(b => b[0] === bande); return b ? b[mode === "FT8" ? 1 : 2] : null; };
+const bandeFT = (f, mode) => BANDES_FT.find(b => { const g = b[mode === "FT8" ? 1 : 2]; return g !== null && Math.abs(f - g) < 500; })?.[0] ?? "";
 
 class DecodeurFT {
   static nom = "Décodeur FT8 / FT4";
@@ -1410,30 +1420,56 @@ class DecodeurFT {
     const mode = el("select", { ariaLabel: "Mode numérique" },
       ...Object.keys(CRENEAUX_FT).map(v => el("option", { value: v, textContent: v })));
     mode.value = this.mode;
+    // Liste des bandes : choisir une bande passe en USB sur sa fréquence d'appel ; « Bande… » si le VFO n'est sur aucune.
+    const bande = el("select", { ariaLabel: "Bande", title: "Accorde le récepteur en USB sur la fréquence d'appel de la bande" });
+    const accorder = f => {
+      if (f === null) return;
+      this.ctx.reglerMode("USB"); this.ctx.reglerFrequence(f);
+      // La clé ne descend pas toujours en HF : l'accord est alors ramené au bord de sa plage.
+      const ici = this.ctx.frequence();
+      this.horsPortee = Math.abs(ici - f) > 1000 ? { f, ici } : null;
+      suivre();
+    };
+    const suivre = () => { const b = bandeFT(this.ctx.frequence(), this.mode); if (bande.value !== b) bande.value = b; };
+    const remplir = () => {
+      bande.replaceChildren(el("option", { value: "", textContent: "Bande…" }),
+        ...BANDES_FT.filter(b => b[this.mode === "FT8" ? 1 : 2] !== null).map(([nom, ft8, ft4]) => {
+          const f = this.mode === "FT8" ? ft8 : ft4;
+          return el("option", { value: nom, textContent: `${nom} · ${(f / 1e6).toFixed(f % 1000 ? 4 : 3).replace(".", ",")}` });
+        }));
+      suivre();
+    };
+    bande.onchange = () => accorder(frequenceBandeFT(bande.value, this.mode));
     mode.onchange = () => {
+      const avant = bandeFT(this.ctx.frequence(), this.mode);
       this.mode = mode.value;
       this.ctx.ecrire("mode", this.mode);
       this.reinitialiser();
       this.zone.replaceChildren();
+      remplir();
+      if (avant) accorder(frequenceBandeFT(avant, this.mode));   // même bande, fréquence d'appel de l'autre mode
     };
-    const usb = el("button", { type: "button", textContent: "Mode USB" });
-    usb.onclick = () => this.ctx.reglerMode("USB");
+    remplir();
     const effacer = el("button", { type: "button", textContent: "Effacer" });
     effacer.onclick = () => this.zone.replaceChildren();
     this.zone = el("div", { className: "cw-texte", role: "log", ariaLive: "polite" });
     this.zone.dataset.vide = "UTC · fréquence audio · message";
     const statut = el("div", { className: "petit" });
     const actualiser = () => {
-      const texte = this.erreur ? `Erreur : ${this.erreur}` : !this.pret ? "Chargement du décodeur…"
-        : this.ctx.mode() !== "USB" ? "Sélectionnez USB."
+      if (this.horsPortee && this.ctx.frequence() !== this.horsPortee.ici) this.horsPortee = null;   // VFO déplacé depuis
+      const texte = this.erreur ? `Erreur : ${this.erreur}`
+        : this.horsPortee ? `${(this.horsPortee.f / 1e6).toFixed(3).replace(".", ",")} MHz hors de portée de la clé : activez l’entrée HF ou indiquez un convertisseur.`
+        : !this.pret ? "Chargement du décodeur…"
+        : this.ctx.mode() !== "USB" ? "Choisissez une bande : le récepteur passe en USB sur la fréquence d’appel."
         : Date.now() - this.dernierAudio > 1000 ? "En attente du signal audio."
         : this.bilan || "En attente d’un créneau UTC complet…";
       if (statut.textContent !== texte) statut.textContent = texte;
+      suivre();
     };
     actualiser();
     this.minuterie = setInterval(actualiser, 250);
-    const actions = el("div", { className: "scanner-choix cw-actions" }, mode, usb, effacer);
-    const aide = el("small", { textContent: "Synchronisez l’horloge de l’ordinateur et accordez-vous sur une fréquence FT8 ou FT4." });
+    const actions = el("div", { className: "scanner-choix cw-actions" }, mode, bande, effacer);
+    const aide = el("small", { textContent: "Synchronisez l’horloge de l’ordinateur et choisissez une bande (clé qui reçoit la HF ou convertisseur)." });
     const contenu = el("div", { className: "cw-contenu" }, actions, this.zone, statut, aide);
     const { panneau, dialogue } = panneauAgrandissable(this.ctx, {
       titre: DecodeurFT.nom, id: "ft-titre", contenu, actions, tailleDefaut: 1.1, defiler: this.zone,
