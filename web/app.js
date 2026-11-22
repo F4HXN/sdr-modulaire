@@ -216,7 +216,7 @@ addEventListener("keydown", e => {
 function majEtat() {
   const actif = !!source;
   $("#b-arret").disabled = !actif;
-  $("#etat").textContent = actif ? `${source.nom} — en marche` : "arrêté";
+  $("#etat").textContent = actif ? `${source.nom} en fonction` : "arrêté";
   $("#etat").className = actif ? "marche" : "";
   const cle = actif && !(source instanceof SourceSimulation);   // une vraie clé est ouverte
   $("#b-cle").classList.toggle("connecte", cle);
