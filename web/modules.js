@@ -8,15 +8,15 @@
 //   arreter()         : minuteries, fichiers… (les abonnements sont retirés automatiquement)
 // Sujets : "niveau" (dBFS), "audio" (Float32Array 48 kHz), "iq" (re, im, centre, taux), "vfo" (fréquence, mode).
 // Contexte : frequence(), mode(), reglerFrequence(f), reglerMode(m), taux(), reglerTaux(t) (asynchrone),
-//            gains() (dB), reglerGain(g) (null = automatique),
+//            gains() (dB), gain() (dB, null = automatique), reglerGain(g) (null = automatique),
 //            lire(clé, défaut), ecrire(clé, valeur).
 // Les rappels du bus doivent rester rapides : on stocke, et une minuterie met l'affichage à jour.
 
 import { FirComplexe, NCO, passeBas, LARGEURS, FFT } from "./dsp.js?v=20261121-fm-stereo";
 import { StereoRds } from "./fm-stereo.js?v=20261121-fm-stereo";
 import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
-import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261122-diag";
-import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261122-diag";
+import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261122-niveau";
+import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261122-niveau";
 import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
@@ -319,6 +319,10 @@ class ModuleStereoRds {
 }
 
 const FREQUENCE_ADSB = 1_090_000_000, TAUX_ADSB = 2_400_000;
+// Niveau automatique ADS-B : le gain du tuner est ajusté pour garder le plancher de bruit entre
+// BRUIT_MIN et BRUIT_MAX (dBFS) sans faire saturer le convertisseur 8 bits. Le gain automatique
+// du tuner, réglé pour la FM, est trop bas pour les impulsions brèves de 1090 MHz.
+const BRUIT_MIN = -36, BRUIT_MAX = -18, GAIN_DEPART = 40, STABILISATION_GAIN = 2000;   // dBFS, dB, ms
 
 class ADSB {
   static nom = "ADS-B (avions)";
@@ -329,6 +333,7 @@ class ADSB {
     this.trafic.station = this.ctx.lire("station", null);
     this.derniersIQ = -Infinity; this.etat = "attente"; this.messages = 0; this.debit = 0;
     this.echantillons = 0; this.tauxRecu = 0;
+    this.auto = this.ctx.lire("niveauAuto", true); this.prochainReglage = 0; this.etatNiveau = "";
     this.ctx.abonner("iq", (re, im, centre, taux) => {
       const maintenant = performance.now(), interrompu = maintenant - this.derniersIQ > 1000;
       this.derniersIQ = maintenant; this.echantillons += re.length; this.tauxRecu = taux;
@@ -344,13 +349,21 @@ class ADSB {
 
   creerPanneau() {
     const accorder = el("button", { type: "button", textContent: "Accorder sur 1090 MHz" });
-    accorder.title = "Règle l'échantillonnage sur 2,4 MS/s, le gain au maximum et la fréquence sur 1090 MHz";
+    accorder.title = "Règle l'échantillonnage sur 2,4 MS/s, le gain et la fréquence sur 1090 MHz";
     accorder.onclick = async () => {
       if (this.ctx.taux() < TAUX_ADSB) await this.ctx.reglerTaux(TAUX_ADSB);
       const gains = this.ctx.gains();
-      if (gains.length) this.ctx.reglerGain(Math.max(...gains));   // impulsions brèves : gain maximal
+      // Impulsions brèves : gain fort. Avec le niveau automatique, départ vers 40 dB, puis ajustement.
+      if (gains.length) this.ctx.reglerGain(this.auto ? gains.reduce((m, x) => Math.abs(x - GAIN_DEPART) < Math.abs(m - GAIN_DEPART) ? x : m) : Math.max(...gains));
+      this.prochainReglage = performance.now() + STABILISATION_GAIN;
       this.ctx.reglerMode("AM"); this.ctx.reglerFrequence(FREQUENCE_ADSB);
     };
+    const caseAuto = el("input", { type: "checkbox", checked: this.auto });
+    caseAuto.onchange = () => { this.auto = caseAuto.checked; this.ctx.ecrire("niveauAuto", this.auto); this.etatNiveau = ""; };
+    const niveauAuto = el("label", { className: "petit adsb-auto",
+      title: "Ajuste le gain RF pour 1090 MHz : baisse s'il y a saturation ou un bruit trop fort, monte si le signal est trop faible" },
+      caseAuto, " Niveau automatique");
+    this.texteNiveau = el("span", { className: "petit" });
     const ouvrir = el("button", { type: "button", textContent: "Ouvrir la carte", className: "adsb-ouvrir" });
     ouvrir.setAttribute("aria-haspopup", "dialog");
     this.statut = el("div", { className: "petit" });
@@ -359,6 +372,7 @@ class ADSB {
 
     // Fenêtre de la carte.
     const titre = el("h2", { id: "adsb-titre", textContent: "ADS-B · avions sur 1090 MHz" });
+    titre.title = "Tirer la barre pour déplacer · coin en bas à droite pour agrandir";
     this.resume = el("span", { className: "adsb-resume" });
     const fermer = el("button", { type: "button", textContent: "Fermer" });
     const recentrer = el("button", { type: "button", textContent: "Recentrer" });
@@ -383,9 +397,13 @@ class ADSB {
       el("header", {}, titre, this.resume, el("span", { className: "adsb-boutons" }, recentrer, fermer)),
       el("div", { className: "adsb-corps" }, this.toile, el("div", { className: "adsb-cote" }, table)), pied);
     this.dialogue.setAttribute("aria-labelledby", titre.id);
+    const afficher = fenetreFlottante(this.dialogue, this.dialogue.querySelector("header"), this.ctx, "carte");
     this.carte = new CarteRadar(this.toile, { surChoix: icao => { this.choisi = icao; this.majTableau(); } });
     this.carte.station = this.trafic.station;
-    ouvrir.onclick = () => { this.dialogue.showModal(); this.carte.avions = [...this.trafic.avions.values()]; this.carte.centrer(); };
+    ouvrir.onclick = () => {
+      if (this.dialogue.open) { fermer.focus(); return; }
+      afficher(); this.carte.avions = [...this.trafic.avions.values()]; this.carte.centrer();
+    };
     fermer.onclick = () => this.dialogue.close();
     recentrer.onclick = () => this.carte.centrer();
     this.dialogue.addEventListener("close", () => ouvrir.focus());
@@ -398,14 +416,19 @@ class ADSB {
         this.debit = (this.messages - avant) / dt; avant = this.messages; tAvant = maintenant; this.trafic.nettoyer();
         // Diagnostic : part des échantillons reçus, niveaux, préambules, Mode S courts, CRC faux (par seconde).
         const ech = this.echantillons, pre = d?.preambules || 0, df = d?.autresDF || 0, crc = d?.crcFaux || 0;
+        const sat = d?.satures || 0, rec = d?.recus || 0;
+        const partSat = rec > (dAvant.rec || 0) ? Math.max(0, sat - (dAvant.sat || 0)) / (rec - dAvant.rec) : 0;
+        if (this.etat === "ecoute" && d) this.reglerNiveau(d, partSat);
+        else this.etatNiveau = "";
         if (this.etat === "ecoute" && d) {
           const recus = Math.min(999, Math.round(100 * (ech - dAvant.ech) / dt / this.tauxRecu));
           const db = x => (20 * Math.log10(Math.max(x, 1e-6))).toFixed(0);
           this.diag.textContent = `Diagnostic : échantillons ${recus} % · bruit ${db(d.bruit)} dB · crête ${db(d.crete)} dB` +
             ` · préambules ${Math.max(0, Math.round((pre - dAvant.pre) / dt))}/s · DF11 ${Math.max(0, Math.round((df - dAvant.df) / dt))}/s` +
-            ` · CRC faux ${Math.max(0, Math.round((crc - dAvant.crc) / dt))}/s`;
+            ` · CRC faux ${Math.max(0, Math.round((crc - dAvant.crc) / dt))}/s · saturation ${(100 * partSat).toFixed(partSat < 0.01 ? 2 : 1)} %`;
         } else this.diag.textContent = "";
-        dAvant = { ech, pre, df, crc };
+        dAvant = { ech, pre, df, crc, sat, rec };
+        this.texteNiveau.textContent = this.etatNiveau;
       }
       if (maintenant - this.derniersIQ > 1000) this.etat = "attente";
       this.statut.textContent = {
@@ -421,7 +444,33 @@ class ADSB {
         this.carte.avions = avions; this.carte.dessiner(); this.majTableau();
       }
     }, 250);
-    return el("div", {}, accorder, this.statut, this.diag, this.liste, ouvrir, this.dialogue);
+    return el("div", {}, accorder, el("div", { className: "adsb-niveau" }, niveauAuto, this.texteNiveau),
+      this.statut, this.diag, this.liste, ouvrir, this.dialogue);
+  }
+
+  /** Niveau automatique : un réglage au plus toutes les 2 s, le temps que bruit et crête se stabilisent. */
+  reglerNiveau(d, partSat) {
+    if (!this.auto) { this.etatNiveau = ""; return; }
+    const gains = [...this.ctx.gains()].sort((a, b) => a - b);
+    if (!gains.length) { this.etatNiveau = "gain non réglable sur cette source"; return; }
+    const actuel = this.ctx.gain();
+    let i = actuel === null ? gains.length - 1 : gains.findIndex(x => x >= actuel - 0.05);
+    if (i < 0) i = gains.length - 1;
+    const db = x => 20 * Math.log10(Math.max(x, 1e-6)), bruit = db(d.bruit), crete = db(d.crete);
+    let pas = 0, raison = "réglé";
+    if (partSat > 0.01) { pas = -3; raison = "saturation"; }
+    else if (partSat > 0.001 || crete > -3) { pas = -1; raison = "saturation"; }
+    else if (bruit > BRUIT_MAX + 6) { pas = -2; raison = "bruit trop fort"; }
+    else if (bruit > BRUIT_MAX) { pas = -1; raison = "bruit trop fort"; }
+    else if (bruit < BRUIT_MIN && crete < -10) { pas = bruit < BRUIT_MIN - 8 ? 2 : 1; raison = "signal faible"; }
+    const j = Math.max(0, Math.min(gains.length - 1, i + pas));
+    const maintenant = performance.now();
+    if (j !== i && actuel !== null && maintenant < this.prochainReglage) raison = "stabilisation";
+    else if (j !== i || actuel === null) {
+      this.ctx.reglerGain(gains[j]); this.prochainReglage = maintenant + STABILISATION_GAIN;
+      i = j;
+    } else if (pas) raison += pas < 0 ? " (gain au minimum)" : " (gain au maximum)";
+    this.etatNiveau = `gain ${gains[i].toFixed(1)} dB · ${raison}`;
   }
 
   trier() {   // ordre stable : par distance si la station est connue, sinon par indicatif

@@ -3,8 +3,8 @@
 
 import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261121-fm-stereo";
 import { CleRtlSdr } from "./rtlsdr.js?v=20261122-pll";
-import { SourceSimulation } from "./simulation.js?v=20261122-diag";
-import { MODULES } from "./modules.js?v=20261122-fenetre";
+import { SourceSimulation } from "./simulation.js?v=20261122-niveau";
+import { MODULES } from "./modules.js?v=20261122-niveau";
 
 const $ = s => document.querySelector(s);
 const PAS = [100, 1000, 2500, 5000, 6250, 8330, 10000, 12500, 25000, 100000, 1000000];
@@ -377,6 +377,7 @@ const contexte = module => ({
   frequence, mode: () => R.mode, reglerFrequence, reglerMode,
   taux: () => R.taux,
   gains: () => source?.gains?.() || [],
+  gain: () => R.gain,         // dB, ou null en gain automatique du tuner
   reglerGain(g) {             // g en dB, ou null pour le gain automatique
     const liste = source?.gains?.() || [];
     if (g !== null && !liste.length) return;

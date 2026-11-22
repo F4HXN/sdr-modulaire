@@ -42,12 +42,20 @@ export class DemodModeS {
     this.messages = 0; this.corriges = 0;
     // Diagnostic (panneau du module) : préambules vus, messages Mode S d'autres types, CRC faux, crête.
     this.preambules = 0; this.autresDF = 0; this.crcFaux = 0; this.crete = 0;
+    // Niveau automatique : échantillons I ou Q en butée du convertisseur (8 bits), sur le total reçu.
+    this.satures = 0; this.recus = 0;
   }
 
   traiter(re, im) {
     const r = this.reste, n = r.length + re.length;
     const m = new Float32Array(n); m.set(r);
-    for (let k = 0; k < re.length; k++) m[r.length + k] = Math.hypot(re[k], im[k]);
+    let sat = 0;
+    for (let k = 0; k < re.length; k++) {
+      const a = re[k], b = im[k];
+      m[r.length + k] = Math.hypot(a, b);
+      if (a > 0.95 || a < -0.95 || b > 0.95 || b < -0.95) sat++;
+    }
+    this.satures += sat; this.recus += re.length;
     const C = new Float64Array(n + 1);
     for (let k = 0; k < n; k++) C[k + 1] = C[k] + m[k];
     // Somme des amplitudes sur [a, b[ en échantillons fractionnaires.
