@@ -9,7 +9,9 @@ le traitement dans le navigateur. En ligne : https://rtl-sdr.fr/sdr-web.html
 | `dsp.js`        | NCO, filtres décimants à état, FFT, démodulateurs, AGC      | MIT |
 | `audio.js`      | sortie audio (AudioWorklet, tampon circulaire)              | MIT |
 | `simulation.js` | source simulée (émetteurs fictifs), plus proposée dans la page : sert au développement | MIT |
-| `modules.js`    | modules à chaud : S-mètre, mémoires, enregistreur WAV, journal, capteurs 433 MHz, stéréo et RDS, ADS-B, scanners de mémoires et de fréquences, décodeur SSTV | MIT |
+| `modules.js`    | modules à chaud : S-mètre, mémoires, enregistreur WAV, journal, capteurs 433 MHz, stéréo et RDS, ADS-B, scanners de mémoires et de fréquences, décodeurs SSTV, FT8 et FT4 | MIT |
+| `ft8-worker.js` | décode les créneaux UTC FT8 (15 s) ou FT4 (7,5 s) depuis l’audio USB, sans bloquer l’interface | MIT |
+| `ft8-lib/` | moteur WebAssembly ft8_lib pour le décodage FT8 et FT4 | voir `ft8-lib/LICENSE.txt` |
 | `sstv.js`       | décodeur SSTV (Martin, Scottie, Robot, PD) : VIS, calage des lignes sur les tops de synchro ; même algorithme que `modules-a-telecharger/sstv.py` | MIT |
 | `capteurs433.js` | décodeur OOK des sondes Nexus-T, Nexus-TH et Rubicson (433,92 MHz) | MIT |
 | `adsb.js`       | ADS-B : démodulation Mode S, CRC-24, positions CPR, suivi des avions | MIT |
@@ -21,6 +23,8 @@ le traitement dans le navigateur. En ligne : https://rtl-sdr.fr/sdr-web.html
 La page HTML qui les assemble est celle du site (`sdr-web.html`), qui charge ces fichiers depuis `sdr-web/`.
 
 Contraintes : Chrome, Edge ou Opera (WebUSB), page en HTTPS ou `localhost`.
+
+FT8 et FT4 : synchroniser l’horloge du système et accorder la clé en USB sur la fréquence du mode. Le calcul se fait dans le navigateur.
 
 Tuners gérés :
 

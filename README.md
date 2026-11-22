@@ -175,15 +175,20 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
   de saturation. Sur les 100 trames bruitées de `gen_packets -n 100` : 72 décodées (Dire Wolf : 70).
   Carte des stations comme pour l'ADS-B (positions non compressées, compressées, Mic-E, objets, items).
   Aussi dans SDR Web (`web/aprs.js`, même algorithme, mêmes trames).
+- **Décodeur FT8 / FT4** : messages FT8 (créneaux de 15 s) et FT4 (7,5 s) reçus en USB, décodés par `jt9`
+  de WSJT-X (`sudo apt install wsjtx`). Horloge synchronisée (NTP) requise ; fréquences usuelles : 7,074 ·
+  14,074 · 21,074 MHz en FT8, 7,0475 · 14,080 MHz en FT4 (clé qui reçoit la HF ou convertisseur).
+  Aussi dans SDR Web (`web/ft8-worker.js`, moteur ft8_lib compilé en WebAssembly dans `web/ft8-lib/`).
 
 ## Pistes
 
 Déjà réalisées : stéréo + RDS en WFM, scanner de mémoires, scanner de fréquences, ADS-B,
-capteurs 433 MHz, pilotage rigctl (Gpredict), décodeur SSTV, décodeur CW, décodeur APRS, convertisseur HF,
+capteurs 433 MHz, pilotage rigctl (Gpredict), décodeur SSTV, décodeur CW, décodeur APRS, décodeur FT8/FT4,
+convertisseur HF,
 version navigateur (SDR Web).
 
 Restent : envoi des trames APRS vers aprs.jerko.fr / APRS-IS,
-FT8/WSPR via `jt9`, enregistreur IQ, sortie MQTT vers InfluxDB/Grafana, serveur web pour
+WSPR via `jt9`, enregistreur IQ, sortie MQTT vers InfluxDB/Grafana, serveur web pour
 l'écoute à distance.
 
 ## Licence

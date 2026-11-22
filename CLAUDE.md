@@ -86,6 +86,6 @@ du catalogue → le recopier dans le site, régénérer et resigner.
 
 ## Pistes
 
-Faites : stéréo + RDS, scanners, ADS-B, capteurs 433, rigctl, SSTV, convertisseur HF, SDR Web.
-Restent : décodeur APRS/AX.25 (vers l'API aprs.jerko.fr), FT8/WSPR, enregistreur IQ,
+Faites : stéréo + RDS, scanners, ADS-B, capteurs 433, rigctl, SSTV, CW, APRS, FT8/FT4, convertisseur HF, SDR Web.
+Restent : envoi APRS vers aprs.jerko.fr, WSPR, enregistreur IQ,
 sortie MQTT vers InfluxDB/Grafana, écoute à distance par le web.

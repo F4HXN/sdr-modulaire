@@ -62,7 +62,7 @@ function fenetreFlottante(dialogue, poignee, ctx, cle = "fenetre") {
 }
 
 /**
- * Panneau « agrandissable » (Décodeurs CW et APRS) : le bouton Agrandir fait passer le contenu dans
+ * Panneau « agrandissable » (décodeurs CW, APRS, FT8 et FT4) : le bouton Agrandir fait passer le contenu dans
  * une fenêtre flottante (déplaçable, redimensionnable, taille et place retenues), avec A−/A+ pour la
  * taille du texte (variable CSS --cw-taille, retenue) et Réduire (ou Échap) pour le remettre en place.
  * actions : la ligne de boutons du panneau, où le bouton Agrandir est ajouté.
@@ -1335,4 +1335,119 @@ class DecodeurAPRS {
   arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); if (this.fenCarte?.open) this.fenCarte.close(); }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS];
+const CRENEAUX_FT = { FT8: 15000, FT4: 7500 };
+
+class DecodeurFT {
+  static nom = "Décodeur FT8 / FT4";
+  static description = "Messages FT8 et FT4 reçus en USB, décodés dans le navigateur sur des créneaux UTC.";
+
+  demarrer() {
+    this.mode = this.ctx.lire("mode", "FT8") === "FT4" ? "FT4" : "FT8";
+    this.sequence = 0;
+    this.pret = false;
+    this.occupe = false;
+    this.dernierAudio = 0;
+    this.fil = new Worker(new URL("./ft8-worker.js?v=1", import.meta.url));
+    this.fil.onmessage = ({ data }) => {
+      if (data.pret) { this.pret = true; return; }
+      this.occupe = false;
+      if (data.sequence !== undefined && data.sequence !== this.sequence) return;
+      if (data.erreur) { this.erreur = data.erreur; return; }
+      const heure = new Date(data.utc).toISOString().slice(11, 19);
+      for (const message of data.messages) {
+        const ligne = el("div", { textContent: `${heure}  ${Math.round(message.freq)} Hz  ${message.msg}` });
+        this.zone.append(ligne);
+        if (this.zone.childElementCount > 200) this.zone.firstElementChild.remove();
+      }
+      if (data.messages.length) this.zone.scrollTop = this.zone.scrollHeight;
+      this.bilan = `${heure} UTC · ${data.messages.length} message(s)`;
+    };
+    this.fil.onerror = e => { this.erreur = e.message || "décodeur indisponible"; };
+    this.ctx.abonner("audio", (audio, taux) => this.recevoir(audio, taux, Date.now()));
+    this.ctx.abonner("vfo", () => this.reinitialiser());
+  }
+
+  reinitialiser() {
+    this.sequence++;
+    this.finAudio = undefined;
+    this.dernierAudio = 0;
+    this.audio = null;
+    this.bilan = "";
+  }
+
+  recevoir(audio, taux, maintenant) {
+    if (!this.pret || this.erreur || this.ctx.mode() !== "USB" || !audio.length) return;
+    const taille = taux * CRENEAUX_FT[this.mode] / 1000;
+    const arrivee = Math.round(maintenant * taux / 1000) - audio.length;
+    if (this.taux !== taux || Math.abs(arrivee - this.finAudio) > taux / 2) this.reinitialiser();
+    this.taux = taux;
+    const debut = this.finAudio ?? arrivee;
+    this.finAudio = debut + audio.length;
+    this.dernierAudio = maintenant;
+
+    for (let i = 0; i < audio.length;) {
+      const instant = debut + i;
+      // Un créneau entamé au démarrage est ignoré. Le premier complet commence au prochain top UTC.
+      const position = instant % taille;
+      const n = Math.min(audio.length - i, taille - position);
+      if (position === 0) this.audio = new Float32Array(taille);
+      if (this.audio) {
+        this.audio.set(audio.subarray(i, i + n), position);
+        if (position + n === taille) {
+          if (!this.occupe) {
+            this.occupe = true;
+            const utc = Math.round((instant - position) * 1000 / taux);
+            this.fil.postMessage({ audio: this.audio, taux, mode: this.mode, sequence: this.sequence, utc }, [this.audio.buffer]);
+          }
+          this.audio = null;
+        }
+      }
+      i += n;
+    }
+  }
+
+  creerPanneau() {
+    const mode = el("select", { ariaLabel: "Mode numérique" },
+      ...Object.keys(CRENEAUX_FT).map(v => el("option", { value: v, textContent: v })));
+    mode.value = this.mode;
+    mode.onchange = () => {
+      this.mode = mode.value;
+      this.ctx.ecrire("mode", this.mode);
+      this.reinitialiser();
+      this.zone.replaceChildren();
+    };
+    const usb = el("button", { type: "button", textContent: "Mode USB" });
+    usb.onclick = () => this.ctx.reglerMode("USB");
+    const effacer = el("button", { type: "button", textContent: "Effacer" });
+    effacer.onclick = () => this.zone.replaceChildren();
+    this.zone = el("div", { className: "cw-texte", role: "log", ariaLive: "polite" });
+    this.zone.dataset.vide = "UTC · fréquence audio · message";
+    const statut = el("div", { className: "petit" });
+    const actualiser = () => {
+      const texte = this.erreur ? `Erreur : ${this.erreur}` : !this.pret ? "Chargement du décodeur…"
+        : this.ctx.mode() !== "USB" ? "Sélectionnez USB."
+        : Date.now() - this.dernierAudio > 1000 ? "En attente du signal audio."
+        : this.bilan || "En attente d’un créneau UTC complet…";
+      if (statut.textContent !== texte) statut.textContent = texte;
+    };
+    actualiser();
+    this.minuterie = setInterval(actualiser, 250);
+    const actions = el("div", { className: "scanner-choix cw-actions" }, mode, usb, effacer);
+    const aide = el("small", { textContent: "Synchronisez l’horloge de l’ordinateur et accordez-vous sur une fréquence FT8 ou FT4." });
+    const contenu = el("div", { className: "cw-contenu" }, actions, this.zone, statut, aide);
+    const { panneau, dialogue } = panneauAgrandissable(this.ctx, {
+      titre: DecodeurFT.nom, id: "ft-titre", contenu, actions, tailleDefaut: 1.1, defiler: this.zone,
+      attenteTexte: "Messages affichés dans la fenêtre agrandie.",
+    });
+    this.dialogue = dialogue;
+    return panneau;
+  }
+
+  arreter() {
+    clearInterval(this.minuterie);
+    this.fil.terminate();
+    if (this.dialogue?.open) this.dialogue.close();
+  }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS, DecodeurFT];
