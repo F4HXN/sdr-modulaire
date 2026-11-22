@@ -312,7 +312,7 @@ class DecodeurCW(Module):
 
     # ------------------------------------------------------------- interface
     def creer_widget(self) -> QWidget:
-        # Panneau compact dans la colonne des modules : 4 à 5 lignes de texte ; le texte en grand
+        # Panneau compact dans la colonne des modules : 2 à 3 lignes de texte ; le texte en grand
         # est dans la fenêtre « Agrandir ».
         w = QWidget()
         w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
@@ -326,7 +326,7 @@ class DecodeurCW(Module):
         self.zone.setPlaceholderText("Mode CW, squelch ouvert, cale-toi sur une station…")
         ligne_h = self.zone.fontMetrics().lineSpacing()
         self.zone.setMinimumHeight(2 * ligne_h + 12)
-        self.zone.setMaximumHeight(5 * ligne_h + 12)
+        self.zone.setMaximumHeight(3 * ligne_h + 12)
         self.zone.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         lay.addWidget(self.zone)
         self.etat = QLabel("—")

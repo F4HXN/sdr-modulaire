@@ -372,7 +372,9 @@ except ImportError:                                      # décodeur seul (essai
 
 
 class VueImage(QWidget):
-    """Affiche l'image à la largeur du panneau, proportions gardées."""
+    """Affiche un aperçu compact de l’image, proportions gardées."""
+
+    HAUTEUR_MAX = 180
 
     def __init__(self) -> None:
         super().__init__()
@@ -391,7 +393,8 @@ class VueImage(QWidget):
         self.update()
 
     def _ajuster(self) -> None:                         # les docks ignorent heightForWidth
-        self.setFixedHeight(round(max(self.width(), 240) * self.rapport))
+        hauteur = round(max(self.width(), self.minimumWidth()) * self.rapport)
+        self.setFixedHeight(min(hauteur, self.HAUTEUR_MAX))
 
     def resizeEvent(self, ev) -> None:
         super().resizeEvent(ev)
@@ -402,7 +405,11 @@ class VueImage(QWidget):
         p.fillRect(self.rect(), Qt.GlobalColor.black)
         if self.qimage is not None:
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            p.drawImage(QRectF(self.rect()), self.qimage)
+            largeur = min(self.width(), self.height() / self.rapport)
+            hauteur = largeur * self.rapport
+            cible = QRectF((self.width() - largeur) / 2, (self.height() - hauteur) / 2,
+                           largeur, hauteur)
+            p.drawImage(cible, self.qimage)
         p.end()
 
 

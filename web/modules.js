@@ -128,14 +128,14 @@ function echelleSignal() {
     texte: (v, c) => `${texteS(v)} · ${v.toFixed(1)} dBFS · crête ${texteS(c)}` };
 }
 function echelleModulation(m) {
-  const pas = { kHz: m.max <= 4 ? 1 : m.max <= 8 ? 2 : 25, "%": 25, dB: 10 }[m.unite] || m.max / 4;
+  const pas = { "%": 25, dB: 10 }[m.unite] || m.max / 4;
   const grad = [];
   for (let v = 0; v <= m.max + 1e-9; v += pas / 2) {
     const longue = Math.abs(v / pas - Math.round(v / pas)) < 1e-6;
     grad.push({ p: v / m.max, longue, texte: longue ? String(+v.toFixed(1)) : "", rouge: m.nominal !== null && v > m.nominal + 1e-9 });
   }
   const nom = { FM: "Excursion", AM: "Modulation", BLU: "Voix", CW: "Signal CW" }[m.type];
-  const f = v => m.unite === "kHz" ? `${v.toFixed(v < 10 ? 1 : 0)} kHz` : m.unite === "%" ? `${Math.round(v)} %` : `+${Math.round(v)} dB`;
+  const f = v => m.unite === "%" ? `${Math.round(v)} %` : `+${Math.round(v)} dB`;
   return { cle: `${m.type}/${m.nominal}/${m.max}`, pos: v => Math.max(0, v) / m.max, grad,
     rouge: m.nominal === null ? null : m.nominal / m.max, titre: m.unite === "dB" ? "dB" : m.unite,
     texte: (v, c) => `${nom} ${f(v)} · crête ${f(c)}${m.unite === "dB" ? " au-dessus du bruit" : m.nominal !== null && c > 1.05 * m.nominal ? " · surmodulation" : ""}` };
@@ -145,13 +145,23 @@ class SMetre {
   static nom = "S-mètre";
   static description = "Cadran à aiguille et barre de LED : modulation (excursion FM, taux AM, niveau BLU) ou force du signal (points S).";
   demarrer() {
-    this.vue = this.ctx.lire("vue", "modulation");
+    this.vue = this.ctx.lire("vue", "signal");
     this.niveau = -120; this.modulation = null;
-    this.valeur = 0; this.crete = 0; this.aiguille = 0; this.tCrete = 0;
-    this.ctx.abonner("niveau", (db, m) => { this.niveau = db; this.modulation = m || null; });
-  }
-  echelle() {
-    return this.vue === "modulation" && this.modulation ? echelleModulation(this.modulation) : echelleSignal();
+    this.derniereMesure = -Infinity;
+    this.crete = -Infinity; this.aiguille = 0; this.tCrete = 0;
+    this.ctx.abonner("niveau", (db, m) => {
+      if (!Number.isFinite(db)) return;
+      this.niveau = db;
+      this.derniereMesure = performance.now();
+      this.modulation = null;
+      if (!m || !Number.isFinite(m.valeur)) return;
+      const presence = m.presence ?? 1;
+      const valeur = m.valeur * presence;
+      // En FM, 100 % correspond à l’excursion nominale du mode sélectionné.
+      this.modulation = m.type === "FM"
+        ? { ...m, valeur: 100 * valeur / m.nominal, nominal: 100, max: Math.ceil(100 * m.max / m.nominal), unite: "%" }
+        : { ...m, valeur };
+    });
   }
   creerPanneau() {
     const boutons = ["modulation", "signal"].map(v => {
@@ -168,21 +178,25 @@ class SMetre {
     const barre = el("div", { className: "smetre-leds" }, ...this.leds);
     this.txt = el("div", { className: "smetre-txt", role: "status" });
     let avant = performance.now(), dernierTexte = 0, cleEchelle = "";
+    const signal = echelleSignal();
     const animer = maintenant => {
       this.anim = requestAnimationFrame(animer);
       const dt = Math.min(0.1, (maintenant - avant) / 1000); avant = maintenant;
-      const e = this.echelle();
+      const actif = maintenant - this.derniereMesure < 1000;
+      const modulation = this.vue === "modulation" ? this.modulation : null;
+      const e = modulation ? echelleModulation(modulation) : signal;
       if (e.cle !== cleEchelle) {              // nouvelle échelle : crête remise à zéro, couleurs des LED
         cleEchelle = e.cle; this.crete = -Infinity;
         const r = e.rouge ?? 2;
         this.leds.forEach((led, i) => { const p = (i + 0.5) / NB_LED; led.className = p < r - 0.12 ? "v" : p < r ? "j" : "r"; });
       }
-      const v = this.vue === "modulation" && this.modulation ? this.modulation.valeur : this.niveau;
+      const v = modulation ? (actif ? modulation.valeur : 0) : (actif ? this.niveau : -120);
+      if (!actif) this.crete = v;
       // Balistique d'un galvanomètre : montée rapide, retombée plus lente.
       const cible = Math.max(0, Math.min(1.02, e.pos(v)));
       this.aiguille += (cible - this.aiguille) * (1 - Math.exp(-dt / (cible > this.aiguille ? 0.05 : 0.35)));
       if (v >= this.crete) { this.crete = v; this.tCrete = maintenant; }
-      else if (maintenant - this.tCrete > 1500) this.crete = Math.max(v, this.crete - (e.cle === "signal" ? 20 : 0.4 * (this.modulation?.max || 1)) * dt);
+      else if (maintenant - this.tCrete > 1500) this.crete = Math.max(v, this.crete - (e.cle === "signal" ? 20 : 0.4 * modulation.max) * dt);
       this.dessiner(e);
       const allumees = Math.round(Math.min(1, this.aiguille) * NB_LED), iCrete = Math.min(NB_LED - 1, Math.floor(e.pos(this.crete) * NB_LED));
       this.leds.forEach((led, i) => { led.classList.toggle("on", i < allumees); led.classList.toggle("crete", i === iCrete && i >= allumees); });
@@ -201,22 +215,20 @@ class SMetre {
     const ouverture = 100 * Math.PI / 180, cx = W / 2, rayon = Math.min(W * 0.62, H * 1.25), cy = H * 0.12 + rayon;
     const angle = p => -Math.PI / 2 - ouverture / 2 + p * ouverture;
     const point = (p, d) => [cx + d * Math.cos(angle(p)), cy + d * Math.sin(angle(p))];
-    const fond = g.createLinearGradient(0, 0, 0, H);
-    fond.addColorStop(0, "#f3e6bf"); fond.addColorStop(1, "#d9c792");
-    g.fillStyle = fond; g.beginPath(); g.roundRect(0, 0, W, H, 8); g.fill();
-    // Arcs : noir, puis rouge dans la zone de dépassement.
+    g.fillStyle = "#000"; g.beginPath(); g.roundRect(0, 0, W, H, 8); g.fill();
+    // Arcs : blanc, puis rouge dans la zone de dépassement.
     const rouge = e.rouge ?? 1;
-    g.lineWidth = 2.5; g.strokeStyle = "#1c1c1c"; g.beginPath(); g.arc(cx, cy, rayon * 0.86, angle(0), angle(rouge)); g.stroke();
+    g.lineWidth = 2.5; g.strokeStyle = "#fff"; g.beginPath(); g.arc(cx, cy, rayon * 0.86, angle(0), angle(rouge)); g.stroke();
     if (rouge < 1) { g.strokeStyle = "#d22"; g.lineWidth = 5; g.beginPath(); g.arc(cx, cy, rayon * 0.86 + 1, angle(rouge), angle(1)); g.stroke(); }
     g.textAlign = "center"; g.textBaseline = "middle";
     g.font = `600 ${Math.max(9, Math.round(W / 22))}px "Share Tech Mono", monospace`;
     for (const t of e.grad) {
       const [x1, y1] = point(t.p, rayon * 0.86), [x2, y2] = point(t.p, rayon * (t.longue ? 0.79 : 0.82));
-      g.strokeStyle = t.rouge ? "#d22" : "#1c1c1c"; g.lineWidth = t.longue ? 2 : 1.2;
+      g.strokeStyle = t.rouge ? "#d22" : "#fff"; g.lineWidth = t.longue ? 2 : 1.2;
       g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
-      if (t.texte) { const [xt, yt] = point(t.p, rayon * 0.95); g.fillStyle = t.rouge ? "#c11" : "#1c1c1c"; g.fillText(t.texte, xt, yt); }
+      if (t.texte) { const [xt, yt] = point(t.p, rayon * 0.95); g.fillStyle = "#fff"; g.fillText(t.texte, xt, yt); }
     }
-    g.fillStyle = "#3a3320"; g.font = `700 ${Math.max(10, Math.round(W / 18))}px "Orbitron", sans-serif`;
+    g.fillStyle = "#fff"; g.font = `700 ${Math.max(10, Math.round(W / 18))}px "Orbitron", sans-serif`;
     g.fillText(e.titre, cx, cy - rayon * 0.5);
     // Repère de crête (point rouge) et aiguille.
     if (Number.isFinite(this.crete)) {
@@ -226,7 +238,7 @@ class SMetre {
     const [xa, ya] = point(Math.max(0, Math.min(1.02, this.aiguille)), rayon * 0.9);
     g.save(); g.beginPath(); g.roundRect(0, 0, W, H, 8); g.clip();
     g.strokeStyle = "rgba(0,0,0,.25)"; g.lineWidth = 3; g.beginPath(); g.moveTo(cx + 2, cy + 2); g.lineTo(xa + 2, ya + 2); g.stroke();
-    g.strokeStyle = "#111"; g.lineWidth = 1.8; g.beginPath(); g.moveTo(cx, cy); g.lineTo(xa, ya); g.stroke();
+    g.strokeStyle = "#fff"; g.lineWidth = 1.8; g.beginPath(); g.moveTo(cx, cy); g.lineTo(xa, ya); g.stroke();
     g.restore();
     g.fillStyle = "#2a2a2a"; g.beginPath(); g.roundRect(0, H - 10, W, 10, [0, 0, 8, 8]); g.fill();
   }

@@ -7,8 +7,8 @@ import logging
 import numpy as np
 from PySide6.QtCore import QByteArray, Qt, Signal
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QComboBox, QDockWidget, QLabel, QMainWindow, QMessageBox,
-                               QScrollArea, QToolButton, QWidget)
+from PySide6.QtWidgets import (QComboBox, QDockWidget, QFrame, QLabel, QMainWindow,
+                               QMessageBox, QScrollArea, QToolButton, QVBoxLayout, QWidget)
 
 from .. import __version__
 from ..audio import SortieAudio
@@ -30,10 +30,24 @@ log = logging.getLogger(__name__)
 class DockModule(QDockWidget):
     ferme = Signal(str)
 
-    def __init__(self, nom: str, parent) -> None:
+    def __init__(self, nom: str, widget: QWidget, parent) -> None:
         super().__init__(nom, parent)
         self.nom = nom
         self.setObjectName(f"module_{nom}")
+
+        cadre = QFrame()
+        cadre.setObjectName("cadre_module")
+        cadre.setStyleSheet("""
+            QFrame#cadre_module {
+                background-color: #081020;
+                border: 1px solid rgba(80, 163, 255, 77);
+                border-radius: 12px;
+            }
+        """)
+        contenu = QVBoxLayout(cadre)
+        contenu.setContentsMargins(10, 10, 10, 10)
+        contenu.addWidget(widget)
+        self.setWidget(cadre)
 
     def closeEvent(self, ev) -> None:
         self.ferme.emit(self.nom)
@@ -454,8 +468,7 @@ class FenetrePrincipale(QMainWindow):
                 QMessageBox.warning(self, "Module", f"Le module « {nom} » n'a pas pu démarrer :\n{exc}")
             return False
         if widget is not None:
-            dock = DockModule(nom, self)
-            dock.setWidget(widget)
+            dock = DockModule(nom, widget, self)
             dock.ferme.connect(self.desactiver_module)
             self.addDockWidget(Qt.RightDockWidgetArea, dock)
             self.docks[nom] = dock
