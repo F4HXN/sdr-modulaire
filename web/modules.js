@@ -64,23 +64,98 @@ const MEMOIRES_DEFAUT = [
   { nom: "Appel FM 70 cm", f: 433_500_000, mode: "NFM" }, { nom: "Radio FM (exemple)", f: 87_800_000, mode: "WFM" },
 ];
 
+// S-mètre : cadran à aiguille et barre de LED. Échelle relative (la clé n'est pas étalonnée en dBm) :
+// 6 dB par point S, S9 à S9_DBFS ; au-delà, +10 à +60 dB.
+const S9_DBFS = -55, S_MIN = S9_DBFS - 8 * 6 - 6, S_MAX = S9_DBFS + 60;   // S0 et S9+60
+const NB_LED = 30;
+/** Position 0..1 sur l'échelle : S0 à S9 sur les 60 % de gauche, +10 à +60 sur le reste. */
+function positionS(db) {
+  return db <= S9_DBFS ? 0.6 * Math.max(0, (db - S_MIN) / (S9_DBFS - S_MIN))
+    : 0.6 + 0.4 * Math.min(1, (db - S9_DBFS) / (S_MAX - S9_DBFS));
+}
+function texteS(db) {
+  if (db <= S9_DBFS) return `S${Math.max(0, Math.min(9, Math.round((db - S_MIN) / 6)))}`;
+  return `S9+${Math.min(60, Math.round((db - S9_DBFS) / 10) * 10 || 0)}`;
+}
+
 class SMetre {
   static nom = "S-mètre";
-  static description = "Niveau du canal en dBFS, avec maintien de crête.";
+  static description = "Cadran à aiguille et barre de LED (points S, +dB), niveau en dBFS et maintien de crête.";
   demarrer() {
-    this.niveau = -120; this.crete = -120;
-    this.ctx.abonner("niveau", db => { this.niveau = db; this.crete = Math.max(db, this.crete - 0.3); });
+    this.niveau = -120; this.crete = -120; this.aiguille = 0; this.tCrete = 0;
+    this.ctx.abonner("niveau", db => { this.niveau = db; });
   }
   creerPanneau() {
-    this.txt = el("div", { className: "smetre-txt" });
-    this.barre = el("div", { className: "smetre-barre" }, el("i"));
-    this.minuterie = setInterval(() => {
-      this.txt.textContent = `${this.niveau.toFixed(1)} dBFS · crête ${this.crete.toFixed(1)}`;
-      this.barre.firstChild.style.width = `${Math.max(0, Math.min(100, (this.niveau + 120) / 120 * 100))}%`;
-    }, 100);
-    return el("div", {}, this.txt, this.barre);
+    this.toile = el("canvas", { className: "smetre-cadran" });
+    this.toile.setAttribute("aria-hidden", "true");
+    this.leds = Array.from({ length: NB_LED }, (_, i) => {
+      const p = (i + 0.5) / NB_LED;
+      return el("i", { className: p < 0.6 ? "v" : p < 0.75 ? "j" : "r" });
+    });
+    const barre = el("div", { className: "smetre-leds" }, ...this.leds);
+    this.txt = el("div", { className: "smetre-txt", role: "status" });
+    let avant = performance.now(), dernierTexte = 0;
+    const animer = maintenant => {
+      this.anim = requestAnimationFrame(animer);
+      const dt = Math.min(0.1, (maintenant - avant) / 1000); avant = maintenant;
+      // Balistique d'un galvanomètre : montée rapide, retombée plus lente.
+      const cible = positionS(this.niveau);
+      this.aiguille += (cible - this.aiguille) * (1 - Math.exp(-dt / (cible > this.aiguille ? 0.05 : 0.35)));
+      if (this.niveau >= this.crete) { this.crete = this.niveau; this.tCrete = maintenant; }
+      else if (maintenant - this.tCrete > 1500) this.crete = Math.max(this.niveau, this.crete - 20 * dt);
+      this.dessiner();
+      const allumees = Math.round(this.aiguille * NB_LED), iCrete = Math.min(NB_LED - 1, Math.floor(positionS(this.crete) * NB_LED));
+      this.leds.forEach((led, i) => { led.classList.toggle("on", i < allumees); led.classList.toggle("crete", i === iCrete && i >= allumees); });
+      if (maintenant - dernierTexte > 200) {
+        dernierTexte = maintenant;
+        this.txt.textContent = `${texteS(this.niveau)} · ${this.niveau.toFixed(1)} dBFS · crête ${texteS(this.crete)}`;
+      }
+    };
+    this.anim = requestAnimationFrame(animer);
+    return el("div", { className: "smetre" }, this.toile, barre, this.txt);
   }
-  arreter() { clearInterval(this.minuterie); }
+  dessiner() {
+    const c = this.toile, r = devicePixelRatio || 1, W = c.clientWidth, H = c.clientHeight;
+    if (!W || !H) return;
+    if (c.width !== Math.round(W * r) || c.height !== Math.round(H * r)) { c.width = Math.round(W * r); c.height = Math.round(H * r); }
+    const g = c.getContext("2d");
+    g.setTransform(r, 0, 0, r, 0, 0); g.clearRect(0, 0, W, H);
+    // Cadran : arc de 100° centré, pivot sous le bas du cadran.
+    const ouverture = 100 * Math.PI / 180, cx = W / 2, rayon = Math.min(W * 0.62, H * 1.25), cy = H * 0.12 + rayon;
+    const angle = p => -Math.PI / 2 - ouverture / 2 + p * ouverture;
+    const point = (p, d) => [cx + d * Math.cos(angle(p)), cy + d * Math.sin(angle(p))];
+    const fond = g.createLinearGradient(0, 0, 0, H);
+    fond.addColorStop(0, "#f3e6bf"); fond.addColorStop(1, "#d9c792");
+    g.fillStyle = fond; g.beginPath(); g.roundRect(0, 0, W, H, 8); g.fill();
+    // Arcs : noir jusqu'à S9, rouge au-delà.
+    g.lineWidth = 2.5;
+    g.strokeStyle = "#1c1c1c"; g.beginPath(); g.arc(cx, cy, rayon * 0.86, angle(0), angle(0.6)); g.stroke();
+    g.strokeStyle = "#d22"; g.lineWidth = 5; g.beginPath(); g.arc(cx, cy, rayon * 0.86 + 1, angle(0.6), angle(1)); g.stroke();
+    // Graduations et chiffres.
+    g.textAlign = "center"; g.textBaseline = "middle";
+    const graduer = (p, longue, texte, rouge) => {
+      const [x1, y1] = point(p, rayon * 0.86), [x2, y2] = point(p, rayon * (longue ? 0.79 : 0.82));
+      g.strokeStyle = rouge ? "#d22" : "#1c1c1c"; g.lineWidth = longue ? 2 : 1.2;
+      g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+      if (texte) { const [xt, yt] = point(p, rayon * 0.95); g.fillStyle = rouge ? "#c11" : "#1c1c1c"; g.fillText(texte, xt, yt); }
+    };
+    g.font = `600 ${Math.max(9, Math.round(W / 22))}px "Share Tech Mono", monospace`;
+    for (let s = 1; s <= 9; s++) graduer(positionS(S_MIN + 6 * s), s % 2 === 1, s % 2 === 1 ? String(s) : "", false);
+    for (let d = 10; d <= 60; d += 10) graduer(positionS(S9_DBFS + d), d % 20 === 0, d % 20 === 0 ? `+${d}` : "", true);
+    g.fillStyle = "#3a3320"; g.font = `700 ${Math.max(10, Math.round(W / 18))}px "Orbitron", sans-serif`;
+    g.fillText("S", cx, cy - rayon * 0.5);
+    // Repère de crête (petit triangle rouge) et aiguille.
+    const [xc, yc] = point(Math.min(1, positionS(this.crete)), rayon * 0.74);
+    g.fillStyle = "#d22"; g.beginPath(); g.arc(xc, yc, 2.5, 0, 2 * Math.PI); g.fill();
+    const [xa, ya] = point(Math.max(0, Math.min(1, this.aiguille)), rayon * 0.9);
+    g.save(); g.beginPath(); g.roundRect(0, 0, W, H, 8); g.clip();
+    g.strokeStyle = "rgba(0,0,0,.25)"; g.lineWidth = 3; g.beginPath(); g.moveTo(cx + 2, cy + 2); g.lineTo(xa + 2, ya + 2); g.stroke();
+    g.strokeStyle = "#111"; g.lineWidth = 1.8; g.beginPath(); g.moveTo(cx, cy); g.lineTo(xa, ya); g.stroke();
+    g.restore();
+    // Cache du pivot.
+    g.fillStyle = "#2a2a2a"; g.beginPath(); g.roundRect(0, H - 10, W, 10, [0, 0, 8, 8]); g.fill();
+  }
+  arreter() { cancelAnimationFrame(this.anim); }
 }
 
 class Memoires {
