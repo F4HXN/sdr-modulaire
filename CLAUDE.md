@@ -19,6 +19,8 @@ python3 -m sdrmod                 # clé RTL-SDR (menu Source → RTL-SDR)
 python3 -m tests.test_dsp                                              # chaque mode sur signaux simulés
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_interface capture.png  # interface + modules à chaud
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_materiel capture.png   # affichage matériel (FC0013 émulée)
+QT_QPA_PLATFORM=offscreen python3 -m tests.test_catalogue              # signature du catalogue
+python3 -m tests.test_sstv                                             # décodeur SSTV (9 modes, ~40 s)
 ```
 
 Toujours relancer les trois tests après une modification du DSP ou de l'interface.
@@ -84,6 +86,6 @@ du catalogue → le recopier dans le site, régénérer et resigner.
 
 ## Pistes
 
-Faites : stéréo + RDS, scanners, ADS-B, capteurs 433, rigctl, convertisseur HF, SDR Web.
+Faites : stéréo + RDS, scanners, ADS-B, capteurs 433, rigctl, SSTV, convertisseur HF, SDR Web.
 Restent : décodeur APRS/AX.25 (vers l'API aprs.jerko.fr), FT8/WSPR, enregistreur IQ,
 sortie MQTT vers InfluxDB/Grafana, écoute à distance par le web.

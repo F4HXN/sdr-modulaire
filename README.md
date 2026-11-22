@@ -88,8 +88,8 @@ sdrmod/
 modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite.py,
                    capteurs_433.py, stereo_rds_fm.py
 modules-a-telecharger/  adsb.py, scanner_memoires.py, scanner_frequences.py,
-                        pilotage_rigctl.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
-tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py
+                        pilotage_rigctl.py, sstv.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
+tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py
 ```
 
 ## Trois niveaux d'extension
@@ -142,6 +142,7 @@ python3 -m tests.test_dsp                                            # chaque mo
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_interface capture.png # interface + modules à chaud
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_materiel capture.png  # affichage du matériel (clé FC0013 émulée)
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_catalogue             # signature Ed25519 et adresse du catalogue
+python3 -m tests.test_sstv                                            # décodeur SSTV sur signaux synthétiques
 ```
 
 ## Modules disponibles
@@ -155,6 +156,10 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
 - **Scanner de mémoires** : parcourt les mémoires, s'arrête sur un signal, reprend après un silence ;
 - **Scanner de fréquences** : plage début–fin avec un pas, seuil relatif au bruit, en boucle ;
   se cale au milieu des stations plus larges que le pas (WFM) ;
+- **Décodeur SSTV** : images Martin M1/M2, Scottie S1/S2/DX, Robot 36/72, PD50 à PD290 (l'ISS émet en
+  PD120 sur 145,800 MHz NFM ; en HF : 14,230 · 21,340 · 28,680 MHz USB). Mode reconnu par l'en-tête VIS
+  (ou forcé à la main), lignes calées sur les tops de synchro (pas d'image penchée même sans correction ppm),
+  images enregistrées en PNG dans `~/.config/sdr-modulaire/donnees/sstv/` ;
 - **Pilotage rigctl** : serveur compatible rigctld sur `localhost:4532` (IPv4 `127.0.0.1` et IPv6 `::1`,
   connexions locales seulement) : Gpredict corrige le Doppler des satellites, WSJT-X, fldigi… règlent
   fréquence et mode. Dans Gpredict : radio « RX only », hôte localhost, port 4532, puis « Engage ».
@@ -162,7 +167,7 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
 ## Pistes
 
 Déjà réalisées : stéréo + RDS en WFM, scanner de mémoires, scanner de fréquences, ADS-B,
-capteurs 433 MHz, pilotage rigctl (Gpredict), convertisseur HF, version navigateur (SDR Web).
+capteurs 433 MHz, pilotage rigctl (Gpredict), décodeur SSTV, convertisseur HF, version navigateur (SDR Web).
 
 Restent : décodeur APRS/AX.25 (vers aprs.jerko.fr, ébauche dans `modules/_decodeur_aprs.py`),
 FT8/WSPR via `jt9`, enregistreur IQ, sortie MQTT vers InfluxDB/Grafana, serveur web pour

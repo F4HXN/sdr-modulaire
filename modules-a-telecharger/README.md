@@ -19,4 +19,5 @@ par le script de déploiement du site).
 | `adsb.py` | avions sur 1090 MHz (2,4 MS/s, gain maximal) : carte radar mondiale et tableau dans une fenêtre séparée |
 | `scanner_memoires.py` | balaie les fréquences du module Mémoires, s'arrête sur un signal et reprend après un silence |
 | `scanner_frequences.py` | balaie une plage début–fin avec un pas, s'arrête sur un signal qui dépasse le bruit estimé, se cale au milieu des stations larges (WFM) |
+| `sstv.py` | décodeur SSTV : Martin, Scottie, Robot, PD (ISS en PD120 sur 145,800 MHz NFM) ; mode reconnu par le VIS, image calée sur les tops de synchro, PNG enregistrés |
 | `pilotage_rigctl.py` | serveur rigctld local (port 4532, IPv4 et IPv6, connexions locales seulement) : Gpredict suit les satellites (Doppler), WSJT-X, fldigi… pilotent fréquence et mode |
