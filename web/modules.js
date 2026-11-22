@@ -17,6 +17,7 @@ import { StereoRds } from "./fm-stereo.js?v=20261121-fm-stereo";
 import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
 import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261121-adsb";
 import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261121-monde";
+import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
 
@@ -706,4 +707,77 @@ class ScannerFrequences {
   arreter() { clearInterval(this.minuterie); this.actif = false; }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences];
+class ModuleSSTV {
+  static nom = "Décodeur SSTV";
+  static description = "Images SSTV (ISS en PD120, Martin, Scottie, Robot, PD) décodées depuis l'audio, téléchargeables en PNG.";
+
+  demarrer() {
+    this.decodeur = null; this.blocs = []; this.perdus = 0; this.ordres = [];
+    // Le rappel du bus ne fait que stocker : le décodage se fait par lots, toutes les 100 ms.
+    this.ctx.abonner("audio", (a, taux) => {
+      if (!this.decodeur) this.decodeur = new DecodeurSSTV(taux);
+      if (this.blocs.length < 200) this.blocs.push(Float32Array.from(a)); else this.perdus++;
+    });
+    this.travail = setInterval(() => {
+      const d = this.decodeur; if (!d) return;
+      for (const o of this.ordres.splice(0)) o[0] === "demarrer" ? d.demarrer(MODES_SSTV.find(m => m.nom === o[1])) : d.arreter("Réception arrêtée.");
+      for (const b of this.blocs.splice(0)) d.traiter(b);
+    }, 100);
+  }
+
+  creerPanneau() {
+    this.canevas = el("canvas", { width: 320, height: 256, className: "sstv-image", title: "Image SSTV" });
+    this.canevas.getContext("2d").fillRect(0, 0, 320, 256);
+    this.statut = el("div", { className: "petit sstv-statut" });
+    this.tonalite = el("div", { className: "petit" });
+    this.choix = el("select", { title: "Mode à forcer pour un démarrage à la main (en-tête VIS manqué)" },
+      el("option", { value: "", textContent: "Automatique (VIS)" }),
+      ...MODES_SSTV.map(m => el("option", { value: m.nom, textContent: m.nom })));
+    this.bDemarrer = el("button", { type: "button", textContent: "Démarrer", disabled: true, title: "Commence l'image maintenant dans le mode choisi" });
+    this.bArreter = el("button", { type: "button", textContent: "Arrêter", disabled: true });
+    this.choix.onchange = () => { this.bDemarrer.disabled = !this.choix.value; };
+    this.bDemarrer.onclick = () => { if (this.choix.value) this.ordres.push(["demarrer", this.choix.value]); };
+    this.bArreter.onclick = () => this.ordres.push(["arreter"]);
+    this.auto = el("input", { type: "checkbox", checked: this.ctx.lire("auto", false) });
+    this.auto.onchange = () => this.ctx.ecrire("auto", this.auto.checked);
+    const telecharger = el("button", { type: "button", textContent: "Télécharger l'image" });
+    telecharger.onclick = () => { const d = this.decodeur; if (d?.image) this.telecharger(d.image, d.mode.largeur, d.mode.hauteur, d.mode.nom, new Date()); };
+    this.version = -1;
+    this.minuterie = setInterval(() => this.rafraichir(), 250);
+    this.rafraichir();
+    return el("div", {}, this.canevas, this.statut, this.tonalite,
+      el("div", { className: "scanner-choix" }, this.choix, this.bDemarrer, this.bArreter),
+      el("div", { className: "scanner-choix sstv-actions" }, telecharger,
+        el("label", { className: "petit sstv-auto" }, this.auto, " Télécharger chaque image")),
+      el("small", { textContent: "ISS : 145,800 MHz en NFM. Ondes courtes : 14,230 · 21,340 · 28,680 MHz en USB." }));
+  }
+
+  rafraichir() {
+    const d = this.decodeur;
+    if (!d) { this.statut.textContent = "Démarrez la réception : le décodeur écoute l'audio du récepteur."; return; }
+    if (d.image && d.version !== this.version) {
+      const { largeur, hauteur } = d.mode;
+      if (this.canevas.width !== largeur || this.canevas.height !== hauteur) { this.canevas.width = largeur; this.canevas.height = hauteur; }
+      this.canevas.getContext("2d").putImageData(new ImageData(d.image, largeur, hauteur), 0, 0);
+      this.version = d.version;
+    }
+    for (const t of d.terminees.splice(0)) if (this.auto.checked) this.telecharger(t.image, t.largeur, t.hauteur, t.mode, t.date, t.partielle);
+    this.statut.textContent = d.message + (this.perdus ? ` (${this.perdus} blocs audio perdus)` : "");
+    this.tonalite.textContent = d.tonalite ? `Tonalité : ${Math.round(d.tonalite).toLocaleString("fr-FR")} Hz` : "";
+    this.bArreter.disabled = d.etat !== "image";
+  }
+
+  telecharger(image, largeur, hauteur, mode, date, partielle = false) {
+    const c = el("canvas", { width: largeur, height: hauteur });
+    c.getContext("2d").putImageData(new ImageData(image.slice(), largeur, hauteur), 0, 0);
+    const h = new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "_");
+    c.toBlob(blob => {
+      const a = el("a", { href: URL.createObjectURL(blob), download: `sstv_${h}_${mode.replace(/ /g, "")}${partielle ? "_partielle" : ""}.png` });
+      a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    }, "image/png");
+  }
+
+  arreter() { clearInterval(this.minuterie); clearInterval(this.travail); }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV];
