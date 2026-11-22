@@ -88,8 +88,9 @@ sdrmod/
 modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite.py,
                    capteurs_433.py, stereo_rds_fm.py
 modules-a-telecharger/  adsb.py, scanner_memoires.py, scanner_frequences.py,
-                        pilotage_rigctl.py, sstv.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
-tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py
+                        pilotage_rigctl.py, sstv.py, decodeur_cw.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
+outils/decodeur_cw/     entraînement du réseau du Décodeur CW (PyTorch, non nécessaire à l'exécution)
+tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py
 ```
 
 ## Trois niveaux d'extension
@@ -143,6 +144,7 @@ QT_QPA_PLATFORM=offscreen python3 -m tests.test_interface capture.png # interfac
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_materiel capture.png  # affichage du matériel (clé FC0013 émulée)
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_catalogue             # signature Ed25519 et adresse du catalogue
 python3 -m tests.test_sstv                                            # décodeur SSTV sur signaux synthétiques
+python3 -m tests.test_decodeur_cw                                     # Décodeur CW de bout en bout (IQ → mode CW → texte)
 ```
 
 ## Modules disponibles
@@ -163,6 +165,9 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
 - **Pilotage rigctl** : serveur compatible rigctld sur `localhost:4532` (IPv4 `127.0.0.1` et IPv6 `::1`,
   connexions locales seulement) : Gpredict corrige le Doppler des satellites, WSJT-X, fldigi… règlent
   fréquence et mode. Dans Gpredict : radio « RX only », hôte localhost, port 4532, puis « Engage ».
+- **Décodeur CW** : Morse décodé par un réseau de neurones (CNN + GRU bidirectionnel + CTC, poids
+  embarqués, numpy seul), 10 à 42 WPM, robuste au bruit, au QSB et à la manipulation manuelle ; texte
+  avec ~4,5 s de retard. Mode CW, squelch ouvert. Entraînement : `outils/decodeur_cw/`.
 
 ## Pistes
 
