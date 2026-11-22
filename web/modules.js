@@ -1071,9 +1071,36 @@ class DecodeurCW {
       const a = el("a", { href: URL.createObjectURL(new Blob([contenu], { type: "text/plain" })), download: `cw_${local.replace(/[-:]/g, "").replace("T", "_")}.txt` });
       a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
     };
+    // Agrandir : le texte passe dans une fenêtre flottante, déplaçable et redimensionnable (taille et place retenues).
+    const contenu = el("div", { className: "cw-contenu" }, this.zone, this.statut,
+      el("div", { className: "scanner-choix cw-actions" }, mode, effacer, copier, enregistrer));
+    const agrandir = el("button", { type: "button", textContent: "Agrandir", className: "capteurs-agrandir" });
+    agrandir.setAttribute("aria-haspopup", "dialog");
+    const titre = el("h2", { id: "cw-titre", textContent: "Décodeur CW" });
+    const plusPetit = el("button", { type: "button", textContent: "A−", title: "Texte plus petit" });
+    const plusGrand = el("button", { type: "button", textContent: "A+", title: "Texte plus grand" });
+    let taille = this.ctx.lire("taille", 1.6);
+    const police = d => { taille = Math.max(0.8, Math.min(4, +(taille + d).toFixed(1))); this.ctx.ecrire("taille", taille); dialogue.style.setProperty("--cw-taille", `${taille}rem`); };
+    plusPetit.onclick = () => police(-0.2); plusGrand.onclick = () => police(0.2);
+    const fermer = el("button", { type: "button", textContent: "Réduire", title: "Remettre dans la colonne des modules (Échap)" });
+    const entete = el("header", { title: "Tirer pour déplacer · coin en bas à droite pour agrandir" }, titre,
+      el("span", { className: "cw-boutons" }, plusPetit, plusGrand, fermer));
+    const dialogue = el("dialog", { className: "capteurs-dialogue cw-dialogue" }, entete);
+    dialogue.setAttribute("aria-labelledby", titre.id);
+    police(0);
+    const ouvrir = fenetreFlottante(dialogue, entete, this.ctx);
+    const panneau = el("div", {}, contenu, agrandir, dialogue);
+    agrandir.onclick = () => {
+      if (dialogue.open) { fermer.focus(); return; }
+      dialogue.append(contenu); agrandir.textContent = "Fenêtre ouverte";
+      ouvrir(); this.zone.scrollTop = this.zone.scrollHeight; fermer.focus();
+    };
+    fermer.onclick = () => dialogue.close();
+    dialogue.addEventListener("close", () => { panneau.prepend(contenu); agrandir.textContent = "Agrandir"; agrandir.focus(); });
+    this.dialogue = dialogue;
     this.minuterie = setInterval(() => this.rafraichir(), 250);
     this.rafraichir();
-    return el("div", {}, this.zone, this.statut, el("div", { className: "scanner-choix cw-actions" }, mode, effacer, copier, enregistrer));
+    return panneau;
   }
 
   rafraichir() {
@@ -1092,7 +1119,7 @@ class DecodeurCW {
       : `Tonalité ${Math.round(e.tonalite)} Hz · ${e.wpm ? `~${Math.round(e.wpm)} WPM` : "vitesse ?"} · contraste ${Math.round(e.contraste)} dB · calcul ${Math.round(e.duree)} ms`;
   }
 
-  arreter() { clearInterval(this.minuterie); this.fil?.terminate(); }
+  arreter() { clearInterval(this.minuterie); this.fil?.terminate(); if (this.dialogue?.open) this.dialogue.close(); }
 }
 
 export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW];

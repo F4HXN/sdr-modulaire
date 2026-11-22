@@ -14,6 +14,7 @@ Généré par outils/decodeur_cw/exporter_module.py — ne pas modifier les poid
 
 import base64
 import io
+import json
 import queue
 import threading
 import time
@@ -21,7 +22,7 @@ import zlib
 from collections import deque
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QByteArray, Qt, QTimer
 from PySide6.QtGui import QFont, QGuiApplication, QTextCursor
 from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
                                QVBoxLayout, QWidget)
@@ -150,6 +151,74 @@ def estimer_dit(puissance_tonalite):
     return float(np.median(points))
 
 
+# ======================================================================= fenêtre agrandie
+class FenetreCW(QWidget):
+    """Texte décodé en grand, dans une fenêtre à part : déplaçable et redimensionnable comme toute
+    fenêtre ; sa taille et sa place sont retenues (fenetre.json dans le dossier du module)."""
+
+    def __init__(self, module: "DecodeurCW") -> None:
+        super().__init__(None, Qt.WindowType.Window)
+        self.module = module
+        self.setWindowTitle("Décodeur CW — SDR Modulaire")
+        self.resize(900, 420)
+        lay = QVBoxLayout(self)
+        self.zone = QPlainTextEdit()
+        self.zone.setReadOnly(True)
+        self.zone.setMaximumBlockCount(2000)
+        self.taille = 22
+        self.zone.setFont(QFont("DejaVu Sans Mono", self.taille))
+        lay.addWidget(self.zone, 1)
+        self.etat = QLabel("—")
+        lay.addWidget(self.etat)
+        ligne = QHBoxLayout()
+        moins, plus = QPushButton("A−"), QPushButton("A+")
+        moins.setToolTip("Texte plus petit")
+        plus.setToolTip("Texte plus grand")
+        moins.clicked.connect(lambda: self._police(-2))
+        plus.clicked.connect(lambda: self._police(+2))
+        b_eff = QPushButton("Effacer")
+        b_eff.clicked.connect(module.effacer)
+        b_cop = QPushButton("Copier")
+        b_cop.clicked.connect(lambda: QGuiApplication.clipboard().setText(self.zone.toPlainText()))
+        reduire = QPushButton("Réduire")
+        reduire.setToolTip("Fermer la fenêtre : le texte reste dans le panneau du module")
+        reduire.clicked.connect(self.close)
+        for b in (moins, plus, b_eff, b_cop):
+            ligne.addWidget(b)
+        ligne.addStretch(1)
+        ligne.addWidget(reduire)
+        lay.addLayout(ligne)
+        self._relire()
+
+    def _fichier(self):
+        return self.module.ctx.dossier_donnees("decodeur_cw") / "fenetre.json"
+
+    def _relire(self) -> None:
+        try:
+            g = json.loads(self._fichier().read_text(encoding="utf-8"))
+            self.restoreGeometry(QByteArray.fromBase64(g["geometrie"].encode()))
+            self._police(g.get("taille", self.taille) - self.taille)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    def _police(self, delta: int) -> None:
+        self.taille = max(10, min(60, self.taille + delta))
+        self.zone.setFont(QFont("DejaVu Sans Mono", self.taille))
+
+    def ajouter(self, morceau: str) -> None:
+        self.zone.moveCursor(QTextCursor.End)
+        self.zone.insertPlainText(morceau)
+        self.zone.moveCursor(QTextCursor.End)
+
+    def closeEvent(self, evenement) -> None:
+        try:
+            self._fichier().write_text(json.dumps({"geometrie": bytes(self.saveGeometry().toBase64()).decode(),
+                                                   "taille": self.taille}), encoding="utf-8")
+        except OSError:
+            pass
+        super().closeEvent(evenement)
+
+
 # ======================================================================= module
 class DecodeurCW(Module):
     nom = "Décodeur CW"
@@ -175,6 +244,7 @@ class DecodeurCW(Module):
         self.contraste = None
         self.silence = False
         self.journal = None
+        self.fenetre = None
         self._file: queue.Queue = queue.Queue(maxsize=3)
         self._actif = True
         self._fil = threading.Thread(target=self._boucle, name="decodeur-cw", daemon=True)
@@ -256,18 +326,35 @@ class DecodeurCW(Module):
         b_cw = QPushButton("Mode CW")
         b_cw.clicked.connect(lambda: self.ctx.regler_mode("CW"))
         b_eff = QPushButton("Effacer")
-        b_eff.clicked.connect(self.zone.clear)
+        b_eff.clicked.connect(self.effacer)
         b_cop = QPushButton("Copier")
         b_cop.clicked.connect(lambda: QGuiApplication.clipboard().setText(self.zone.toPlainText()))
+        b_agr = QPushButton("Agrandir")
+        b_agr.setToolTip("Ouvre le texte en grand dans une fenêtre déplaçable et redimensionnable")
+        b_agr.clicked.connect(self.agrandir)
         self.c_journal = QCheckBox("Journal")
         self.c_journal.setToolTip("Enregistre le texte décodé, horodaté, dans le dossier du module")
         self.c_journal.toggled.connect(self._basculer_journal)
-        for b in (b_cw, b_eff, b_cop, self.c_journal):
+        for b in (b_cw, b_eff, b_cop, b_agr, self.c_journal):
             ligne.addWidget(b)
         lay.addLayout(ligne)
         self.minuterie = QTimer(w, interval=250, timeout=self._rafraichir)
         self.minuterie.start()
         return w
+
+    def agrandir(self) -> None:
+        if self.fenetre is None:
+            self.fenetre = FenetreCW(self)
+            self.fenetre.zone.setPlainText(self.zone.toPlainText())
+            self.fenetre.zone.moveCursor(QTextCursor.End)
+        self.fenetre.show()
+        self.fenetre.raise_()
+        self.fenetre.activateWindow()
+
+    def effacer(self) -> None:
+        self.zone.clear()
+        if self.fenetre is not None:
+            self.fenetre.zone.clear()
 
     def _rafraichir(self) -> None:
         while self.texte:
@@ -276,8 +363,11 @@ class DecodeurCW(Module):
             fin_actuelle = self.zone.toPlainText()[-1:] if self.zone.toPlainText() else " "
             if fin_actuelle == " ":
                 morceau = morceau.lstrip(" ")
-            self.zone.insertPlainText(morceau.replace("  ", " "))
+            morceau = morceau.replace("  ", " ")
+            self.zone.insertPlainText(morceau)
             self.zone.moveCursor(QTextCursor.End)
+            if self.fenetre is not None:
+                self.fenetre.ajouter(morceau)
             if self.journal:
                 self.journal.write(morceau)
                 self.journal.flush()
@@ -290,6 +380,8 @@ class DecodeurCW(Module):
         else:
             wpm = f"~{self.wpm:.0f} WPM" if self.wpm else "vitesse ?"
             self.etat.setText(f"Tonalité {self.tonalite:.0f} Hz · {wpm} · contraste {self.contraste:.0f} dB")
+        if self.fenetre is not None and self.fenetre.isVisible():
+            self.fenetre.etat.setText(self.etat.text())
 
     def _basculer_journal(self, actif: bool) -> None:
         if actif:
@@ -310,6 +402,9 @@ class DecodeurCW(Module):
         self._fil.join(timeout=2)
         if hasattr(self, "minuterie"):
             self.minuterie.stop()
+        if self.fenetre is not None:
+            self.fenetre.close()
+            self.fenetre = None
         if self.journal:
             self.journal.close()
             self.journal = None
