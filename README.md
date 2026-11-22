@@ -88,9 +88,9 @@ sdrmod/
 modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite.py,
                    capteurs_433.py, stereo_rds_fm.py
 modules-a-telecharger/  adsb.py, scanner_memoires.py, scanner_frequences.py,
-                        pilotage_rigctl.py, sstv.py, decodeur_cw.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
+                        pilotage_rigctl.py, sstv.py, decodeur_cw.py, decodeur_aprs.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
 outils/decodeur_cw/     entraînement du réseau du Décodeur CW (PyTorch, non nécessaire à l'exécution)
-tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py
+tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py
 ```
 
 ## Trois niveaux d'extension
@@ -145,6 +145,7 @@ QT_QPA_PLATFORM=offscreen python3 -m tests.test_materiel capture.png  # affichag
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_catalogue             # signature Ed25519 et adresse du catalogue
 python3 -m tests.test_sstv                                            # décodeur SSTV sur signaux synthétiques
 python3 -m tests.test_decodeur_cw                                     # Décodeur CW de bout en bout (IQ → mode CW → texte)
+python3 -m tests.test_decodeur_aprs                                   # Décodeur APRS sur trames AFSK synthétiques
 ```
 
 ## Modules disponibles
@@ -168,14 +169,19 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
 - **Décodeur CW** : Morse décodé par un réseau de neurones (CNN + GRU bidirectionnel + CTC, poids
   embarqués, numpy seul), 10 à 42 WPM, robuste au bruit, au QSB et à la manipulation manuelle ; texte
   avec ~4,5 s de retard. Mode CW, squelch ouvert. Entraînement : `outils/decodeur_cw/` ; aussi dans SDR Web
-  (`web/cw.js`, poids `web/cw-poids.bin` exportés par `outils/decodeur_cw/exporter_web.py`).
+  (`web/cw.js`, poids `web/cw-poids.bin` exportés par `outils/decodeur_cw/exporter_web.py`) ;
+- **Décodeur APRS** : trames AFSK 1200 bauds décodées sans logiciel externe (plus besoin de Dire Wolf),
+  sur 144,800 MHz (ou 144,390, ou l'ISS 145,825) extrait des IQ, même si le VFO écoute ailleurs ; alerte
+  de saturation. Sur les 100 trames bruitées de `gen_packets -n 100` : 72 décodées (Dire Wolf : 70).
+  Aussi dans SDR Web (`web/aprs.js`, même algorithme, mêmes trames).
 
 ## Pistes
 
 Déjà réalisées : stéréo + RDS en WFM, scanner de mémoires, scanner de fréquences, ADS-B,
-capteurs 433 MHz, pilotage rigctl (Gpredict), décodeur SSTV, convertisseur HF, version navigateur (SDR Web).
+capteurs 433 MHz, pilotage rigctl (Gpredict), décodeur SSTV, décodeur CW, décodeur APRS, convertisseur HF,
+version navigateur (SDR Web).
 
-Restent : décodeur APRS/AX.25 (vers aprs.jerko.fr, ébauche dans `modules/_decodeur_aprs.py`),
+Restent : envoi des trames APRS vers aprs.jerko.fr / APRS-IS, carte des stations APRS,
 FT8/WSPR via `jt9`, enregistreur IQ, sortie MQTT vers InfluxDB/Grafana, serveur web pour
 l'écoute à distance.
 

@@ -19,6 +19,7 @@ import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261122-niveau";
 import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261122-niveau";
 import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
 import { TAUX_CW, DUREE_FENETRE, DUREE_PAS } from "./cw.js?v=20261122-cw";
+import { DemodAFSK, trameVersTexte } from "./aprs.js?v=20261122-aprs";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
 
@@ -1123,4 +1124,90 @@ class DecodeurCW {
   arreter() { clearInterval(this.minuterie); this.fil?.terminate(); if (this.dialogue?.open) this.dialogue.close(); }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW];
+// Décodeur APRS : même démodulateur que le module decodeur_aprs.py de SDR Modulaire (aprs.js).
+// Le module extrait son canal des IQ (indépendant du VFO) : NCO → 240 kHz → 48 kHz → FM → 24 kHz.
+const FREQUENCES_APRS = [[144_800_000, "144,800 MHz · Europe"], [144_390_000, "144,390 MHz · Amérique du Nord"], [145_825_000, "145,825 MHz · ISS"]];
+class DecodeurAPRS {
+  static nom = "Décodeur APRS";
+  static description = "Trames APRS (AFSK 1200 bauds) décodées dans le navigateur, sur 144,800 MHz ou une autre fréquence APRS de la bande reçue.";
+
+  demarrer() {
+    this.frequence = this.ctx.lire("frequence", FREQUENCES_APRS[0][0]);
+    this.recues = []; this.nombre = 0; this.cle = ""; this.derniersIQ = -Infinity; this.couvert = false; this.saturation = 0;
+    this.ctx.abonner("iq", (re, im, centre, taux) => this.recevoir(re, im, centre, taux));
+  }
+
+  recevoir(re, im, centre, taux) {
+    this.derniersIQ = performance.now();
+    let sat = 0;
+    for (let k = 0; k < re.length; k += 4) if (re[k] > 0.95 || re[k] < -0.95 || im[k] > 0.95 || im[k] < -0.95) sat++;
+    this.saturation = sat / Math.ceil(re.length / 4);
+    const f = this.frequence;
+    this.couvert = Math.abs(f - centre) + 10_000 < 0.42 * taux;
+    if (!this.couvert) { this.cle = ""; return; }
+    const cle = `${centre}/${taux}/${f}`;
+    if (cle !== this.cle) {                  // nouvelle bande : chaîne de démodulation neuve
+      this.cle = cle;
+      const d1 = Math.round(taux / 240_000), fs1 = taux / d1, d2 = Math.round(fs1 / 48_000);
+      this.nco = new NCO(taux); this.nco.freq = f - centre;
+      this.etage1 = new FirComplexe(passeBas(taux, 30_000, d1 * 4 + 1), d1);
+      this.etage2 = new FirComplexe(passeBas(fs1, 12_000, d2 * 12 + 1), d2);
+      this.fs = fs1 / d2;
+      this.versAudio = new FirComplexe(passeBas(this.fs, 6_000, 31), 2);
+      this.pr = 1; this.pi = 0;
+      this.demod = new DemodAFSK(this.fs / 2);
+    }
+    const [cr, ci] = this.etage2.traiter(...this.etage1.traiter(...this.nco.melanger(re, im)));
+    const fm = new Float32Array(cr.length);
+    let pr = this.pr, pi = this.pi;
+    for (let k = 0; k < cr.length; k++) { const a = cr[k], b = ci[k]; fm[k] = Math.atan2(b * pr - a * pi, a * pr + b * pi); pr = a; pi = b; }
+    this.pr = pr; this.pi = pi;
+    const [audio] = this.versAudio.traiter(fm, new Float32Array(fm.length));
+    for (const o of this.demod.traiter(audio)) { const t = trameVersTexte(o); if (t) this.recues.push(t); }
+  }
+
+  creerPanneau() {
+    const choix = el("select", { title: "Fréquence APRS décodée (elle doit être dans la bande reçue)" },
+      ...FREQUENCES_APRS.map(([f, t]) => el("option", { value: f, textContent: t, selected: f === this.frequence })));
+    choix.onchange = () => { this.frequence = Number(choix.value); this.ctx.ecrire("frequence", this.frequence); this.cle = ""; };
+    const accorder = el("button", { type: "button", textContent: "Accorder", title: "Règle le VFO sur la fréquence APRS en NFM (pour l'entendre aussi)" });
+    accorder.onclick = () => { this.ctx.reglerMode("NFM"); this.ctx.reglerFrequence(this.frequence); };
+    this.statut = el("div", { className: "petit" });
+    this.liste = el("ul", { className: "journal aprs-liste" });
+    const effacer = el("button", { type: "button", textContent: "Effacer" });
+    effacer.onclick = () => this.liste.replaceChildren();
+    const texte = () => [...this.liste.children].reverse().map(li => li.textContent).join("\n");
+    const copier = el("button", { type: "button", textContent: "Copier" });
+    copier.onclick = () => navigator.clipboard?.writeText(texte()).then(() => {
+      copier.textContent = "Copié"; setTimeout(() => { copier.textContent = "Copier"; }, 1200);
+    }).catch(() => {});
+    const enregistrer = el("button", { type: "button", textContent: "Enregistrer", title: "Télécharge les trames reçues dans un fichier texte" });
+    enregistrer.onclick = () => {
+      const d = new Date(), h = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "_");
+      const a = el("a", { href: URL.createObjectURL(new Blob([texte() + "\n"], { type: "text/plain" })), download: `aprs_${h}.txt` });
+      a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    };
+    this.minuterie = setInterval(() => this.rafraichir(), 250);
+    this.rafraichir();
+    return el("div", {}, el("div", { className: "scanner-choix" }, choix, accorder), this.statut, this.liste,
+      el("div", { className: "scanner-choix cw-actions" }, effacer, copier, enregistrer));
+  }
+
+  rafraichir() {
+    for (const t of this.recues.splice(0)) {
+      this.nombre++;
+      this.liste.prepend(el("li", { textContent: `${new Date().toLocaleTimeString("fr-FR")}  ${t}` }));
+      if (this.liste.children.length > 300) this.liste.lastChild.remove();
+    }
+    const nom = FREQUENCES_APRS.find(([f]) => f === this.frequence)?.[1].split(" ·")[0] || "";
+    const sat = this.saturation > 0.001;
+    this.statut.classList.toggle("aprs-alerte", sat);
+    this.statut.textContent = performance.now() - this.derniersIQ > 1000 ? "Démarrez la réception : le décodeur lit les IQ de la clé."
+      : !this.couvert ? `${nom} hors de la bande reçue : cliquez sur Accorder.`
+      : `Écoute de ${nom} · ${this.nombre} trame(s)` + (sat ? ` · SATURATION ${(100 * this.saturation).toFixed(1)} % : baissez le gain RF ou éloignez l'émetteur` : "");
+  }
+
+  arreter() { clearInterval(this.minuterie); }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS];

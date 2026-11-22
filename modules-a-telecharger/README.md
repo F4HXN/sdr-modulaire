@@ -22,3 +22,4 @@ par le script de déploiement du site).
 | `sstv.py` | décodeur SSTV : Martin, Scottie, Robot, PD (ISS en PD120 sur 145,800 MHz NFM) ; mode reconnu par le VIS, image calée sur les tops de synchro, PNG enregistrés |
 | `pilotage_rigctl.py` | serveur rigctld local (port 4532, IPv4 et IPv6, connexions locales seulement) : Gpredict suit les satellites (Doppler), WSJT-X, fldigi… pilotent fréquence et mode |
 | `decodeur_cw.py` | décode le Morse par réseau de neurones (CNN + GRU + CTC), 10 à 42 WPM, robuste au bruit et au QSB ; texte avec ~4,5 s de retard. Mode CW, squelch ouvert. Entraînement : `outils/decodeur_cw/` |
+| `decodeur_aprs.py` | trames APRS (AFSK 1200, AX.25) décodées sans logiciel externe, sur 144,800 MHz extrait des IQ même si le VFO écoute ailleurs ; alerte de saturation |
