@@ -61,6 +61,45 @@ function fenetreFlottante(dialogue, poignee, ctx, cle = "fenetre") {
   };
 }
 
+/**
+ * Panneau « agrandissable » (Décodeurs CW et APRS) : le bouton Agrandir fait passer le contenu dans
+ * une fenêtre flottante (déplaçable, redimensionnable, taille et place retenues), avec A−/A+ pour la
+ * taille du texte (variable CSS --cw-taille, retenue) et Réduire (ou Échap) pour le remettre en place.
+ * actions : la ligne de boutons du panneau, où le bouton Agrandir est ajouté.
+ * defiler : élément à faire défiler en bas à l'ouverture (ou null).
+ */
+function panneauAgrandissable(ctx, { titre: texteTitre, id, contenu, actions, tailleDefaut, defiler = null, attenteTexte }) {
+  const agrandir = el("button", { type: "button", textContent: "Agrandir", className: "cw-agrandir" });
+  agrandir.setAttribute("aria-haspopup", "dialog");
+  actions.append(agrandir);
+  const titre = el("h2", { id, textContent: texteTitre });
+  const plusPetit = el("button", { type: "button", textContent: "A−", title: "Texte plus petit" });
+  const plusGrand = el("button", { type: "button", textContent: "A+", title: "Texte plus grand" });
+  const fermer = el("button", { type: "button", textContent: "Réduire", title: "Remettre dans la colonne des modules (Échap)" });
+  const entete = el("header", { title: "Tirer pour déplacer · coin en bas à droite pour agrandir" }, titre,
+    el("span", { className: "cw-boutons" }, plusPetit, plusGrand, fermer));
+  const dialogue = el("dialog", { className: "capteurs-dialogue cw-dialogue" }, entete);
+  dialogue.setAttribute("aria-labelledby", id);
+  let taille = ctx.lire("taille", tailleDefaut);
+  const police = d => {
+    taille = Math.max(0.6, Math.min(4, +(taille + d).toFixed(1)));
+    ctx.ecrire("taille", taille); dialogue.style.setProperty("--cw-taille", `${taille}rem`);
+  };
+  plusPetit.onclick = () => police(-0.2); plusGrand.onclick = () => police(0.2);
+  police(0);
+  const ouvrir = fenetreFlottante(dialogue, entete, ctx);
+  const attente = el("div", { className: "petit", textContent: attenteTexte });
+  const panneau = el("div", {}, contenu, dialogue);
+  agrandir.onclick = () => {
+    if (dialogue.open) { fermer.focus(); return; }
+    agrandir.remove(); dialogue.append(contenu); panneau.prepend(attente);
+    ouvrir(); if (defiler) defiler.scrollTop = defiler.scrollHeight; fermer.focus();
+  };
+  fermer.onclick = () => dialogue.close();
+  dialogue.addEventListener("close", () => { attente.remove(); actions.append(agrandir); panneau.prepend(contenu); agrandir.focus(); });
+  return { panneau, dialogue };
+}
+
 const MEMOIRES_DEFAUT = [
   { nom: "APRS", f: 144_800_000, mode: "NFM" }, { nom: "Appel FM 2 m", f: 145_500_000, mode: "NFM" },
   { nom: "Appel FM 70 cm", f: 433_500_000, mode: "NFM" }, { nom: "Radio FM (exemple)", f: 87_800_000, mode: "WFM" },
@@ -1073,32 +1112,10 @@ class DecodeurCW {
       a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
     };
     // Agrandir : le texte passe dans une fenêtre flottante, déplaçable et redimensionnable (taille et place retenues).
-    const agrandir = el("button", { type: "button", textContent: "Agrandir", className: "cw-agrandir" });
-    const actions = el("div", { className: "scanner-choix cw-actions" }, mode, effacer, copier, enregistrer, agrandir);
+    const actions = el("div", { className: "scanner-choix cw-actions" }, mode, effacer, copier, enregistrer);
     const contenu = el("div", { className: "cw-contenu" }, this.zone, this.statut, actions);
-    agrandir.setAttribute("aria-haspopup", "dialog");
-    const titre = el("h2", { id: "cw-titre", textContent: "Décodeur CW" });
-    const plusPetit = el("button", { type: "button", textContent: "A−", title: "Texte plus petit" });
-    const plusGrand = el("button", { type: "button", textContent: "A+", title: "Texte plus grand" });
-    let taille = this.ctx.lire("taille", 1.6);
-    const police = d => { taille = Math.max(0.8, Math.min(4, +(taille + d).toFixed(1))); this.ctx.ecrire("taille", taille); dialogue.style.setProperty("--cw-taille", `${taille}rem`); };
-    plusPetit.onclick = () => police(-0.2); plusGrand.onclick = () => police(0.2);
-    const fermer = el("button", { type: "button", textContent: "Réduire", title: "Remettre dans la colonne des modules (Échap)" });
-    const entete = el("header", { title: "Tirer pour déplacer · coin en bas à droite pour agrandir" }, titre,
-      el("span", { className: "cw-boutons" }, plusPetit, plusGrand, fermer));
-    const dialogue = el("dialog", { className: "capteurs-dialogue cw-dialogue" }, entete);
-    dialogue.setAttribute("aria-labelledby", titre.id);
-    police(0);
-    const ouvrir = fenetreFlottante(dialogue, entete, this.ctx);
-    const attente = el("div", { className: "petit", textContent: "Texte affiché dans la fenêtre agrandie." });
-    const panneau = el("div", {}, contenu, dialogue);
-    agrandir.onclick = () => {
-      if (dialogue.open) { fermer.focus(); return; }
-      agrandir.remove(); dialogue.append(contenu); panneau.prepend(attente);
-      ouvrir(); this.zone.scrollTop = this.zone.scrollHeight; fermer.focus();
-    };
-    fermer.onclick = () => dialogue.close();
-    dialogue.addEventListener("close", () => { attente.remove(); actions.append(agrandir); panneau.prepend(contenu); agrandir.focus(); });
+    const { panneau, dialogue } = panneauAgrandissable(this.ctx, { titre: "Décodeur CW", id: "cw-titre", contenu, actions,
+      tailleDefaut: 1.6, defiler: this.zone, attenteTexte: "Texte affiché dans la fenêtre agrandie." });
     this.dialogue = dialogue;
     this.minuterie = setInterval(() => this.rafraichir(), 250);
     this.rafraichir();
@@ -1187,10 +1204,15 @@ class DecodeurAPRS {
       const a = el("a", { href: URL.createObjectURL(new Blob([texte() + "\n"], { type: "text/plain" })), download: `aprs_${h}.txt` });
       a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
     };
+    const actions = el("div", { className: "scanner-choix cw-actions" }, effacer, copier, enregistrer);
+    const contenu = el("div", { className: "cw-contenu aprs-contenu" },
+      el("div", { className: "scanner-choix" }, choix, accorder), this.statut, this.liste, actions);
+    const { panneau, dialogue } = panneauAgrandissable(this.ctx, { titre: "Décodeur APRS", id: "aprs-titre", contenu, actions,
+      tailleDefaut: 1.1, attenteTexte: "Trames affichées dans la fenêtre agrandie." });
+    this.dialogue = dialogue;
     this.minuterie = setInterval(() => this.rafraichir(), 250);
     this.rafraichir();
-    return el("div", {}, el("div", { className: "scanner-choix" }, choix, accorder), this.statut, this.liste,
-      el("div", { className: "scanner-choix cw-actions" }, effacer, copier, enregistrer));
+    return panneau;
   }
 
   rafraichir() {
@@ -1207,7 +1229,7 @@ class DecodeurAPRS {
       : `Écoute de ${nom} · ${this.nombre} trame(s)` + (sat ? ` · SATURATION ${(100 * this.saturation).toFixed(1)} % : baissez le gain RF ou éloignez l'émetteur` : "");
   }
 
-  arreter() { clearInterval(this.minuterie); }
+  arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); }
 }
 
 export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS];

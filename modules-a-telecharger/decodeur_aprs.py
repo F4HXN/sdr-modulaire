@@ -17,14 +17,15 @@ Même algorithme dans SDR Web (web/aprs.js).
 
 from __future__ import annotations
 
+import json
 import math
 import queue
 import threading
 import time
 
 import numpy as np
-from PySide6.QtCore import QTimer
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QByteArray, Qt, QTimer
+from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLabel, QListWidget, QPushButton,
                                QSizePolicy, QVBoxLayout, QWidget)
 from scipy import signal
@@ -177,6 +178,69 @@ def trame_vers_texte(o: bytes) -> str | None:
     return f"{adresses[1][0]}>{','.join([adresses[0][0]] + relais)}:{info}"
 
 
+# ======================================================================= fenêtre agrandie
+class FenetreAPRS(QWidget):
+    """Trames en grand, dans une fenêtre à part (comme celle du Décodeur CW) : déplaçable et
+    redimensionnable ; taille, place et police retenues (fenetre.json dans le dossier du module)."""
+
+    def __init__(self, module: "DecodeurAPRS") -> None:
+        super().__init__(None, Qt.WindowType.Window)
+        self.module = module
+        self.setWindowTitle("Décodeur APRS — SDR Modulaire")
+        self.resize(1000, 480)
+        lay = QVBoxLayout(self)
+        self.liste = QListWidget()
+        self.liste.setWordWrap(True)
+        self.taille = 14
+        self.liste.setFont(QFont("DejaVu Sans Mono", self.taille))
+        lay.addWidget(self.liste, 1)
+        self.etat = QLabel("—")
+        self.etat.setWordWrap(True)
+        lay.addWidget(self.etat)
+        ligne = QHBoxLayout()
+        moins, plus = QPushButton("A−"), QPushButton("A+")
+        moins.setToolTip("Texte plus petit")
+        plus.setToolTip("Texte plus grand")
+        moins.clicked.connect(lambda: self._police(-2))
+        plus.clicked.connect(lambda: self._police(+2))
+        b_eff = QPushButton("Effacer")
+        b_eff.clicked.connect(module.effacer)
+        b_cop = QPushButton("Copier")
+        b_cop.clicked.connect(module.copier)
+        reduire = QPushButton("Réduire")
+        reduire.setToolTip("Fermer la fenêtre : les trames restent dans le panneau du module")
+        reduire.clicked.connect(self.close)
+        for b in (moins, plus, b_eff, b_cop):
+            ligne.addWidget(b)
+        ligne.addStretch(1)
+        ligne.addWidget(reduire)
+        lay.addLayout(ligne)
+        self._relire()
+
+    def _fichier(self):
+        return self.module.ctx.dossier_donnees("decodeur_aprs") / "fenetre.json"
+
+    def _relire(self) -> None:
+        try:
+            g = json.loads(self._fichier().read_text(encoding="utf-8"))
+            self.restoreGeometry(QByteArray.fromBase64(g["geometrie"].encode()))
+            self._police(g.get("taille", self.taille) - self.taille)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    def _police(self, delta: int) -> None:
+        self.taille = max(8, min(48, self.taille + delta))
+        self.liste.setFont(QFont("DejaVu Sans Mono", self.taille))
+
+    def closeEvent(self, evenement) -> None:
+        try:
+            self._fichier().write_text(json.dumps({"geometrie": bytes(self.saveGeometry().toBase64()).decode(),
+                                                   "taille": self.taille}), encoding="utf-8")
+        except OSError:
+            pass
+        super().closeEvent(evenement)
+
+
 # ======================================================================= module
 FREQUENCES = [(144_800_000, "144,800 MHz · Europe"), (144_390_000, "144,390 MHz · Amérique du Nord"),
               (145_825_000, "145,825 MHz · ISS")]
@@ -195,6 +259,7 @@ class DecodeurAPRS(Module):
         self.etat = {"instant": 0.0, "couvert": False, "saturation": 0.0, "perdus": 0}
         self.nombre = 0
         self.journal = None
+        self.fenetre = None
         self._actif = True
         self._fil = threading.Thread(target=self._boucle, name="decodeur-aprs", daemon=True)
         self._fil.start()
@@ -273,20 +338,40 @@ class DecodeurAPRS(Module):
         lay.addWidget(self.liste)
         boutons = QHBoxLayout()
         effacer = QPushButton("Effacer")
-        effacer.clicked.connect(self.liste.clear)
+        effacer.clicked.connect(self.effacer)
         copier = QPushButton("Copier")
-        copier.clicked.connect(lambda: QGuiApplication.clipboard().setText(
-            "\n".join(self.liste.item(i).text() for i in range(self.liste.count() - 1, -1, -1))))
+        copier.clicked.connect(self.copier)
+        agrandir = QPushButton("Agrandir")
+        agrandir.setToolTip("Ouvre les trames en grand dans une fenêtre déplaçable et redimensionnable")
+        agrandir.clicked.connect(self.agrandir)
         self.c_journal = QCheckBox("Journal")
         self.c_journal.setToolTip("Enregistre les trames, horodatées, dans le dossier du module")
         self.c_journal.toggled.connect(self._basculer_journal)
-        for b in (effacer, copier, self.c_journal):
+        for b in (effacer, copier, agrandir, self.c_journal):
             boutons.addWidget(b)
         lay.addLayout(boutons)
         self.minuterie = QTimer(w, interval=250, timeout=self._rafraichir)
         self.minuterie.start()
         self._rafraichir()
         return w
+
+    def agrandir(self) -> None:
+        if self.fenetre is None:
+            self.fenetre = FenetreAPRS(self)
+            for i in range(self.liste.count()):
+                self.fenetre.liste.addItem(self.liste.item(i).text())
+        self.fenetre.show()
+        self.fenetre.raise_()
+        self.fenetre.activateWindow()
+
+    def effacer(self) -> None:
+        self.liste.clear()
+        if self.fenetre is not None:
+            self.fenetre.liste.clear()
+
+    def copier(self) -> None:
+        QGuiApplication.clipboard().setText(
+            "\n".join(self.liste.item(i).text() for i in range(self.liste.count() - 1, -1, -1)))
 
     def _accorder(self) -> None:
         self.ctx.regler_mode("NFM")
@@ -300,9 +385,10 @@ class DecodeurAPRS(Module):
                 break
             self.nombre += 1
             ligne = f"{time.strftime('%H:%M:%S')}  {texte}"
-            self.liste.insertItem(0, ligne)
-            if self.liste.count() > 500:
-                self.liste.takeItem(500)
+            for liste in [self.liste] + ([self.fenetre.liste] if self.fenetre is not None else []):
+                liste.insertItem(0, ligne)
+                if liste.count() > 500:
+                    liste.takeItem(500)
             if self.journal:
                 self.journal.write(ligne + "\n")
                 self.journal.flush()
@@ -316,6 +402,8 @@ class DecodeurAPRS(Module):
             if e["saturation"] > 0.001:
                 texte += f" · SATURATION {100 * e['saturation']:.1f} % : baissez le gain RF ou éloignez l'émetteur"
         self.statut.setText(texte)
+        if self.fenetre is not None and self.fenetre.isVisible():
+            self.fenetre.etat.setText(texte)
 
     def _basculer_journal(self, actif: bool) -> None:
         if actif:
@@ -334,6 +422,9 @@ class DecodeurAPRS(Module):
         self._fil.join(timeout=2)
         if hasattr(self, "minuterie"):
             self.minuterie.stop()
+        if self.fenetre is not None:
+            self.fenetre.close()
+            self.fenetre = None
         if self.journal:
             self.journal.close()
             self.journal = None
