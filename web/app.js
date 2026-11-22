@@ -146,10 +146,51 @@ $("#chiffres").addEventListener("wheel", e => {
   const p = Number(e.target.dataset?.poids); if (!p) return;
   e.preventDefault(); reglerFrequence(frequence() + (e.deltaY < 0 ? p : -p));
 }, { passive: false });
-$("#chiffres").addEventListener("dblclick", () => {
-  const v = prompt("Fréquence en MHz :", (frequence() / 1e6).toFixed(5));
-  if (v) { const f = parseFloat(v.replace(",", ".")) * 1e6; if (f > 0) reglerFrequence(f); }
+
+// Boutons ▲ ▼ : un pas par clic ; maintenus, ils répètent.
+for (const [id, n] of [["#f-haut", 1], ["#f-bas", -1]]) {
+  const b = $(id); let attente, repetition;
+  const stop = () => { clearTimeout(attente); clearInterval(repetition); };
+  b.addEventListener("pointerdown", e => {
+    if (e.button !== 0) return;
+    e.preventDefault(); stop(); pas(n);
+    attente = setTimeout(() => { repetition = setInterval(() => pas(n), 80); }, 400);
+  });
+  for (const ev of ["pointerup", "pointerleave", "pointercancel"]) b.addEventListener(ev, stop);
+  b.addEventListener("click", e => { if (e.detail === 0) pas(n); });   // clavier (Entrée, Espace)
+}
+
+// Saisie au clavier : clic sur l'afficheur, ou un chiffre tapé n'importe où sur la page.
+// En MHz par défaut (145.5 ou 145,5) ; suffixes k, M, G acceptés ; un grand nombre sans suffixe est en Hz.
+const saisie = $("#saisie-freq");
+function lireFrequence(texte) {
+  const m = texte.trim().replace(",", ".").replace(/\s+/g, "").match(/^(\d+(?:\.\d*)?|\.\d+)([kmg])?(?:hz)?$/i);
+  if (!m) return null;
+  const v = parseFloat(m[1]), u = m[2]?.toLowerCase();
+  const f = u === "k" ? v * 1e3 : u === "m" ? v * 1e6 : u === "g" ? v * 1e9 : v >= 1e5 ? v : v * 1e6;
+  return f > 0 && f < 10e9 ? Math.round(f) : null;
+}
+function ouvrirSaisie(debut) {
+  if (!saisie.hidden) return;
+  saisie.value = debut ?? (frequence() / 1e6).toFixed(4).replace(/\.?0+$/, "");
+  $("#chiffres").hidden = true; saisie.hidden = false; $("#unite").textContent = "MHz";
+  saisie.focus();
+  if (debut === undefined) saisie.select(); else saisie.setSelectionRange(saisie.value.length, saisie.value.length);
+}
+function fermerSaisie(valider) {
+  if (saisie.hidden) return;
+  const f = valider ? lireFrequence(saisie.value) : null;
+  if (valider && f === null && saisie.value.trim()) { saisie.style.borderBottomColor = "#ff7a7a"; return; }
+  saisie.hidden = true; saisie.style.borderBottomColor = ""; $("#chiffres").hidden = false; $("#unite").textContent = "Hz";
+  if (f !== null) reglerFrequence(f);
+}
+saisie.addEventListener("input", () => { saisie.style.borderBottomColor = ""; });
+saisie.addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); fermerSaisie(true); }
+  else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); fermerSaisie(false); }
 });
+saisie.addEventListener("blur", () => { if (!saisie.hidden) { saisie.hidden = true; saisie.style.borderBottomColor = ""; $("#chiffres").hidden = false; $("#unite").textContent = "Hz"; } });
+$("#chiffres").addEventListener("click", () => ouvrirSaisie());
 
 // ---------------------------------------------------------------- interface : réglages
 function remplir(sel, valeurs, texte, actuelle) {
@@ -208,7 +249,8 @@ $("#echelle").onclick = () => {
 $("#b-cle").onclick = () => demarrer("cle");
 $("#b-arret").onclick = () => arreter();
 addEventListener("keydown", e => {
-  if (e.defaultPrevented || e.target.closest("input, select, textarea")) return;
+  if (e.defaultPrevented || e.target.closest("input, select, textarea, dialog")) return;
+  if (/^[0-9.,]$/.test(e.key) && !e.ctrlKey && !e.altKey && !e.metaKey) { e.preventDefault(); ouvrirSaisie(e.key === "," ? "." : e.key); return; }
   const n = { ArrowUp: 1, ArrowDown: -1, ArrowRight: 1, ArrowLeft: -1, PageUp: 10, PageDown: -10 }[e.key];
   if (n) { e.preventDefault(); pas(n); }
 });
