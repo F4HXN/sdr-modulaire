@@ -8,9 +8,15 @@ Ces modules ne sont **pas** chargés automatiquement par SDR Modulaire. Le plus 
 
 Ils sont aussi téléchargeables sur <https://rtl-sdr.fr/sdr-modulaire.html#modules-a-venir>.
 
+Le catalogue lu par l'application (`https://rtl-sdr.fr/catalogue-modules.json`) est signé en Ed25519 :
+l'application refuse d'installer si la signature ne correspond pas à la clé publique qu'elle contient,
+si l'adresse de téléchargement sort de `https://rtl-sdr.fr/`, ou si l'empreinte SHA-256 d'un module diffère.
+Toute modification d'un module impose donc de régénérer puis de resigner le catalogue (c'est fait
+par le script de déploiement du site).
+
 | Fichier   | Ce qu'il fait |
 |-----------|---------------|
 | `adsb.py` | avions sur 1090 MHz (2,4 MS/s, gain maximal) : carte radar mondiale et tableau dans une fenêtre séparée |
 | `scanner_memoires.py` | balaie les fréquences du module Mémoires, s'arrête sur un signal et reprend après un silence |
-| `scanner_frequences.py` | balaie une plage début–fin avec un pas, s'arrête sur un signal qui dépasse le bruit estimé |
-| `pilotage_rigctl.py` | serveur rigctld local (port 4532) : Gpredict suit les satellites (Doppler), WSJT-X, fldigi… pilotent fréquence et mode |
+| `scanner_frequences.py` | balaie une plage début–fin avec un pas, s'arrête sur un signal qui dépasse le bruit estimé, se cale au milieu des stations larges (WFM) |
+| `pilotage_rigctl.py` | serveur rigctld local (port 4532, IPv4 et IPv6, connexions locales seulement) : Gpredict suit les satellites (Doppler), WSJT-X, fldigi… pilotent fréquence et mode |

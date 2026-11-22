@@ -17,6 +17,7 @@ modules à chaud**, sans redémarrer.
 - Bande passante réglable par mode (mémorisée), AGC audio, squelch en dBFS, volume
 - Détection de la clé : modèle, tuner, couverture, paliers de gain, taux max ; options non prises en charge grisées, fréquence en rouge hors couverture (menu Source → Informations sur le matériel)
 - RTL-SDR : taux d'échantillonnage, gain RF (auto ou manuel), correction ppm, échantillonnage direct I/Q (HF sur V3), bias-T
+- Convertisseur HF (Ham It Up…) : décalage en MHz dans les réglages ; l'afficheur et le spectre montrent la vraie fréquence HF, la clé est accordée sur fréquence + décalage
 - Réglages, modules actifs et disposition des fenêtres retrouvés au lancement suivant
 
 ## Installation (Debian / Ubuntu)
@@ -35,6 +36,17 @@ pip install -r requirements.txt
 
 Menu **Modules → Ajouter des modules…** : les modules proposés sur rtl-sdr.fr s'installent
 (et se mettent à jour) en un clic dans `~/.config/sdr-modulaire/modules/`.
+
+Le catalogue (`https://rtl-sdr.fr/catalogue-modules.json`) est **signé en Ed25519** par l'auteur
+(`catalogue-modules.json.sig`) ; la clé publique est écrite dans l'application (`sdrmod/signature.py`).
+Avant toute installation, l'application vérifie :
+
+- la signature du catalogue : invalide, absente ou illisible → catalogue refusé, rien n'est installable ;
+- l'adresse de téléchargement : seuls les fichiers sous `https://rtl-sdr.fr/` sont acceptés ;
+- l'empreinte SHA-256 de chaque module, annoncée par le catalogue signé ;
+- le nom de fichier, la taille et la syntaxe Python.
+
+« Installer depuis un fichier… » reste possible pour un module local : c'est alors vous qui lui faites confiance.
 
 ![Gestionnaire d'ajout de modules](docs/captures/ajout-modules.png)
 
@@ -68,6 +80,7 @@ sdrmod/
   dsp.py           NCO, FIR/IIR à état, décimateurs, AGC
   bus.py           publication / abonnement
   modules.py       Module, Contexte, GestionnaireModules
+  signature.py     vérification Ed25519 du catalogue des modules (Python pur)
   sources/         rtlsdr_source.py (une classe Source par matériel),
                    simulation.py (émetteurs fictifs, pour les tests automatiques seulement)
   demods/          am.py, fm.py, blu.py              (un fichier = un ou plusieurs modes)
@@ -76,7 +89,7 @@ modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite
                    capteurs_433.py, stereo_rds_fm.py
 modules-a-telecharger/  adsb.py, scanner_memoires.py, scanner_frequences.py,
                         pilotage_rigctl.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
-tests/             test_dsp.py, test_interface.py
+tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py
 ```
 
 ## Trois niveaux d'extension
@@ -128,13 +141,32 @@ déclarée dans `SOURCES` (`sources/__init__.py`).
 python3 -m tests.test_dsp                                            # chaque mode sur signaux simulés
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_interface capture.png # interface + modules à chaud
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_materiel capture.png  # affichage du matériel (clé FC0013 émulée)
+QT_QPA_PLATFORM=offscreen python3 -m tests.test_catalogue             # signature Ed25519 et adresse du catalogue
 ```
 
-## Pistes de modules
+## Modules disponibles
 
-Décodeur APRS/AX.25 (vers aprs.jerko.fr), FT8/WSPR via `jt9`, stéréo + RDS en WFM,
-enregistreur IQ, scanner de mémoires, sortie MQTT vers InfluxDB/Grafana, serveur
-web pour l'écoute à distance.
+Fournis avec l'application : S-mètre, Mémoires, Enregistreur audio (WAV), Journal d'activité,
+Capteurs 433 MHz, Stéréo et RDS en FM.
+
+À télécharger (Modules → Ajouter des modules…) :
+
+- **ADS-B** : avions sur 1090 MHz, carte radar et tableau ;
+- **Scanner de mémoires** : parcourt les mémoires, s'arrête sur un signal, reprend après un silence ;
+- **Scanner de fréquences** : plage début–fin avec un pas, seuil relatif au bruit, en boucle ;
+  se cale au milieu des stations plus larges que le pas (WFM) ;
+- **Pilotage rigctl** : serveur compatible rigctld sur `localhost:4532` (IPv4 `127.0.0.1` et IPv6 `::1`,
+  connexions locales seulement) : Gpredict corrige le Doppler des satellites, WSJT-X, fldigi… règlent
+  fréquence et mode. Dans Gpredict : radio « RX only », hôte localhost, port 4532, puis « Engage ».
+
+## Pistes
+
+Déjà réalisées : stéréo + RDS en WFM, scanner de mémoires, scanner de fréquences, ADS-B,
+capteurs 433 MHz, pilotage rigctl (Gpredict), convertisseur HF, version navigateur (SDR Web).
+
+Restent : décodeur APRS/AX.25 (vers aprs.jerko.fr, ébauche dans `modules/_decodeur_aprs.py`),
+FT8/WSPR via `jt9`, enregistreur IQ, sortie MQTT vers InfluxDB/Grafana, serveur web pour
+l'écoute à distance.
 
 ## Licence
 

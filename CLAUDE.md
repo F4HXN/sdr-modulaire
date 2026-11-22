@@ -74,7 +74,16 @@ taux en marche, détection matériel (clé émulée). Charge DSP ~13 % d'un cœu
 manuel, ppm, tenue dans la durée (dérive de latence audio). C'est la première chose à
 valider sur la machine.
 
+## Catalogue des modules
+
+`catalogue-modules.json` est signé en Ed25519 (`.sig` à côté, base64). Clé publique :
+`sdrmod/signature.py` (vérification en Python pur) ; clé privée hors dépôts,
+`~/.config/rtl-sdr.fr/catalogue-ed25519.pem`, script `signer_catalogue.py` du dépôt du site
+(appelé par `deployer.sh`). `base` doit être sous `https://rtl-sdr.fr/`. Modifier un module
+du catalogue → le recopier dans le site, régénérer et resigner.
+
 ## Pistes
 
-Décodeur APRS/AX.25 (vers l'API aprs.jerko.fr), stéréo + RDS en WFM, scanner de
-mémoires, enregistreur IQ, sortie MQTT vers InfluxDB/Grafana, écoute à distance par le web.
+Faites : stéréo + RDS, scanners, ADS-B, capteurs 433, rigctl, convertisseur HF, SDR Web.
+Restent : décodeur APRS/AX.25 (vers l'API aprs.jerko.fr), FT8/WSPR, enregistreur IQ,
+sortie MQTT vers InfluxDB/Grafana, écoute à distance par le web.
