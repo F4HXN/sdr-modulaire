@@ -12,7 +12,7 @@
 //            lire(clé, défaut), ecrire(clé, valeur).
 // Les rappels du bus doivent rester rapides : on stocke, et une minuterie met l'affichage à jour.
 
-import { FirComplexe, NCO, passeBas } from "./dsp.js?v=20261121-fm-stereo";
+import { FirComplexe, NCO, passeBas, LARGEURS, FFT } from "./dsp.js?v=20261121-fm-stereo";
 import { StereoRds } from "./fm-stereo.js?v=20261121-fm-stereo";
 import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
 import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261121-adsb";
@@ -514,6 +514,29 @@ class ScannerMemoires {
 // Scanner de fréquences : plage début–fin avec un pas, arrêt sur signal, reprise après un silence.
 const PAS_SCAN = [5, 6.25, 8.33, 10, 12.5, 20, 25, 50, 100, 200], MODES_SCAN = ["NFM", "AM", "WFM", "USB", "LSB", "CW"];
 
+/**
+ * Trouve une station dans le spectre d'un bloc IQ : ses deux bords, autour de f0 (là où le
+ * scanner l'a touchée) et dans une fenêtre de quelques largeurs de canal. null si rien de net.
+ */
+function bordsStation(re, im, centre, taux, f0, bw) {
+  const N = 2048, fft = new FFT(N), trames = Math.min(8, Math.floor(re.length / N));
+  if (!trames) return null;
+  const p = new Float64Array(N);
+  for (let t = 0; t < trames; t++) { const db = fft.spectre(re, im, t * N); for (let i = 0; i < N; i++) p[i] += 10 ** (db[i] / 10); }
+  const res = taux / N, w = Math.max(1, Math.round(bw / 20 / res)), lisse = new Float64Array(N);
+  for (let i = 0; i < N; i++) { let s = 0, c = 0; for (let k = Math.max(0, i - w); k <= Math.min(N - 1, i + w); k++) { s += p[k]; c++; } lisse[i] = 10 * Math.log10(s / c / trames + 1e-20); }
+  const bruit = [...lisse].sort((a, b) => a - b)[N >> 1];
+  const bin = f => Math.round((f - centre) / res + N / 2), freq = i => centre + (i - N / 2) * res;
+  const a = Math.max(2, bin(f0 - bw)), b = Math.min(N - 3, bin(f0 + 2.5 * bw));
+  let pic = -1; for (let i = a; i <= b; i++) if (pic < 0 || lisse[i] > lisse[pic]) pic = i;
+  if (pic < 0 || lisse[pic] < bruit + 6) return null;
+  const seuil = Math.max(bruit + 6, lisse[pic] - 30);
+  let g = pic, d = pic;
+  while (g > 2 && lisse[g - 1] > seuil) g--;
+  while (d < N - 3 && lisse[d + 1] > seuil) d++;
+  return { gauche: freq(g), droite: freq(d) };
+}
+
 class ScannerFrequences {
   static nom = "Scanner de fréquences";
   static description = "Balaye une plage début–fin avec un pas, s'arrête sur un signal qui dépasse le bruit et reprend après un silence.";
@@ -528,6 +551,10 @@ class ScannerFrequences {
     this.niveaux = []; this.actif = false; this.etat = "arret"; this.k = -1; this.f = null; this.journal = [];
     if (MODES_SCAN.includes(this.ctx.mode())) this.modeScan = this.ctx.mode();   // on part du mode du récepteur
     this.ctx.abonner("niveau", db => { this.niveaux.push([performance.now(), db]); if (this.niveaux.length > 200) this.niveaux.splice(0, 100); });
+    this.ctx.abonner("iq", (re, im, centre, taux) => {   // un bloc suffit, et seulement pendant le centrage
+      if (this.etat === "centrage" && !this.blocIQ && performance.now() > this.tAccord + STABILISATION)
+        this.blocIQ = { re: re.slice(), im: im.slice(), centre, taux };
+    });
     this.ctx.abonner("vfo", (_f, mode) => {   // mode changé dans la barre du haut : le scanner suit
       if (mode === this.modeScan || !MODES_SCAN.includes(mode)) return;
       this.modeScan = mode; if (this.choixMode) this.choixMode.value = mode;
@@ -585,21 +612,37 @@ class ScannerFrequences {
     if (this.actif) { this.actif = false; this.etat = "arret"; this.afficher(); return; }
     const [n] = this.plage();
     if (this.debut === this.fin || n > 200000) { this.statut.textContent = "Plage invalide : début et fin différents, 200 000 pas au plus."; return; }
-    this.actif = true; this.mesures = []; this.tours = 1; this.fini = false; this.ctx.reglerMode(this.modeScan); this.k = -1; this.suivant();
+    this.actif = true; this.mesures = []; this.tours = 1; this.fini = false; this.kSortie = null; this.ctx.reglerMode(this.modeScan); this.k = -1; this.suivant();
+  }
+  largeurHz() { return LARGEURS[this.modeScan] || 12500; }
+  estIgnoree(f) {   // une fréquence ignorée écarte toute la largeur du canal autour d'elle
+    const demi = Math.max(this.largeurHz() / 2, this.pas * 500);
+    for (const g of this.ignorees) if (Math.abs(f - g) < demi) return true;
+    return false;
   }
   suivant() {
     const [n, fDe] = this.plage();
+    if (this.kSortie != null) { this.k = Math.min(this.kSortie, n) - 1; this.kSortie = null; }
     let trouve = false;
     for (let i = 0; i < n; i++) {
       if (this.k + 1 >= n) {   // fin de la plage
         if (!this.boucle) { this.actif = false; this.etat = "arret"; this.fini = true; this.afficher(); return; }
         this.tours++;
       }
-      this.k = (this.k + 1) % n; if (!this.ignorees.has(fDe(this.k))) { trouve = true; break; }
+      this.k = (this.k + 1) % n; if (!this.estIgnoree(fDe(this.k))) { trouve = true; break; }
     }
     if (!trouve) { this.actif = false; this.etat = "arret"; this.afficher(); return; }
     this.f = fDe(this.k); this.ctx.reglerFrequence(this.f);
     this.fAttendue = this.ctx.frequence(); this.tAccord = performance.now(); this.tSilence = null; this.etat = "mesure";
+    this.afficher();
+  }
+  arreterSur(k, db) {
+    const [, fDe] = this.plage();
+    if (k !== this.k) { this.k = k; this.f = fDe(k); this.ctx.reglerFrequence(this.f); this.fAttendue = this.ctx.frequence(); }
+    this.etat = "signal"; this.tSilence = null; this.tAccord = performance.now();
+    this.journal.unshift(`${new Date().toLocaleTimeString("fr-FR")}  ${(this.f / 1e6).toFixed(4)} MHz  ${db.toFixed(0)} dBFS`);
+    this.journal.length = Math.min(this.journal.length, 30);
+    this.ulJournal.replaceChildren(...this.journal.map(t => el("li", { textContent: t })));
     this.afficher();
   }
   bruit() {   // médiane des derniers pas (presque tous vides) ; rien tant qu'il y en a moins de 5
@@ -620,11 +663,23 @@ class ScannerFrequences {
       const bruit = this.bruit();
       this.mesures.push(db); if (this.mesures.length > 60) this.mesures.shift();
       if (bruit !== null && db > bruit + this.marge) {
-        this.etat = "signal";
-        this.journal.unshift(`${new Date().toLocaleTimeString("fr-FR")}  ${(this.f / 1e6).toFixed(4)} MHz  ${db.toFixed(0)} dBFS`);
-        this.journal.length = Math.min(this.journal.length, 30);
-        this.ulJournal.replaceChildren(...this.journal.map(t => el("li", { textContent: t })));
+        const pasHz = this.pas * 1e3, bw = this.largeurHz();
+        if (bw > 2 * pasHz) {
+          // Canal plus large que le pas (WFM…) : on vient de toucher le flanc de la station.
+          // On lit le spectre pour trouver ses deux bords et se caler au milieu.
+          this.etat = "centrage"; this.blocIQ = null; this.dbDetection = db; this.tCentrage = maintenant; this.afficher();
+        } else this.arreterSur(this.k, db);
       } else { this.suivant(); return; }
+    } else if (this.etat === "centrage") {
+      if (!this.blocIQ) { if (maintenant - this.tCentrage > 1000) this.arreterSur(this.k, this.dbDetection); return; }
+      const { re, im, centre, taux } = this.blocIQ, bw = this.largeurHz(), pasHz = this.pas * 1e3;
+      const bords = bordsStation(re, im, centre, taux, this.f, bw);
+      if (!bords) { this.arreterSur(this.k, this.dbDetection); return; }
+      const [n] = this.plage(), bas = Math.min(this.debut, this.fin) * 1e6;
+      const kc = Math.max(0, Math.min(n - 1, Math.round(((bords.gauche + bords.droite) / 2 - bas) / pasHz)));
+      // À la reprise : premier pas dont le canal ne touche plus la station.
+      this.kSortie = Math.max(kc + 1, Math.ceil((bords.droite + bw / 2 - bas) / pasHz));
+      this.arreterSur(kc, this.dbDetection);
     } else if (this.etat === "signal") {
       const db = this.niveauDepuis(maintenant - 300);
       if (db === null) { /* pas de mesure récente */ }
@@ -645,7 +700,8 @@ class ScannerFrequences {
       this.statut.textContent = `${this.fini ? "Passage terminé" : "Arrêté"} · ${bas.toFixed(4)} → ${haut.toFixed(4)} MHz, ${n} pas de ${this.pas} kHz en ${this.modeScan}`;
     } else if (this.etat === "signal") {
       this.statut.textContent = `● Signal sur ${(this.f / 1e6).toFixed(4)} MHz ${this.modeScan}${this.tSilence === null ? "" : ` · reprise dans ${Math.max(0, this.reprise - (performance.now() - this.tSilence) / 1000).toFixed(0)} s`}`;
-    } else this.statut.textContent = `Balayage… ${(this.f / 1e6).toFixed(4)} MHz (${this.k + 1}/${n}, tour ${this.tours})${this.bruit() === null ? " · mesure du bruit" : ` · bruit ${this.bruit().toFixed(0)} dBFS`}`;
+    } else if (this.etat === "centrage") this.statut.textContent = `Centrage sur la station… ${(this.f / 1e6).toFixed(4)} MHz`;
+    else this.statut.textContent = `Balayage… ${(this.f / 1e6).toFixed(4)} MHz (${this.k + 1}/${n}, tour ${this.tours})${this.bruit() === null ? " · mesure du bruit" : ` · bruit ${this.bruit().toFixed(0)} dBFS`}`;
   }
   arreter() { clearInterval(this.minuterie); this.actif = false; }
 }
