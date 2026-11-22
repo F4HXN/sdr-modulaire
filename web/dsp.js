@@ -162,6 +162,36 @@ function excursion(d, fs, pas) {
   return Math.max(b - m, m - a) * fs / (2 * Math.PI);
 }
 
+// Bruit seul : le discriminateur FM et l'enveloppe AM donnent une fausse « modulation » énorme.
+// On estime la présence d'un vrai signal (0 = bruit seul, 1 = signal net) et, sans signal,
+// l'aiguille est plafonnée à 40 % de l'échelle (PLAFOND_BRUIT).
+const PLAFOND_BRUIT = 0.4;
+/** FM : enveloppe constante pour un vrai signal ; pour du bruit (loi de Rayleigh), écart-type/moyenne ≈ 0,52. */
+function presenceFM(cr, ci, pas) {
+  let s = 0, s2 = 0, n = 0;
+  for (let k = 0; k < cr.length; k += pas) { const e = Math.hypot(cr[k], ci[k]); s += e; s2 += e * e; n++; }
+  const m = s / Math.max(1, n), cv = Math.sqrt(Math.max(0, s2 / Math.max(1, n) - m * m)) / (m || 1);
+  return Math.max(0, Math.min(1, (0.42 - cv) / 0.3));
+}
+/** AM : raie de porteuse au centre du canal, comparée au plancher (médiane) du canal. */
+function presenceAM(fft, cr, ci, largeur) {
+  if (cr.length < fft.n) return null;
+  const db = fft.spectre(cr, ci, 0), c = fft.n / 2, binHz = TAUX_AUDIO / fft.n;
+  const demi = Math.max(12, Math.min(c - 1, Math.round(largeur / 2 / binHz)));
+  let porteuse = -Infinity; const reste = [];
+  for (let k = c - demi; k <= c + demi; k++) { if (Math.abs(k - c) <= 8) porteuse = Math.max(porteuse, db[k]); else reste.push(db[k]); }
+  reste.sort((a, b) => a - b);
+  const ecart = porteuse - reste[reste.length >> 1];
+  return Math.max(0, Math.min(1, (ecart - 12) / 12));
+}
+/** Applique la présence (lissée) à la mesure : plafond de 40 % de l'échelle sans signal. */
+function plafonner(mesure, q) {
+  if (q < 1) mesure.valeur = Math.min(mesure.valeur, mesure.max * (PLAFOND_BRUIT + (1 - PLAFOND_BRUIT) * q));
+  mesure.presence = q;
+  return mesure;
+}
+const lisser = (a, b) => a === undefined ? b : 0.7 * a + 0.3 * b;
+
 class Discriminateur {
   constructor() { this.pr = 1; this.pi = 0; }
   traiter(ir, ii) {
@@ -199,7 +229,8 @@ export function creerDemod(mode, largeur) {
         const [cr, ci] = canal.traiter(ir, ii);
         this.niveau = puissanceDb(cr, ci);
         const multiplex = disc.traiter(cr, ci);
-        this.modulation = { type: "FM", valeur: excursion(multiplex, TAUX_INTER, 4) / 1000, nominal: 75, max: 100, unite: "kHz" };
+        this.presence = lisser(this.presence, presenceFM(cr, ci, 4));
+        this.modulation = plafonner({ type: "FM", valeur: excursion(multiplex, TAUX_INTER, 4) / 1000, nominal: 75, max: 100, unite: "kHz" }, this.presence);
         this.stereo = surMultiplex?.(multiplex);
         const fm = desac.traiter(multiplex);
         const [a] = vers48.traiter(fm, new Float32Array(fm.length));
@@ -216,7 +247,8 @@ export function creerDemod(mode, largeur) {
       traiter(ir, ii) {
         const [cr, ci] = canal.traiter(ir, ii); this.niveau = puissanceDb(cr, ci);
         const d = disc.traiter(cr, ci), nominal = largeur >= 20000 ? 5 : 2.5;
-        this.modulation = { type: "FM", valeur: excursion(d, TAUX_AUDIO, 1) / 1000, nominal, max: nominal * 1.6, unite: "kHz" };
+        this.presence = lisser(this.presence, presenceFM(cr, ci, 1));
+        this.modulation = plafonner({ type: "FM", valeur: excursion(d, TAUX_AUDIO, 1) / 1000, nominal, max: nominal * 1.6, unite: "kHz" }, this.presence);
         const a = dc.traiter(desac.traiter(d));
         const g = TAUX_AUDIO / (2 * Math.PI * 2500);   // ±2,5 kHz → ±1
         for (let k = 0; k < a.length; k++) a[k] *= g;
@@ -225,7 +257,7 @@ export function creerDemod(mode, largeur) {
     };
   }
   if (mode === "AM") {
-    const dc = new ReductionContinue();
+    const dc = new ReductionContinue(), fftAM = new FFT(2048);
     return {
       domaine: "audio", decalage: 0,
       traiter(ir, ii) {
@@ -236,7 +268,9 @@ export function creerDemod(mode, largeur) {
         porteuse /= Math.max(1, cr.length);
         const [a, b] = centiles(e, 0.01, 0.99);
         const taux = porteuse > 0 ? 100 * Math.max(b - porteuse, porteuse - a) / porteuse : 0;
-        this.modulation = { type: "AM", valeur: taux, nominal: 100, max: 125, unite: "%" };
+        const q = presenceAM(fftAM, cr, ci, largeur);
+        if (q !== null) this.presence = lisser(this.presence, q);
+        this.modulation = plafonner({ type: "AM", valeur: taux, nominal: 100, max: 125, unite: "%" }, this.presence ?? 0);
         return dc.traiter(e);
       },
     };

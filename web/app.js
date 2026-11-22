@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // SDR Web : récepteur SDR dans le navigateur (WebUSB), version web de SDR Modulaire.
 
-import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261122-modulation";
+import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261122-bruit";
 import { CleRtlSdr } from "./rtlsdr.js?v=20261122-pll";
 import { SourceSimulation } from "./simulation.js?v=20261122-niveau";
-import { MODULES } from "./modules.js?v=20261122-modulation";
+import { MODULES } from "./modules.js?v=20261122-bruit";
 
 const $ = s => document.querySelector(s);
 const PAS = [100, 1000, 2500, 5000, 6250, 8330, 10000, 12500, 25000, 100000, 1000000];

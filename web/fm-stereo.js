@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-import { FirComplexe, passeBas, TAUX_INTER } from "./dsp.js?v=20261122-modulation";
+import { FirComplexe, passeBas, TAUX_INTER } from "./dsp.js?v=20261122-bruit";
 
 const TAU = 2 * Math.PI;
 const PILOTE = TAU * 19000 / TAUX_INTER;

@@ -12,8 +12,8 @@
 //            lire(clé, défaut), ecrire(clé, valeur).
 // Les rappels du bus doivent rester rapides : on stocke, et une minuterie met l'affichage à jour.
 
-import { FirComplexe, NCO, passeBas, LARGEURS, FFT } from "./dsp.js?v=20261122-modulation";
-import { StereoRds } from "./fm-stereo.js?v=20261122-modulation";
+import { FirComplexe, NCO, passeBas, LARGEURS, FFT } from "./dsp.js?v=20261122-bruit";
+import { StereoRds } from "./fm-stereo.js?v=20261122-bruit";
 import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
 import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261122-niveau";
 import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261122-niveau";
