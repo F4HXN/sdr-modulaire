@@ -12,12 +12,13 @@
 //            lire(clé, défaut), ecrire(clé, valeur).
 // Les rappels du bus doivent rester rapides : on stocke, et une minuterie met l'affichage à jour.
 
-import { FirComplexe, NCO, passeBas, LARGEURS, FFT } from "./dsp.js?v=20261122-bruit";
-import { StereoRds } from "./fm-stereo.js?v=20261122-bruit";
+import { FirComplexe, NCO, passeBas, LARGEURS, FFT } from "./dsp.js?v=20261122-cw";
+import { StereoRds } from "./fm-stereo.js?v=20261122-cw";
 import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
 import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261122-niveau";
 import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261122-niveau";
 import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
+import { TAUX_CW, DUREE_FENETRE, DUREE_PAS } from "./cw.js?v=20261122-cw";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
 
@@ -998,4 +999,100 @@ class ModuleSSTV {
   arreter() { clearInterval(this.minuterie); clearInterval(this.travail); }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV];
+// Décodeur CW : même réseau de neurones que le module decodeur_cw.py de SDR Modulaire (cw.js).
+// L'audio (48 kHz, après AGC et squelch) est filtré et ramené à 8 kHz ; toutes les 3 s, la fenêtre
+// des 6 dernières secondes part au fil de calcul (cw-worker.js), qui renvoie le texte du milieu.
+class DecodeurCW {
+  static nom = "Décodeur CW";
+  static description = "Morse décodé par un réseau de neurones, 10 à 42 WPM, robuste au bruit et au QSB. Mode CW, squelch ouvert.";
+
+  demarrer() {
+    this.fenetre = new Float32Array(DUREE_FENETRE * TAUX_CW); this.rempli = 0; this.depuis = 0;
+    this.premiere = true; this.occupe = false; this.recus = [];
+    this.etat = { pret: false, erreur: "", silence: false, tonalite: null, wpm: null, contraste: null, duree: 0 };
+    this.taux = 0;
+    this.fil = new Worker(new URL("./cw-worker.js?v=20261122-cw", import.meta.url), { type: "module" });
+    this.fil.onmessage = e => {
+      const r = e.data;
+      if (r.pret) { this.etat.pret = true; return; }
+      this.occupe = false;
+      if (r.erreur) { this.etat.erreur = r.erreur; return; }
+      Object.assign(this.etat, { silence: r.silence, duree: r.duree ?? this.etat.duree });
+      if (!r.silence) {
+        Object.assign(this.etat, { tonalite: r.tonalite, wpm: r.wpm, contraste: r.contraste });
+        if (r.texte) this.recus.push(r.texte);
+      }
+    };
+    this.fil.onerror = e => { this.etat.erreur = e.message || "le fil de calcul n'a pas démarré"; };
+    this.ctx.abonner("audio", (a, taux) => this.recevoir(a, taux));
+  }
+
+  /** Filtre passe-bas (3,4 kHz) et décimation vers 8 kHz, en ne calculant que les échantillons gardés. */
+  recevoir(a, taux) {
+    if (taux !== this.taux) {
+      this.taux = taux; this.facteur = Math.max(1, Math.round(taux / TAUX_CW));
+      this.h = passeBas(taux, 3400, 127); this.histo = new Float32Array(this.h.length - 1); this.phase = 0;
+    }
+    const h = this.h, L = h.length, f = this.facteur, y = new Float32Array(L - 1 + a.length);
+    y.set(this.histo); y.set(a, L - 1);
+    const sortie = [];
+    let j = L - 1 + this.phase;
+    for (; j < y.length; j += f) { let s = 0; for (let q = 0; q < L; q++) s += h[q] * y[j - q]; sortie.push(s); }
+    this.phase = j - y.length;
+    this.histo = y.slice(y.length - (L - 1));
+    // Fenêtre glissante des 6 dernières secondes.
+    const n = sortie.length, W = this.fenetre;
+    if (n >= W.length) W.set(sortie.slice(n - W.length));
+    else { W.copyWithin(0, n); W.set(sortie, W.length - n); }
+    this.rempli = Math.min(W.length, this.rempli + n); this.depuis += n;
+    if (this.rempli === W.length && this.depuis >= DUREE_PAS * TAUX_CW && !this.occupe && this.etat.pret) {
+      this.depuis = 0; this.occupe = true;
+      this.fil.postMessage({ fenetre: W.slice(), premiere: this.premiere });
+      this.premiere = false;
+    }
+  }
+
+  creerPanneau() {
+    this.zone = el("div", { className: "cw-texte", role: "log", ariaLive: "polite" });
+    this.zone.dataset.vide = "Mode CW, squelch ouvert : calez-vous sur une station…";
+    this.statut = el("div", { className: "petit" });
+    const mode = el("button", { type: "button", textContent: "Mode CW" });
+    mode.onclick = () => this.ctx.reglerMode("CW");
+    const effacer = el("button", { type: "button", textContent: "Effacer" });
+    effacer.onclick = () => { this.zone.textContent = ""; };
+    const copier = el("button", { type: "button", textContent: "Copier" });
+    copier.onclick = () => navigator.clipboard?.writeText(this.zone.textContent).then(() => {
+      copier.textContent = "Copié"; setTimeout(() => { copier.textContent = "Copier"; }, 1200);
+    }).catch(() => {});
+    const enregistrer = el("button", { type: "button", textContent: "Enregistrer", title: "Télécharge le texte décodé, avec la date et la fréquence" });
+    enregistrer.onclick = () => {
+      const d = new Date(), local = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19);
+      const contenu = `[${local.replace("T", " ")} ${(this.ctx.frequence() / 1e6).toFixed(4)} MHz]\n${this.zone.textContent}\n`;
+      const a = el("a", { href: URL.createObjectURL(new Blob([contenu], { type: "text/plain" })), download: `cw_${local.replace(/[-:]/g, "").replace("T", "_")}.txt` });
+      a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    };
+    this.minuterie = setInterval(() => this.rafraichir(), 250);
+    this.rafraichir();
+    return el("div", {}, this.zone, this.statut, el("div", { className: "scanner-choix cw-actions" }, mode, effacer, copier, enregistrer));
+  }
+
+  rafraichir() {
+    for (let morceau of this.recus.splice(0)) {
+      const t = this.zone.textContent;
+      if (!t || t.endsWith(" ")) morceau = morceau.replace(/^ +/, "");
+      this.zone.textContent = (t + morceau.replace(/  +/g, " ")).slice(-4000);
+      this.zone.scrollTop = this.zone.scrollHeight;
+    }
+    const e = this.etat, m = this.ctx.mode();
+    this.statut.textContent = e.erreur ? `Erreur : ${e.erreur}`
+      : !e.pret ? "Chargement du réseau de neurones…"
+      : !["CW", "USB", "LSB"].includes(m) ? `Mode ${m} : passez en CW pour décoder`
+      : e.silence ? "Squelch fermé : ouvrez-le pour décoder"
+      : e.tonalite === null ? `En attente de ${DUREE_FENETRE} s d'audio…`
+      : `Tonalité ${Math.round(e.tonalite)} Hz · ${e.wpm ? `~${Math.round(e.wpm)} WPM` : "vitesse ?"} · contraste ${Math.round(e.contraste)} dB · calcul ${Math.round(e.duree)} ms`;
+  }
+
+  arreter() { clearInterval(this.minuterie); this.fil?.terminate(); }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW];

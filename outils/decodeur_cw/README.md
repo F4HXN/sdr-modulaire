@@ -24,6 +24,7 @@ python3 entrainer.py 45                # minutes ; écrit meilleur.pt
 python3 entrainer.py 25 meilleur.pt    # reprise / affinage depuis un réseau existant
 python3 exporter_module.py meilleur.pt ../../modules-a-telecharger/decodeur_cw.py
 python3 -m tests.test_decodeur_cw      # depuis la racine du dépôt : test de bout en bout
+python3 exporter_web.py ../../modules-a-telecharger/decodeur_cw.py ../../web/cw-poids.bin   # mêmes poids pour SDR Web
 ```
 
 `decodeur_cw_gabarit.py` est le module sans ses poids ; `exporter_module.py` y insère les poids

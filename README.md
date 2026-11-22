@@ -167,7 +167,8 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
   fréquence et mode. Dans Gpredict : radio « RX only », hôte localhost, port 4532, puis « Engage ».
 - **Décodeur CW** : Morse décodé par un réseau de neurones (CNN + GRU bidirectionnel + CTC, poids
   embarqués, numpy seul), 10 à 42 WPM, robuste au bruit, au QSB et à la manipulation manuelle ; texte
-  avec ~4,5 s de retard. Mode CW, squelch ouvert. Entraînement : `outils/decodeur_cw/`.
+  avec ~4,5 s de retard. Mode CW, squelch ouvert. Entraînement : `outils/decodeur_cw/` ; aussi dans SDR Web
+  (`web/cw.js`, poids `web/cw-poids.bin` exportés par `outils/decodeur_cw/exporter_web.py`).
 
 ## Pistes
 
