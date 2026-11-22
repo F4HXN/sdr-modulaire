@@ -21,6 +21,44 @@ import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
 
+/**
+ * Fenêtre flottante (dialogue non modal) : déplacée en tirant la poignée (barre de titre),
+ * redimensionnée par son coin (CSS resize), position et taille retenues avec ctx.ecrire().
+ * Échap la ferme. Le récepteur reste utilisable pendant qu'elle est ouverte.
+ */
+function fenetreFlottante(dialogue, poignee, ctx, cle = "fenetre") {
+  const borne = (v, min, max) => Math.max(min, Math.min(max, v));
+  const placer = (x, y) => {
+    const r = dialogue.getBoundingClientRect();
+    dialogue.style.left = `${borne(x, 0, innerWidth - Math.min(r.width, 120))}px`;
+    dialogue.style.top = `${borne(y, 0, innerHeight - 48)}px`;
+  };
+  const retenir = () => {
+    const r = dialogue.getBoundingClientRect();
+    ctx.ecrire(cle, { x: Math.round(r.left), y: Math.round(r.top), l: Math.round(r.width), h: Math.round(r.height) });
+  };
+  poignee.classList.add("poignee");
+  poignee.addEventListener("pointerdown", e => {
+    if (e.button !== 0 || e.target.closest("button, input, select, a")) return;
+    const r = dialogue.getBoundingClientRect(), dx = e.clientX - r.left, dy = e.clientY - r.top;
+    try { poignee.setPointerCapture(e.pointerId); } catch { /* pointeur déjà relâché */ }
+    const bouger = ev => placer(ev.clientX - dx, ev.clientY - dy);
+    const lacher = () => { poignee.removeEventListener("pointermove", bouger); poignee.removeEventListener("pointerup", lacher); retenir(); };
+    poignee.addEventListener("pointermove", bouger); poignee.addEventListener("pointerup", lacher);
+    e.preventDefault();
+  });
+  let attente;
+  new ResizeObserver(() => { if (dialogue.open) { clearTimeout(attente); attente = setTimeout(retenir, 300); } }).observe(dialogue);
+  dialogue.addEventListener("keydown", e => { if (e.key === "Escape") dialogue.close(); });
+  return () => {                                   // ouvrir : taille et place retenues, sinon centrée
+    const g = ctx.lire(cle, null);
+    if (g) { dialogue.style.width = `${Math.min(g.l, innerWidth - 16)}px`; dialogue.style.height = `${Math.min(g.h, innerHeight - 16)}px`; }
+    dialogue.show();
+    const r = dialogue.getBoundingClientRect();
+    placer(g ? g.x : (innerWidth - r.width) / 2, g ? g.y : (innerHeight - r.height) / 2);
+  };
+}
+
 const MEMOIRES_DEFAUT = [
   { nom: "APRS", f: 144_800_000, mode: "NFM" }, { nom: "Appel FM 2 m", f: 145_500_000, mode: "NFM" },
   { nom: "Appel FM 70 cm", f: 433_500_000, mode: "NFM" }, { nom: "Radio FM (exemple)", f: 87_800_000, mode: "WFM" },
@@ -192,25 +230,32 @@ class Capteurs433 {
     const agrandir = el("button", { type: "button", textContent: "Agrandir", className: "capteurs-agrandir" });
     agrandir.setAttribute("aria-haspopup", "dialog");
     const titre = el("h2", { id: "capteurs-titre", textContent: "Capteurs 433 MHz" });
-    const fermer = el("button", { type: "button", textContent: "Réduire", autofocus: true });
-    const dialogue = el("dialog", { className: "capteurs-dialogue" },
-      el("header", {}, titre, fermer));
+    const fermer = el("button", { type: "button", textContent: "Réduire", title: "Remettre dans la colonne des modules (Échap)" });
+    const entete = el("header", { title: "Tirer pour déplacer · coin en bas à droite pour agrandir" }, titre, fermer);
+    const dialogue = el("dialog", { className: "capteurs-dialogue" }, entete);
     dialogue.setAttribute("aria-labelledby", titre.id);
+    const ouvrir = fenetreFlottante(dialogue, entete, this.ctx);
     const panneau = el("div", {}, contenu, agrandir, dialogue);
     agrandir.onclick = () => {
+      if (dialogue.open) { fermer.focus(); return; }
       dialogue.append(contenu);
-      dialogue.showModal();
+      agrandir.textContent = "Fenêtre ouverte";
+      ouvrir();
+      fermer.focus();
     };
     fermer.onclick = () => dialogue.close();
     dialogue.addEventListener("close", () => {
       panneau.prepend(contenu);
+      agrandir.textContent = "Agrandir";
       agrandir.focus();
     });
+    this.dialogue = dialogue;
     return panneau;
   }
 
   arreter() {
     clearInterval(this.minuterie);
+    this.dialogue?.close();
   }
 }
 
