@@ -49,6 +49,7 @@ class Reglages:
 
     taille_fft: int = 4096
     moyennage: float = 0.5
+    zoom: float = 0.0                   # largeur affichée par le spectre (Hz), 0 = toute la bande
     niveau_min: float = -110.0
     niveau_max: float = -40.0
 

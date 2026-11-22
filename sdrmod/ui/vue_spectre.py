@@ -82,10 +82,12 @@ class VueSpectre(pg.GraphicsLayoutWidget):
         return getattr(self, "_dernier", None)
 
     def maj(self, donnees) -> None:
-        db, centre, taux = donnees
+        db, centre, taux = donnees        # taux : largeur affichée (toute la bande, ou la portion zoomée)
         n = len(db)
         geometrie = (n, centre, taux)
         if geometrie != self._geometrie:
+            if self._geometrie is not None and self._geometrie[2] != taux:
+                self._buf[:] = -150.0     # autre largeur : l'ancien waterfall ne correspond plus
             self._geometrie = geometrie
             self.x = (centre + (np.arange(n) - n / 2) * taux / n) / 1e6
             x0, larg = (centre - taux / 2) / 1e6, taux / 1e6
@@ -97,7 +99,8 @@ class VueSpectre(pg.GraphicsLayoutWidget):
         # réduction pour le waterfall (max par groupe de colonnes)
         ligne = db
         if n > COLONNES_MAX:
-            ligne = db.reshape(COLONNES_MAX, n // COLONNES_MAX).max(axis=1)
+            k = -(-n // COLONNES_MAX)        # n n'est plus forcément une puissance de 2 avec le zoom
+            ligne = np.pad(db, (0, k * COLONNES_MAX - n), constant_values=-150.0).reshape(COLONNES_MAX, k).max(axis=1)
         if self._buf.shape[1] != len(ligne):
             self._buf = np.full((LIGNES_WATERFALL, len(ligne)), -150.0, dtype=np.float32)
         self._buf[:-1] = self._buf[1:]

@@ -12,7 +12,7 @@ const TAILLE_FFT = 2048;
 
 // ---------------------------------------------------------------- réglages persistants
 const DEFAUT = { centre: 145_300_000, decalage: 200_000, taux: 960000, mode: "NFM", largeurs: {}, gain: null, ppm: 0,
-  agc: true, direct: 0, convertisseur: 0, squelch: -120, volume: 0.5, pas: 12500, moyennage: 0.6, min: -100, max: -20, modules: ["S-mètre"] };
+  agc: true, direct: 0, convertisseur: 0, squelch: -120, volume: 0.5, pas: 12500, moyennage: 0.6, min: -100, max: -20, zoom: 0, modules: ["S-mètre"] };
 const R = Object.assign({}, DEFAUT, JSON.parse(localStorage.getItem("sdr-web") || "{}"));
 const sauver = () => localStorage.setItem("sdr-web", JSON.stringify(R));
 addEventListener("beforeunload", sauver);
@@ -32,14 +32,39 @@ let source = null, chaine = null, fft = null, audio = null, sortie = null, minut
 const etatDC = { dr: 0, di: 0 };
 let moyenne = null, dernierSpectre = null;
 
+// Zoom en fréquence : R.zoom = largeur affichée en Hz (0 = toute la bande). La FFT grandit avec le zoom
+// (jusqu'à 65 536 points) pour garder le détail ; on n'affiche que la fenêtre [vue.a, vue.b] (Hz, par rapport
+// au centre de la clé). La vue reste fixe pendant l'accord et se recentre si le VFO approche de son bord.
+const ZOOMS = [0, 1_000_000, 500_000, 200_000, 100_000, 50_000, 20_000];
+const vue = { a: 0, b: 0, centre: 0 };
+function tailleFFT(bloc) {
+  if (!R.zoom || R.zoom >= R.taux) return TAILLE_FFT;
+  let n = TAILLE_FFT; const voulu = TAILLE_FFT * R.taux / R.zoom;
+  while (n < voulu && n * 2 <= Math.min(65536, bloc)) n *= 2;
+  return n;
+}
+function majVue(recentrer = false) {
+  const large = !R.zoom || R.zoom >= R.taux, l = large ? R.taux : R.zoom, demi = R.taux / 2 - l / 2;
+  const avant = vue.centre;
+  if (large) vue.centre = 0;
+  else if (recentrer || R.decalage < vue.a + 0.1 * l || R.decalage > vue.b - 0.1 * l) vue.centre = Math.max(-demi, Math.min(demi, R.decalage));
+  vue.a = vue.centre - l / 2; vue.b = vue.centre + l / 2;
+  return vue.centre !== avant;
+}
+
 // Confirmation d'ouverture de la clé : au premier bloc d'échantillons reçu, ou erreur au bout de 3 s.
 let attenteEchantillons = null;
 const nomCle = () => { const i = source?.infos?.() || {}; return [i.modele || "clé RTL-SDR", i.tuner && `tuner ${i.tuner}`].filter(Boolean).join(", "); };
 function traiterBloc(octets) {
   if (attenteEchantillons) { clearTimeout(attenteEchantillons); attenteEchantillons = null; statut(`✓ Clé ouverte, réception en cours : ${nomCle()}.`); $("#statut").className = "ok"; }
   const [ir, ii] = octetsVersIQ(octets, etatDC);
-  if (ir.length >= TAILLE_FFT) {
+  const nFFT = tailleFFT(ir.length);
+  if (!fft || fft.n !== nFFT) { fft = new FFT(nFFT); moyenne = null; }
+  if (ir.length >= fft.n) {
     const db = fft.spectre(ir, ii, 0);
+    if (fft.n !== TAILLE_FFT) {          // même plancher de bruit à l'écran quelle que soit la taille de la FFT
+      const k = 10 * Math.log10(fft.n / TAILLE_FFT); for (let i = 0; i < db.length; i++) db[i] += k;
+    }
     if (!moyenne || moyenne.length !== db.length) moyenne = db;
     else { const a = R.moyennage; for (let k = 0; k < db.length; k++) moyenne[k] = a * moyenne[k] + (1 - a) * db[k]; }
     dernierSpectre = moyenne;
@@ -213,7 +238,7 @@ remplir($("#pas"), PAS, p => p >= 1e6 ? `${p / 1e6} MHz` : p >= 1000 ? `${p / 10
 remplir($("#taux"), TAUX, t => `${(t / 1e6).toFixed(3)} MS/s`, R.taux);
 $("#mode").onchange = e => reglerMode(e.target.value);
 $("#pas").onchange = e => { R.pas = Number(e.target.value); };
-$("#taux").onchange = async e => { R.taux = Number(e.target.value); if (source) await demarrer(source instanceof SourceSimulation ? "sim" : "cle", source.usb); };
+$("#taux").onchange = async e => { R.taux = Number(e.target.value); remplirZoom(); if (source) await demarrer(source instanceof SourceSimulation ? "sim" : "cle", source.usb); };
 $("#largeur").value = largeur();
 $("#largeur").onchange = e => { R.largeurs[R.mode] = Number(e.target.value); chaine?.regler(R.mode, largeur()); };
 // Entrée HF : échantillonnage direct (branche Q de la Blog V3) ; décalage d'un convertisseur HF
@@ -239,6 +264,13 @@ $("#squelch").value = R.squelch; $("#squelch").oninput = e => { R.squelch = Numb
 $("#squelch").oninput({ target: $("#squelch") });
 $("#volume").value = R.volume; $("#volume").oninput = e => { R.volume = Number(e.target.value); };
 $("#moyennage").value = R.moyennage; $("#moyennage").oninput = e => { R.moyennage = Number(e.target.value); };
+function remplirZoom() {     // largeurs plus petites que la bande reçue seulement
+  const z = ZOOMS.filter(v => v === 0 || v < R.taux);
+  if (!z.includes(R.zoom)) R.zoom = 0;
+  remplir($("#zoom"), z, v => v === 0 ? "Toute la bande" : v >= 1e6 ? `${v / 1e6} MHz` : `${v / 1e3} kHz`, R.zoom);
+}
+remplirZoom();
+$("#zoom").onchange = e => { R.zoom = Number(e.target.value); majVue(true); effacerChute(); moyenne = null; };
 $("#gain-auto").checked = R.gain === null;
 function majGain() {
   const auto = $("#gain-auto").checked, g = source?.gains?.() || [];
@@ -289,8 +321,9 @@ function erreur(t) { $("#statut").textContent = t; $("#statut").className = "err
 const cs = $("#spectre"), cw = $("#chute"), xs = cs.getContext("2d"), xw = cw.getContext("2d");
 function effacerSpectre() {
   moyenne = dernierSpectre = null;
-  xw.clearRect(0, 0, cw.width, cw.height);
+  effacerChute();
 }
+function effacerChute() { xw.clearRect(0, 0, cw.width, cw.height); }
 
 const separateur = document.createElement("div");
 separateur.tabIndex = 0;
@@ -381,13 +414,16 @@ function dessiner() {
   for (let db = Math.ceil(R.min / 10) * 10; db <= R.max; db += 10) {
     const y = H - (db - R.min) / (R.max - R.min) * H; xs.beginPath(); xs.moveTo(0, y); xs.lineTo(W, y); xs.stroke(); xs.fillText(`${db}`, 4 * r, y - 2 * r);
   }
-  const pasGrad = R.taux > 1.5e6 ? 250e3 : 100e3;
-  for (let f = Math.ceil((R.centre - R.taux / 2) / pasGrad) * pasGrad; f < R.centre + R.taux / 2; f += pasGrad) {
-    const x = ((f - R.centre) / R.taux + 0.5) * W; xs.beginPath(); xs.moveTo(x, 0); xs.lineTo(x, H); xs.stroke();
-    xs.fillText((f / 1e6).toFixed(f % 1e6 ? (f % 1e5 ? 3 : 1) : 0), x + 3 * r, H - 4 * r);
+  if (majVue()) effacerChute();
+  const l = vue.b - vue.a, xDe = f => (f - vue.a) / l * W;        // f : Hz par rapport au centre de la clé
+  const pasGrad = [1e3, 2e3, 5e3, 10e3, 20e3, 25e3, 50e3, 100e3, 250e3, 500e3].find(p => l / p <= 10) || 1e6;
+  for (let f = Math.ceil((R.centre + vue.a) / pasGrad) * pasGrad; f < R.centre + vue.b; f += pasGrad) {
+    const x = xDe(f - R.centre); xs.beginPath(); xs.moveTo(x, 0); xs.lineTo(x, H); xs.stroke();
+    const dec = f % 1e6 === 0 ? 0 : f % 1e5 === 0 ? 1 : f % 1e4 === 0 ? 2 : f % 1e3 === 0 ? 3 : 4;
+    xs.fillText((f / 1e6).toFixed(dec), x + 3 * r, H - 4 * r);
   }
   // bande du canal et VFO
-  const xv = (R.decalage / R.taux + 0.5) * W, lb = largeur() / R.taux * W;
+  const xv = xDe(R.decalage), lb = largeur() / l * W;
   const [b0, b1] = R.mode === "USB" ? [0, lb] : R.mode === "LSB" ? [-lb, 0] : [-lb / 2, lb / 2];
   xs.fillStyle = "rgba(255,255,255,.08)"; xs.fillRect(xv + b0, 0, Math.max(1, b1 - b0), H);
   xs.strokeStyle = "#ff5252"; xs.beginPath(); xs.moveTo(xv, 0); xs.lineTo(xv, H); xs.stroke();
@@ -395,9 +431,9 @@ function dessiner() {
   const s = dernierSpectre, n = s.length;
   // courbe (max par colonne de pixels)
   xs.strokeStyle = "#4fc3f7"; xs.lineWidth = 1.2 * r; xs.beginPath();
-  const ligne = new Float32Array(W);
+  const ligne = new Float32Array(W), caseDe = f => Math.floor((f / R.taux + 0.5) * n);
   for (let x = 0; x < W; x++) {
-    const a = Math.floor(x * n / W), b = Math.max(a + 1, Math.floor((x + 1) * n / W)); let m = -200;
+    const a = Math.max(0, caseDe(vue.a + x / W * l)), b = Math.min(n, Math.max(a + 1, caseDe(vue.a + (x + 1) / W * l))); let m = -200;
     for (let k = a; k < b; k++) if (s[k] > m) m = s[k];
     ligne[x] = m;
     const y = H - (m - R.min) / (R.max - R.min) * H;
@@ -419,7 +455,7 @@ for (const c of [cs, cw]) {
   c.addEventListener("click", e => {
     const rect = c.getBoundingClientRect();
     const position = (e.clientX - rect.left) / rect.width;
-    reglerFrequence(R.centre + (position - 0.5) * R.taux, false);
+    reglerFrequence(R.centre + vue.a + position * (vue.b - vue.a), false);
   });
   c.addEventListener("wheel", e => { e.preventDefault(); pas(e.deltaY < 0 ? 1 : -1); }, { passive: false });
 }
@@ -441,7 +477,7 @@ const contexte = module => ({
   },
   async reglerTaux(t) {
     if (!TAUX.includes(t) || t === R.taux) return;
-    R.taux = t; $("#taux").value = t;
+    R.taux = t; $("#taux").value = t; remplirZoom();
     if (source) await demarrer(source instanceof SourceSimulation ? "sim" : "cle", source.usb);
   },
   lire(cle, defaut) { try { return JSON.parse(localStorage.getItem(`sdr-web/${module.nom}/${cle}`)) ?? defaut; } catch { return defaut; } },

@@ -36,6 +36,7 @@ class PanneauReglages(QWidget):
     volume_change = Signal(float)
     fft_change = Signal(int)
     moyennage_change = Signal(float)
+    zoom_change = Signal(float)
     niveaux_change = Signal(float, float)
     auto_echelle = Signal()
 
@@ -156,6 +157,12 @@ class PanneauReglages(QWidget):
         self.fft.currentIndexChanged.connect(lambda _: self.fft_change.emit(self.fft.currentData()))
         f.addRow("Taille FFT", self.fft)
 
+        self.zoom = QComboBox()
+        self.zoom.setToolTip("Largeur de fréquence affichée par le spectre et le waterfall, autour du VFO")
+        self._zooms_pour(r.taux, r.zoom)
+        self.zoom.currentIndexChanged.connect(lambda _: self.zoom_change.emit(float(self.zoom.currentData() or 0)))
+        f.addRow("Largeur", self.zoom)
+
         self.moyennage = _curseur(0, 95, int(r.moyennage * 100))
         self.moyennage.valueChanged.connect(lambda v: self.moyennage_change.emit(v / 100))
         f.addRow("Moyenne", self.moyennage)
@@ -264,3 +271,18 @@ class PanneauReglages(QWidget):
         s = self.squelch.value()
         self.squelch_lbl.setText("ouvert" if s <= -120 else f"{s} dBFS")
         self.n_lbl.setText(f"{self.n_min.value()} … {self.n_max.value()} dBFS")
+
+    ZOOMS = (0.0, 1_000_000.0, 500_000.0, 200_000.0, 100_000.0, 50_000.0, 20_000.0)
+
+    def _zooms_pour(self, taux: float, actuel: float) -> None:
+        """Largeurs proposées : plus petites que la bande reçue."""
+        self.zoom.blockSignals(True)
+        self.zoom.clear()
+        for z in self.ZOOMS:
+            if z == 0 or z < taux:
+                self.zoom.addItem("Toute la bande" if z == 0 else (f"{z / 1e6:g} MHz" if z >= 1e6 else f"{z / 1e3:g} kHz"), z)
+        i = self.zoom.findData(actuel)
+        self.zoom.setCurrentIndex(max(0, i))
+        self.zoom.blockSignals(False)
+        if i < 0 and actuel:
+            self.zoom_change.emit(0.0)

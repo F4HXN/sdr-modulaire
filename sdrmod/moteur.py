@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 
 class Moteur(QObject):
-    spectre_pret = Signal(object)   # (dbfs: np.ndarray, centre: float, taux: int)
+    spectre_pret = Signal(object)   # (dbfs: np.ndarray, centre: float, largeur: float) de la portion affichée
     niveau = Signal(float)
     erreur = Signal(str)
     en_marche = Signal(bool)
@@ -48,6 +48,8 @@ class Moteur(QObject):
         self.agc_actif = True
         self.taille_fft = 4096
         self.moyennage = 0.5
+        self.zoom = 0.0                 # Hz affichés (0 = toute la bande)
+        self._vue_centre = 0.0          # centre de la portion affichée, par rapport au centre de la clé
         self._mode_demande: tuple[str, float] | None = None
         self._largeur_demandee: float | None = None
 
@@ -226,8 +228,26 @@ class Moteur(QObject):
             self.sortie.ecrire(audio * self.volume)
         return audio
 
+    def _vue(self) -> tuple[float, float] | None:
+        """Portion affichée (Hz par rapport au centre de la clé) quand on zoome, sinon None.
+        Elle reste fixe pendant l'accord et se recentre si le VFO approche de son bord."""
+        l = self.zoom
+        if not l or l >= self.taux:
+            self._vue_centre = 0.0
+            return None
+        demi = self.taux / 2 - l / 2
+        a = self._vue_centre - l / 2
+        if not (a + 0.1 * l <= self.decalage <= a + 0.9 * l) or abs(self._vue_centre) > demi:
+            self._vue_centre = float(min(max(self.decalage, -demi), demi))
+        return self._vue_centre - l / 2, self._vue_centre + l / 2
+
     def _spectre(self, x: np.ndarray) -> None:
+        vue = self._vue()
         n = self.taille_fft
+        if vue:          # zoom : FFT plus longue pour garder le détail (dans la limite d'un bloc)
+            voulu = self.taille_fft * self.taux / self.zoom
+            while n < voulu and n * 2 <= min(262_144, len(x)):
+                n *= 2
         if self._fenetre is None or len(self._fenetre) != n:
             self._fenetre = signal.windows.blackmanharris(n).astype(np.float32)
             self._norme = float(self._fenetre.sum()) ** 2
@@ -238,9 +258,19 @@ class Moteur(QObject):
         segs = x[: nseg * n].reshape(nseg, n) * self._fenetre
         p = (np.abs(np.fft.fft(segs, axis=1)) ** 2).mean(axis=0) / self._norme
         db = 10.0 * np.log10(np.fft.fftshift(p) + 1e-20)
-        if self._moy_spectre is None:
+        if n != self.taille_fft:        # même plancher de bruit à l'écran quelle que soit la taille de la FFT
+            db += 10.0 * np.log10(n / self.taille_fft)
+        if self._moy_spectre is None or len(self._moy_spectre) != n:
             self._moy_spectre = db
         else:
             a = self.moyennage
             self._moy_spectre = a * self._moy_spectre + (1 - a) * db
-        self.spectre_pret.emit((self._moy_spectre.astype(np.float32), self.centre, self.taux))
+        if vue is None:
+            self.spectre_pret.emit((self._moy_spectre.astype(np.float32), self.centre, float(self.taux)))
+            return
+        a, b = vue
+        k0 = max(0, int(round(n / 2 + a * n / self.taux)))
+        k1 = min(n, k0 + int(round((b - a) * n / self.taux)))
+        largeur = (k1 - k0) * self.taux / n
+        self.spectre_pret.emit((self._moy_spectre[k0:k1].astype(np.float32),
+                                self.centre + (k0 - n / 2) * self.taux / n + largeur / 2, largeur))

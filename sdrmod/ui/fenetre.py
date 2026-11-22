@@ -63,7 +63,7 @@ class FenetrePrincipale(QMainWindow):
         m.centre, m.taux, m.decalage = r.centre, r.taux, r.decalage
         m.convertisseur = r.convertisseur
         m.volume, m.squelch, m.agc_actif = r.volume, r.squelch, r.agc
-        m.taille_fft, m.moyennage = r.taille_fft, r.moyennage
+        m.taille_fft, m.moyennage, m.zoom = r.taille_fft, r.moyennage, r.zoom
 
         self._construire_interface()
         self._connecter()
@@ -182,6 +182,7 @@ class FenetrePrincipale(QMainWindow):
         p.volume_change.connect(lambda v: self._param("volume", "volume", v))
         p.fft_change.connect(lambda v: self._param("taille_fft", "taille_fft", v))
         p.moyennage_change.connect(lambda v: self._param("moyennage", "moyennage", v))
+        p.zoom_change.connect(lambda v: self._param("zoom", "zoom", v))
         p.niveaux_change.connect(self._changer_niveaux)
         p.auto_echelle.connect(self._echelle_auto)
 
@@ -302,6 +303,7 @@ class FenetrePrincipale(QMainWindow):
         if etait:
             self.moteur.arreter()
         self.reglages.taux = self.moteur.taux = t
+        self.panneau._zooms_pour(t, self.reglages.zoom)     # largeurs plus petites que la nouvelle bande
         self.regler_frequence(self.reglages.frequence)
         if etait:
             self.demarrer()
