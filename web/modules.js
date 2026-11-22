@@ -20,6 +20,7 @@ import { CarteRadar, couleurAltitude, couleurSymbole } from "./carte-adsb.js?v=2
 import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
 import { TAUX_CW, DUREE_FENETRE, DUREE_PAS } from "./cw.js?v=20261122-cw";
 import { DemodAFSK, trameVersTexte, positionAPRS } from "./aprs.js?v=20261122-carteaprs";
+import { DecodeurDMR as MoteurDMR, TAUX_DMR, FID as FID_DMR, SAP as SAP_DMR, nomSlot, texteAppel } from "./dmr.js?v=20261122-dmr";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
 
@@ -1486,4 +1487,130 @@ class DecodeurFT {
   }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS, DecodeurFT];
+
+class DecodeurDMR {
+  static nom = "Décodeur DMR";
+  static description = "Appels DMR (relais et direct) : slot, color code, groupe ou appel privé, ID et alias de l'émetteur, SMS. La voix n'est pas décodée.";
+
+  demarrer() {
+    this.cle = ""; this.derniersIQ = -Infinity; this.couvert = false;
+    this.enCours = new Map();          // slot → { ...appel, heure, li }
+    this.moteur = null; this.bruit = null; this.crete = null;
+    this.ctx.abonner("iq", (re, im, centre, taux) => this.recevoir(re, im, centre, taux));
+  }
+
+  recevoir(re, im, centre, taux) {
+    this.derniersIQ = performance.now();
+    const f = this.ctx.frequence();
+    this.couvert = Math.abs(f - centre) + 8_000 < 0.42 * taux;
+    if (!this.couvert) return;
+    const cle = `${centre}/${taux}`;
+    if (cle !== this.cle) {                  // nouvelle bande : chaîne neuve (changer de fréquence garde le décodeur)
+      this.cle = cle;
+      const d1 = Math.round(taux / 240_000), fs1 = taux / d1, d2 = Math.round(fs1 / TAUX_DMR);
+      this.nco = new NCO(taux);
+      this.etage1 = new FirComplexe(passeBas(taux, 30_000, d1 * 4 + 1), d1);
+      this.etage2 = new FirComplexe(passeBas(fs1, 7_000, d2 * 12 + 1), d2);
+      this.pr = 1; this.pi = 0;
+      this.moteur = new MoteurDMR();
+    }
+    this.nco.freq = f - centre;
+    const [cr, ci] = this.etage2.traiter(...this.etage1.traiter(...this.nco.melanger(re, im)));
+    if (!cr.length) return;
+    let p = 0;
+    for (let k = 0; k < cr.length; k++) p += cr[k] * cr[k] + ci[k] * ci[k];
+    p = 10 * Math.log10(p / cr.length + 1e-20);
+    this.bruit = this.bruit === null ? p : Math.min(p, this.bruit + 0.02);
+    this.crete = this.crete === null ? p : Math.max(p, this.crete - 0.5);
+    const fm = new Float32Array(cr.length), k2 = TAUX_DMR / (2 * Math.PI);
+    let pr = this.pr, pi = this.pi;
+    for (let k = 0; k < cr.length; k++) { const a = cr[k], b = ci[k]; fm[k] = Math.atan2(b * pr - a * pi, a * pr + b * pi) * k2; pr = a; pi = b; }
+    this.pr = pr; this.pi = pi;
+    for (const ev of this.moteur.traiter(fm)) this.evenement(ev);
+  }
+
+  ligne(texte) {
+    const li = el("li", { textContent: texte });
+    this.liste.prepend(li);
+    while (this.liste.childElementCount > 300) this.liste.lastElementChild.remove();
+    return li;
+  }
+
+  texteLigne(a, fin) {
+    const cc = a.cc !== null && a.cc !== undefined ? ` · CC ${a.cc}` : "";
+    return `${a.heure}  ${nomSlot(a.slot)}${cc}  ${texteAppel(a)}${fin}`;
+  }
+
+  evenement(ev) {
+    if (!this.liste) return;
+    const h = new Date().toTimeString().slice(0, 8), s = ev.slot;
+    if (ev.type === "appel") {
+      const a = { ...ev, heure: h };
+      a.li = this.ligne(this.texteLigne(a, "  …"));
+      this.enCours.set(s, a);
+    } else if (ev.type === "alias" && this.enCours.has(s)) {
+      const a = this.enCours.get(s); a.alias = ev.texte; a.li.textContent = this.texteLigne(a, "  …");
+    } else if (ev.type === "fin" && this.enCours.has(s)) {
+      const a = this.enCours.get(s); a.alias = ev.alias || a.alias;
+      a.li.textContent = this.texteLigne(a, `  ${ev.duree.toFixed(1).replace(".", ",")} s`);
+      this.enCours.delete(s);
+    } else if (ev.type === "sms") {
+      this.ligne(`${h}  ${nomSlot(s)}  ${ev.src} → ${ev.groupe ? "TG" : "privé"} ${ev.dst} · ${ev.texte}${ev.crc ? "" : "  (CRC faux)"}`);
+    } else if (ev.type === "donnees" && (ev.blocs === 0 || this.voirCsbk.checked)) {
+      this.ligne(`${h}  ${nomSlot(s)}  données ${SAP_DMR[ev.sap] ?? `SAP ${ev.sap}`} ${ev.src} → ${ev.groupe ? "groupe" : "privé"} ${ev.dst}`);
+    } else if (ev.type === "csbk" && this.voirCsbk.checked) {
+      this.ligne(ev.opcode === 0x3D ? `${h}  ${nomSlot(s)}  préambule ${ev.src} → ${ev.groupe ? "TG" : "privé"} ${ev.dst}`
+        : `${h}  ${nomSlot(s)}  CSBK ${ev.opcode.toString(16).toUpperCase().padStart(2, "0")} ${FID_DMR[ev.fid] ?? ""}`.trimEnd());
+    }
+  }
+
+  creerPanneau() {
+    this.statut = el("div", { className: "petit" });
+    this.ts = [1, 2].map(() => el("div", { className: "petit dmr-slot" }));
+    this.diag = el("div", { className: "petit", title: "Crête du canal au-dessus du bruit, salves DMR reconnues, color code, type d'émetteur (relais, mobile, direct)" });
+    this.diag.style.color = "var(--doux)";
+    this.liste = el("ul", { className: "journal aprs-liste" });
+    const effacer = el("button", { type: "button", textContent: "Effacer" });
+    effacer.onclick = () => { this.liste.replaceChildren(); this.enCours.clear(); };
+    const texte = () => [...this.liste.children].reverse().map(li => li.textContent).join("\n");
+    const copier = el("button", { type: "button", textContent: "Copier" });
+    copier.onclick = () => navigator.clipboard?.writeText(texte()).then(() => {
+      copier.textContent = "Copié"; setTimeout(() => { copier.textContent = "Copier"; }, 1200);
+    }).catch(() => {});
+    const enregistrer = el("button", { type: "button", textContent: "Enregistrer", title: "Télécharge les appels et messages dans un fichier texte" });
+    enregistrer.onclick = () => {
+      const d = new Date(), h = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "_");
+      const a = el("a", { href: URL.createObjectURL(new Blob([texte() + "\n"], { type: "text/plain" })), download: `dmr_${h}.txt` });
+      a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    };
+    this.voirCsbk = el("input", { type: "checkbox", checked: this.ctx.lire("csbk", false) });
+    this.voirCsbk.onchange = () => this.ctx.ecrire("csbk", this.voirCsbk.checked);
+    const csbk = el("label", { className: "sstv-auto", title: "Affiche aussi les blocs de signalisation (CSBK) : nombreux sur certains relais" }, this.voirCsbk, "CSBK");
+    const actions = el("div", { className: "scanner-choix cw-actions" }, effacer, copier, enregistrer, csbk);
+    const contenu = el("div", { className: "cw-contenu aprs-contenu" }, this.statut, ...this.ts, this.diag, this.liste, actions);
+    const { panneau, dialogue } = panneauAgrandissable(this.ctx, { titre: DecodeurDMR.nom, id: "dmr-titre", contenu, actions,
+      tailleDefaut: 1.1, attenteTexte: "Appels affichés dans la fenêtre agrandie." });
+    this.dialogue = dialogue;
+    this.minuterie = setInterval(() => this.rafraichir(), 250);
+    this.rafraichir();
+    return panneau;
+  }
+
+  rafraichir() {
+    const m = this.moteur;
+    const texte = performance.now() - this.derniersIQ > 1500 ? "En attente des échantillons de la clé."
+      : !this.couvert ? "Le VFO est trop près du bord de la bande reçue."
+      : !m?.salves ? "Accordez le VFO sur une fréquence DMR (relais ou direct). Le mode n'a pas d'importance : le module démodule lui-même."
+      : this.enCours.size ? "Signal DMR reçu." : "Signal DMR reçu, pas d'appel en cours.";
+    if (this.statut.textContent !== texte) this.statut.textContent = texte;
+    this.ts.forEach((l, i) => { const a = this.enCours.get(i + 1), t = `${nomSlot(i + 1)} : ${a ? texteAppel(a) : "—"}`; if (l.textContent !== t) l.textContent = t; });
+    if (this.crete !== null && m) {
+      const d = `crête ${Math.round(this.crete - this.bruit)} dB · ${m.salves} salves${m.cc !== null ? ` · CC ${m.cc}` : ""}${m.source ? ` · ${m.source}` : ""}`;
+      if (this.diag.textContent !== d) this.diag.textContent = d;
+    }
+  }
+
+  arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR];

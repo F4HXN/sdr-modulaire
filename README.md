@@ -90,7 +90,7 @@ modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite
 modules-a-telecharger/  adsb.py, scanner_memoires.py, scanner_frequences.py,
                         pilotage_rigctl.py, sstv.py, decodeur_cw.py, decodeur_aprs.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
 outils/decodeur_cw/     entraînement du réseau du Décodeur CW (PyTorch, non nécessaire à l'exécution)
-tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py
+tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py, test_decodeur_dmr.py
 ```
 
 ## Trois niveaux d'extension
@@ -146,6 +146,7 @@ QT_QPA_PLATFORM=offscreen python3 -m tests.test_catalogue             # signatur
 python3 -m tests.test_sstv                                            # décodeur SSTV sur signaux synthétiques
 python3 -m tests.test_decodeur_cw                                     # Décodeur CW de bout en bout (IQ → mode CW → texte)
 python3 -m tests.test_decodeur_aprs                                   # Décodeur APRS sur trames AFSK synthétiques
+QT_QPA_PLATFORM=offscreen python3 -m tests.test_decodeur_dmr dmr.wav  # Décodeur DMR sur un flux de relais synthétique
 ```
 
 ## Modules disponibles
@@ -179,15 +180,21 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
   de WSJT-X (`sudo apt install wsjtx`). Horloge synchronisée (NTP) requise. Liste « Bande » : 160 m à 70 cm,
   fréquences d'appel de WSJT-X, accord en USB d'un clic (clé qui reçoit la HF ou convertisseur).
   Aussi dans SDR Web (`web/ft8-worker.js`, moteur ft8_lib compilé en WebAssembly dans `web/ft8-lib/`).
+- **Décodeur DMR** (données, sans logiciel externe) : sur la fréquence du VFO, quel que soit le mode, il affiche
+  les appels des relais et du direct : slot (TS1, TS2), color code, groupe (TG) ou appel privé, ID et alias
+  de l'émetteur, chiffrement, urgence, durée ; les SMS (paquets IP, Motorola TMS, blocs 1/2 et 3/4) ; les CSBK
+  sur demande. L'appel est trouvé même sans son en-tête (LC intégré des salves vocales). La voix (AMBE+2) n'est
+  pas décodée. Codes de la norme ETSI TS 102 361-1 vérifiés avec dsd-fme sur le flux de `tests/test_decodeur_dmr.py`.
+  Aussi dans SDR Web (`web/dmr.js`, même algorithme, mêmes résultats).
 
 ## Pistes
 
 Déjà réalisées : stéréo + RDS en WFM, scanner de mémoires, scanner de fréquences, ADS-B,
 capteurs 433 MHz, pilotage rigctl (Gpredict), décodeur SSTV, décodeur CW, décodeur APRS, décodeur FT8/FT4,
-convertisseur HF,
+décodeur DMR (données), convertisseur HF,
 version navigateur (SDR Web).
 
-Restent : envoi des trames APRS vers aprs.jerko.fr / APRS-IS,
+Restent : voix DMR (dsd-fme dans l'appli), envoi des trames APRS vers aprs.jerko.fr / APRS-IS,
 WSPR via `jt9`, enregistreur IQ, sortie MQTT vers InfluxDB/Grafana, serveur web pour
 l'écoute à distance.
 
