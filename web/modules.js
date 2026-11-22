@@ -16,10 +16,10 @@ import { FirComplexe, NCO, passeBas, LARGEURS, FFT } from "./dsp.js?v=20261122-c
 import { StereoRds } from "./fm-stereo.js?v=20261122-cw";
 import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
 import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261122-niveau";
-import { CarteRadar, couleurAltitude } from "./carte-adsb.js?v=20261122-niveau";
+import { CarteRadar, couleurAltitude, couleurSymbole } from "./carte-adsb.js?v=20261122-carteaprs";
 import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
 import { TAUX_CW, DUREE_FENETRE, DUREE_PAS } from "./cw.js?v=20261122-cw";
-import { DemodAFSK, trameVersTexte } from "./aprs.js?v=20261122-aprs";
+import { DemodAFSK, trameVersTexte, positionAPRS } from "./aprs.js?v=20261122-carteaprs";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
 
@@ -1151,6 +1151,10 @@ class DecodeurAPRS {
   demarrer() {
     this.frequence = this.ctx.lire("frequence", FREQUENCES_APRS[0][0]);
     this.recues = []; this.nombre = 0; this.cle = ""; this.derniersIQ = -Infinity; this.couvert = false; this.saturation = 0;
+    this.stations = new Map();         // indicatif (ou nom d'objet) → { id, lat, lon, symbole, commentaire, vu, nb, trace }
+    // Station d'écoute : la sienne, ou à défaut celle déjà enregistrée dans le module ADS-B.
+    let adsb = null; try { adsb = JSON.parse(localStorage.getItem("sdr-web/ADS-B (avions)/station")); } catch { /* rien */ }
+    this.station = this.ctx.lire("station", adsb);
     this.ctx.abonner("iq", (re, im, centre, taux) => this.recevoir(re, im, centre, taux));
   }
 
@@ -1180,7 +1184,20 @@ class DecodeurAPRS {
     for (let k = 0; k < cr.length; k++) { const a = cr[k], b = ci[k]; fm[k] = Math.atan2(b * pr - a * pi, a * pr + b * pi); pr = a; pi = b; }
     this.pr = pr; this.pi = pi;
     const [audio] = this.versAudio.traiter(fm, new Float32Array(fm.length));
-    for (const o of this.demod.traiter(audio)) { const t = trameVersTexte(o); if (t) this.recues.push(t); }
+    for (const o of this.demod.traiter(audio)) { const t = trameVersTexte(o); if (t) { this.recues.push(t); this.placer(t); } }
+  }
+
+  /** Met à jour la station (ou l'objet) si la trame contient une position. */
+  placer(texte) {
+    const p = positionAPRS(texte); if (!p) return;
+    const maintenant = Date.now();
+    let s = this.stations.get(p.id);
+    if (!s) { s = { id: p.id, nb: 0, trace: [] }; this.stations.set(p.id, s); }
+    Object.assign(s, { lat: p.lat, lon: p.lon, symbole: p.symbole, commentaire: p.commentaire || s.commentaire || "", vu: maintenant });
+    s.nb++;
+    const der = s.trace[s.trace.length - 1];
+    if (!der || der[0] !== p.lat || der[1] !== p.lon) { s.trace.push([p.lat, p.lon, maintenant]); if (s.trace.length > 200) s.trace.shift(); }
+    this.carteAJour = true;
   }
 
   creerPanneau() {
@@ -1204,18 +1221,92 @@ class DecodeurAPRS {
       const a = el("a", { href: URL.createObjectURL(new Blob([texte() + "\n"], { type: "text/plain" })), download: `aprs_${h}.txt` });
       a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
     };
-    const actions = el("div", { className: "scanner-choix cw-actions" }, effacer, copier, enregistrer);
+    const ouvrirCarte = el("button", { type: "button", textContent: "Carte", title: "Stations APRS reçues sur une carte, comme les avions de l'ADS-B" });
+    ouvrirCarte.setAttribute("aria-haspopup", "dialog");
+    ouvrirCarte.onclick = () => this.ouvrirCarte();
+    this.creerCarte();
+    const actions = el("div", { className: "scanner-choix cw-actions" }, effacer, copier, enregistrer, ouvrirCarte);
     const contenu = el("div", { className: "cw-contenu aprs-contenu" },
       el("div", { className: "scanner-choix" }, choix, accorder), this.statut, this.liste, actions);
     const { panneau, dialogue } = panneauAgrandissable(this.ctx, { titre: "Décodeur APRS", id: "aprs-titre", contenu, actions,
       tailleDefaut: 1.1, attenteTexte: "Trames affichées dans la fenêtre agrandie." });
     this.dialogue = dialogue;
+    panneau.append(this.fenCarte);
     this.minuterie = setInterval(() => this.rafraichir(), 250);
     this.rafraichir();
     return panneau;
   }
 
+  /** Fenêtre de la carte : même présentation que celle de l'ADS-B (carte, tableau, station). */
+  creerCarte() {
+    const titre = el("h2", { id: "aprs-carte-titre", textContent: "APRS · stations reçues" });
+    titre.title = "Tirer la barre pour déplacer · coin en bas à droite pour agrandir";
+    this.resume = el("span", { className: "adsb-resume" });
+    const fermer = el("button", { type: "button", textContent: "Fermer" });
+    const recentrer = el("button", { type: "button", textContent: "Recentrer" });
+    const toile = el("canvas", { className: "adsb-carte" });
+    toile.setAttribute("aria-label", "Carte des stations APRS reçues");
+    this.tableau = el("tbody");
+    const table = el("table", { className: "adsb-table" },
+      el("thead", {}, el("tr", {}, ...["Station", "Vue", "Dist.", "Trames", "Commentaire"].map(t => el("th", { textContent: t })))), this.tableau);
+    const st = this.station;
+    const lat = el("input", { type: "number", step: "0.0001", min: -90, max: 90, placeholder: "48.8566", value: st?.lat ?? "" });
+    const lon = el("input", { type: "number", step: "0.0001", min: -180, max: 180, placeholder: "2.3522", value: st?.lon ?? "" });
+    const placer = el("button", { type: "button", textContent: "Enregistrer la station" });
+    placer.onclick = () => {
+      const la = parseFloat(lat.value), lo = parseFloat(lon.value);
+      this.station = Number.isFinite(la) && Number.isFinite(lo) ? { lat: la, lon: lo } : null;
+      this.ctx.ecrire("station", this.station); this.carte.station = this.station; this.carte.centrer(); this.majTableau();
+    };
+    const pied = el("div", { className: "adsb-pied" },
+      el("label", {}, "Station : lat. ", lat), el("label", {}, " lon. ", lon), placer,
+      el("span", { className: "petit", textContent: "Facultatif : sert aux distances et aux cercles (reprise du module ADS-B si déjà saisie)." }));
+    const entete = el("header", {}, titre, this.resume, el("span", { className: "adsb-boutons" }, recentrer, fermer));
+    this.fenCarte = el("dialog", { className: "adsb-dialogue" }, entete,
+      el("div", { className: "adsb-corps" }, toile, el("div", { className: "adsb-cote" }, table)), pied);
+    this.fenCarte.setAttribute("aria-labelledby", titre.id);
+    this.afficherCarte = fenetreFlottante(this.fenCarte, entete, this.ctx, "carte");
+    this.carte = new CarteRadar(toile, { surChoix: id => { this.choisi = id; this.majTableau(); } });
+    this.carte.station = this.station;
+    fermer.onclick = () => this.fenCarte.close();
+    recentrer.onclick = () => this.carte.centrer();
+  }
+
+  ouvrirCarte() {
+    if (this.fenCarte.open) return;
+    this.afficherCarte(); this.carte.points = [...this.stations.values()]; this.carte.centrer(); this.majTableau();
+  }
+
+  trierStations() {
+    const st = this.station, cle = s => st ? distanceKm(st.lat, st.lon, s.lat, s.lon) : -s.vu;
+    return [...this.stations.values()].sort((a, b) => cle(a) - cle(b));
+  }
+
+  majTableau() {
+    const st = this.station;
+    this.tableau.replaceChildren(...this.trierStations().map(s => {
+      const tr = el("tr", { className: s.id === this.choisi ? "choisi" : "" },
+        el("td", {}, el("i", { className: "adsb-pastille" }), s.id),
+        el("td", { textContent: new Date(s.vu).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) }),
+        el("td", { textContent: st ? `${Math.round(distanceKm(st.lat, st.lon, s.lat, s.lon))} km` : "" }),
+        el("td", { textContent: s.nb }),
+        el("td", { textContent: s.commentaire.slice(0, 40), title: s.commentaire }));
+      tr.firstChild.firstChild.style.background = couleurSymbole(s.symbole);
+      tr.onclick = () => {
+        this.choisi = this.carte.selection = s.id;
+        this.carte.lat0 = s.lat; this.carte.lon0 = s.lon; this.carte.dessiner(); this.majTableau();
+      };
+      return tr;
+    }));
+  }
+
   rafraichir() {
+    if (this.fenCarte?.open) {
+      const avecPos = this.stations.size;
+      this.resume.textContent = `${avecPos} station(s) placée(s) · ${this.nombre} trame(s)`;
+      this.carte.points = [...this.stations.values()]; this.carte.dessiner();
+      if (this.carteAJour) { this.carteAJour = false; this.majTableau(); }
+    }
     for (const t of this.recues.splice(0)) {
       this.nombre++;
       this.liste.prepend(el("li", { textContent: `${new Date().toLocaleTimeString("fr-FR")}  ${t}` }));
@@ -1229,7 +1320,7 @@ class DecodeurAPRS {
       : `Écoute de ${nom} · ${this.nombre} trame(s)` + (sat ? ` · SATURATION ${(100 * this.saturation).toFixed(1)} % : baissez le gain RF ou éloignez l'émetteur` : "");
   }
 
-  arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); }
+  arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); if (this.fenCarte?.open) this.fenCarte.close(); }
 }
 
 export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS];

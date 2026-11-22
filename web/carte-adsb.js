@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Carte radar autonome pour le module ADS-B : côtes, frontières, cercles de distance,
-// avions orientés selon leur cap avec leur trace. Molette : zoom ; glisser : déplacer ;
-// clic : choisir un avion ; double-clic : recentrer.
+// avions orientés selon leur cap avec leur trace, et points (stations APRS : rond coloré selon
+// le symbole, indicatif, ancienneté, trace). Molette : zoom ; glisser : déplacer ;
+// clic : choisir un avion ou un point ; double-clic : recentrer.
 
 import { distanceKm } from "./adsb.js?v=20261122-niveau";
 
@@ -29,12 +30,23 @@ export function couleurAltitude(alt) {
   return `hsl(${(teinte + 360) % 360} 95% 62%)`;
 }
 
+/** Couleur d'un symbole APRS (table + code) : véhicules, météo, relais, domicile, autres. */
+export function couleurSymbole(s = "") {
+  const c = s[1] || "";
+  if ("_W".includes(c) && s[0] === "/") return "#4fc3f7";                       // météo
+  if (c === "#" || c === "&") return "#d98cff";                                 // relais numérique, passerelle
+  if ("-yI".includes(c)) return "#ffd166";                                      // domicile, station fixe
+  if ("<>OPRUXabfjkuvs'=".includes(c)) return "#39ff9f";                        // véhicules, piétons, bateaux, avions
+  return "#7fd4ff";
+}
+const anciennete = t => { const s = (Date.now() - t) / 1000; return s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${Math.round(s / 3600)} h`; };
+
 export class CarteRadar {
   constructor(canvas, { surChoix } = {}) {
     this.c = canvas; this.ctx = canvas.getContext("2d");
     this.lat0 = 46.6; this.lon0 = 2.4; this.kmPx = 2.5;   // km par pixel
     this.selection = null; this.surChoix = surChoix;
-    this.avions = []; this.station = null;
+    this.avions = []; this.points = []; this.station = null;
     chargerFond().then(() => this.dessiner());
     let glisse = null;
     canvas.addEventListener("wheel", e => {
@@ -72,7 +84,7 @@ export class CarteRadar {
 
   /** Cadre la vue sur la station, ou à défaut sur les avions connus. */
   centrer() {
-    const pos = this.avions.filter(a => a.lat !== undefined);
+    const pos = [...this.avions, ...this.points].filter(a => a.lat !== undefined);
     if (this.station) { this.lat0 = this.station.lat; this.lon0 = this.station.lon; }
     else if (pos.length) { this.lat0 = pos.reduce((s, a) => s + a.lat, 0) / pos.length; this.lon0 = pos.reduce((s, a) => s + a.lon, 0) / pos.length; }
     let rayon = 250;
@@ -87,6 +99,10 @@ export class CarteRadar {
       if (a.lat === undefined) continue;
       const [ax, ay] = this.versEcran(a.lat, a.lon), e = Math.hypot(ax - x, ay - y);
       if (e < d) { d = e; meilleur = a.icao; }
+    }
+    for (const p of this.points) {
+      const [px, py] = this.versEcran(p.lat, p.lon), e = Math.hypot(px - x, py - y);
+      if (e < d) { d = e; meilleur = p.id; }
     }
     this.selection = meilleur; this.surChoix?.(meilleur); this.dessiner();
   }
@@ -150,6 +166,24 @@ export class CarteRadar {
       g.fillStyle = "#e6f1ff"; g.font = "600 11px ui-monospace, monospace"; g.fillText(a.indicatif || a.icao, x + 12, y - 2);
       g.fillStyle = coul; g.font = "11px ui-monospace, monospace";
       g.fillText(a.altitude !== undefined ? `FL${String(Math.round(a.altitude / 100)).padStart(3, "0")}` : "—", x + 12, y + 11);
+      g.globalAlpha = 1;
+    }
+
+    // Points (stations APRS) : trace, rond coloré, indicatif et ancienneté ; pâlis après 30 min.
+    for (const p of this.points) {
+      const [x, y] = this.versEcran(p.lat, p.lon), coul = couleurSymbole(p.symbole), choisi = p.id === this.selection;
+      const vieux = Date.now() - p.vu > 30 * 60000;
+      if (p.trace?.length > 1) {
+        g.strokeStyle = coul; g.globalAlpha = choisi ? 0.9 : 0.45; g.lineWidth = choisi ? 2 : 1.2; g.beginPath();
+        p.trace.forEach(([lat, lon], i) => { const [tx, ty] = this.versEcran(lat, lon); i ? g.lineTo(tx, ty) : g.moveTo(tx, ty); });
+        g.stroke(); g.globalAlpha = 1;
+      }
+      g.globalAlpha = vieux ? 0.45 : 1;
+      g.fillStyle = coul; g.strokeStyle = "#040912"; g.lineWidth = 1.5;
+      g.beginPath(); g.arc(x, y, 5.5, 0, 2 * Math.PI); g.fill(); g.stroke();
+      if (choisi) { g.strokeStyle = "#fff"; g.lineWidth = 1.5; g.beginPath(); g.arc(x, y, 12, 0, 2 * Math.PI); g.stroke(); }
+      g.fillStyle = "#e6f1ff"; g.font = "600 11px ui-monospace, monospace"; g.fillText(p.id, x + 9, y - 2);
+      g.fillStyle = coul; g.font = "11px ui-monospace, monospace"; g.fillText(anciennete(p.vu), x + 9, y + 11);
       g.globalAlpha = 1;
     }
 

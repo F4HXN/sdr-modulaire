@@ -173,6 +173,7 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
 - **Décodeur APRS** : trames AFSK 1200 bauds décodées sans logiciel externe (plus besoin de Dire Wolf),
   sur 144,800 MHz (ou 144,390, ou l'ISS 145,825) extrait des IQ, même si le VFO écoute ailleurs ; alerte
   de saturation. Sur les 100 trames bruitées de `gen_packets -n 100` : 72 décodées (Dire Wolf : 70).
+  Carte des stations comme pour l'ADS-B (positions non compressées, compressées, Mic-E, objets, items).
   Aussi dans SDR Web (`web/aprs.js`, même algorithme, mêmes trames).
 
 ## Pistes
@@ -181,7 +182,7 @@ Déjà réalisées : stéréo + RDS en WFM, scanner de mémoires, scanner de fr�
 capteurs 433 MHz, pilotage rigctl (Gpredict), décodeur SSTV, décodeur CW, décodeur APRS, convertisseur HF,
 version navigateur (SDR Web).
 
-Restent : envoi des trames APRS vers aprs.jerko.fr / APRS-IS, carte des stations APRS,
+Restent : envoi des trames APRS vers aprs.jerko.fr / APRS-IS,
 FT8/WSPR via `jt9`, enregistreur IQ, sortie MQTT vers InfluxDB/Grafana, serveur web pour
 l'écoute à distance.
 

@@ -121,3 +121,51 @@ export function trameVersTexte(o) {
   info = info.replace(/[\r\n]+$/, "");
   return `${adr[1][0]}>${[adr[0][0], ...adr.slice(2).map(([a, h]) => a + (h ? "*" : ""))].join(",")}:${info}`;
 }
+
+// ------------------------------------------------------------------ positions APRS
+const NON_COMPRESSE = /^(\d{2})([0-9 ]{2}\.[0-9 ]{2})([NS])(.)(\d{3})([0-9 ]{2}\.[0-9 ]{2})([EW])(.)/;
+function nonCompresse(p) {
+  const m = NON_COMPRESSE.exec(p); if (!m) return null;
+  const lat = +m[1] + parseFloat(m[2].replace(/ /g, "0")) / 60, lon = +m[5] + parseFloat(m[6].replace(/ /g, "0")) / 60;
+  return [m[3] === "S" ? -lat : lat, m[7] === "W" ? -lon : lon, m[4] + m[8], p.slice(19)];
+}
+function compresse(p) {
+  if (p.length < 10 || !/^[\/\\A-Za-j]/.test(p)) return null;
+  for (let i = 1; i < 9; i++) { const c = p.charCodeAt(i); if (c < 33 || c > 124) return null; }
+  const b91 = s => [...s].reduce((v, c, i) => v + (c.charCodeAt(0) - 33) * 91 ** (3 - i), 0);
+  return [90 - b91(p.slice(1, 5)) / 380926, -180 + b91(p.slice(5, 9)) / 190463, p[0] + p[9], p.slice(13)];
+}
+const positionDe = p => /^\d/.test(p) ? nonCompresse(p) : compresse(p);
+function micE(dest, info) {
+  const d = dest.split("-")[0]; if (d.length !== 6 || info.length < 9) return null;
+  const ch = [];
+  for (const c of d) {
+    if (c >= "0" && c <= "9") ch.push(+c);
+    else if (c >= "A" && c <= "J") ch.push(c.charCodeAt(0) - 65);
+    else if (c >= "P" && c <= "Y") ch.push(c.charCodeAt(0) - 80);
+    else if ("KLZ".includes(c)) ch.push(0);
+    else return null;
+  }
+  const lat = ch[0] * 10 + ch[1] + (ch[2] * 10 + ch[3] + (ch[4] * 10 + ch[5]) / 100) / 60;
+  const haut = c => c >= "P" && c <= "Z", nord = haut(d[3]), decale = haut(d[4]), ouest = haut(d[5]);
+  let deg = info.charCodeAt(1) - 28 + (decale ? 100 : 0);
+  if (deg >= 180 && deg <= 189) deg -= 80; else if (deg >= 190 && deg <= 199) deg -= 190;
+  let mn = info.charCodeAt(2) - 28; if (mn >= 60) mn -= 60;
+  const lon = deg + (mn + (info.charCodeAt(3) - 28) / 100) / 60;
+  // commentaire : sans l'indicateur de type d'appareil Kenwood (« ] » TH-D7, « > » TM-D700)
+  return [nord ? lat : -lat, ouest ? -lon : lon, info[8] + info[7], info.slice(9).replace(/^[\]>]/, "")];
+}
+/** Position d'une trame TNC2 : { id, lat, lon, symbole, commentaire, source }, ou null (comme position_aprs). */
+export function positionAPRS(texte) {
+  const deux = texte.indexOf(":"), chevron = texte.indexOf(">");
+  if (deux < 0 || chevron < 0 || chevron > deux) return null;
+  const source = texte.slice(0, chevron), dest = texte.slice(chevron + 1, deux).split(",")[0], info = texte.slice(deux + 1);
+  let id = source, r = null; const t = info[0] ?? "";
+  if ("!=".includes(t) && t) r = positionDe(info.slice(1));
+  else if ("/@".includes(t) && t) r = positionDe(info.slice(8));
+  else if (t === ";" && info.length >= 18) { id = info.slice(1, 10).trim(); r = positionDe(info.slice(18)); }
+  else if (t === ")") { const m = /^\)([^!_]{3,9})[!_]/.exec(info); if (m) { id = m[1].trim(); r = positionDe(info.slice(m[0].length)); } }
+  else if ("`'\x1c\x1d".includes(t) && t) r = micE(dest, info);
+  if (!r || !(r[0] >= -90 && r[0] <= 90 && r[1] >= -180 && r[1] <= 180)) return null;
+  return { id, lat: r[0], lon: r[1], symbole: r[2], commentaire: r[3].trim(), source };
+}
