@@ -1,6 +1,18 @@
-"""Source RTL-SDR (pyrtlsdr + librtlsdr)."""
+"""Source RTL-SDR (pyrtlsdr + librtlsdr).
+
+Lecture continue (asynchrone) : librtlsdr garde plusieurs transferts USB en vol, comme rtl_fm ;
+un fil reçoit les tampons dans une réserve où lire() prélève ses blocs. Avec des lectures
+synchrones successives, les échantillons arrivés entre deux lectures étaient perdus : sans
+effet audible en FM ou en ADS-B, mais assez pour rendre illisibles les trames APRS, plus
+longues qu'un bloc.
+"""
 
 from __future__ import annotations
+
+import logging
+import threading
+import time
+from collections import deque
 
 import numpy as np
 
@@ -21,6 +33,9 @@ TUNERS = {
         "Sur RTL-SDR Blog V4 : HF 0,5–28,8 MHz par convertisseur intégré (pilote rtl-sdr-blog requis)."),
 }
 TAUX_MAX_STABLE = 2_400_000
+TAMPON_USB = 16 * 16_384        # octets par transfert asynchrone (multiple de 512, ~55 ms à 2,4 MS/s)
+RESERVE_MAX_S = 2.0             # au-delà, le traitement a pris trop de retard : on jette le plus ancien
+log = logging.getLogger(__name__)
 
 
 def lister_cles() -> list[dict]:
@@ -76,6 +91,13 @@ class SourceRtlSdr(Source):
         self.serie = serie
         self.sdr = None
         self._ppm = 0
+        self._reserve: deque[np.ndarray] = deque()
+        self._octets = 0
+        self._cond = threading.Condition()
+        self._fil: threading.Thread | None = None
+        self._erreur: Exception | None = None
+        self.perdus = 0                 # octets jetés faute d'avoir été lus à temps
+        self._dernier_avis = 0.0
 
     def ouvrir(self, taux: int, frequence: float) -> None:
         try:
@@ -101,16 +123,71 @@ class SourceRtlSdr(Source):
         self.sdr.sample_rate = taux
         self.sdr.center_freq = int(frequence)
         self._ppm = 0
+        self._taux = taux
+        self._reserve.clear()
+        self._octets = 0
+        self._erreur = None
+        self._fil = threading.Thread(target=self._lecture_continue, name="rtlsdr-async", daemon=True)
+        self._fil.start()
+
+    def _lecture_continue(self) -> None:
+        try:
+            self.sdr.read_bytes_async(self._recu, TAMPON_USB)
+        except Exception as exc:           # clé débranchée, erreur USB
+            self._erreur = exc
+        finally:
+            with self._cond:
+                self._cond.notify_all()
+
+    def _recu(self, valeurs, _contexte) -> None:
+        bloc = np.frombuffer(valeurs, dtype=np.uint8).copy()     # le tampon de librtlsdr est réutilisé
+        with self._cond:
+            self._reserve.append(bloc)
+            self._octets += len(bloc)
+            limite = int(2 * self._taux * RESERVE_MAX_S)
+            while self._octets > limite and len(self._reserve) > 1:
+                jete = self._reserve.popleft()
+                self._octets -= len(jete)
+                self.perdus += len(jete)
+            self._cond.notify_all()
+        if self.perdus and time.monotonic() - self._dernier_avis > 5:     # un avis toutes les 5 s au plus
+            self._dernier_avis = time.monotonic()
+            log.warning("Traitement en retard : %d octets IQ jetés au total", self.perdus)
 
     def fermer(self) -> None:
         if self.sdr is not None:
             try:
+                if self._fil is not None and self._fil.is_alive():
+                    self.sdr.cancel_read_async()
+                    self._fil.join(timeout=2)
+            except Exception:
+                log.exception("Arrêt de la lecture continue")
+            try:
                 self.sdr.close()
             finally:
                 self.sdr = None
+                self._fil = None
 
     def lire(self, n: int) -> np.ndarray:
-        brut = np.frombuffer(self.sdr.read_bytes(2 * n), dtype=np.uint8)
+        voulu = 2 * n
+        with self._cond:
+            if not self._cond.wait_for(lambda: self._octets >= voulu or self._erreur is not None
+                                       or self._fil is None or not self._fil.is_alive(), timeout=3.0):
+                raise RuntimeError("La clé n'envoie plus d'échantillons")
+            if self._octets < voulu:
+                raise RuntimeError("Lecture interrompue : " + (str(self._erreur) if self._erreur else "la clé a cessé d'envoyer"))
+            morceaux, reste = [], voulu
+            while reste:
+                b = self._reserve[0]
+                if len(b) <= reste:
+                    morceaux.append(self._reserve.popleft())
+                    reste -= len(b)
+                else:
+                    morceaux.append(b[:reste])
+                    self._reserve[0] = b[reste:]
+                    reste = 0
+            self._octets -= voulu
+        brut = np.concatenate(morceaux)
         iq = (brut.astype(np.float32) - 127.4) * (1.0 / 128.0)
         return iq.view(np.complex64)
 
