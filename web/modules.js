@@ -21,6 +21,7 @@ import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
 import { TAUX_CW, DUREE_FENETRE, DUREE_PAS } from "./cw.js?v=20261122-cw";
 import { DemodAFSK, trameVersTexte, positionAPRS } from "./aprs.js?v=20261122-carteaprs";
 import { enteteWav, iqVersOctets, nomFichier, lireEnteteWav, SourceFichierIQ, LIMITE_WAV } from "./enregistreur-iq.js?v=20261123-iq";
+import { DecodeurFax, STATIONS as STATIONS_FAX, LARGEUR as LARGEUR_FAX, TAUX_FAX, DECALAGE_USB } from "./fax-meteo.js?v=20261123-fax";
 import { MoteurACARS, LISTES as LISTES_ACARS, texteMessage as texteACARS, mhz as mhzACARS } from "./acars.js?v=20261123-acars";
 import { MoteurTonalites, TAUX_TONALITES, texteCtcss, secondes } from "./tonalites.js?v=20261123-tonalites";
 import { DecodeurDMR as MoteurDMR, TAUX_DMR, FID as FID_DMR, SAP as SAP_DMR, nomSlot, texteAppel } from "./dmr.js?v=20261122-dmr";
@@ -1982,4 +1983,142 @@ class DecodeurACARS {
   arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, EnregistreurIQ, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR, DecodeurACARS, Tonalites];
+class FaxMeteo {
+  static nom = "Fax météo (WEFAX)";
+  static description = "Cartes météo en ondes courtes (DWD Pinneberg, Northwood, Athènes, Boston…) : 120 lignes/min, IOC 576, calage automatique sur le phasage, PNG téléchargés. Station choisie dans une liste.";
+
+  demarrer() {
+    this.decodeur = new DecodeurFax();
+    this.choix = this.ctx.lire("station", 1);
+    if (this.choix > STATIONS_FAX.length) this.choix = 1;
+    this.cle = ""; this.derniersIQ = -Infinity; this.couvert = false; this.niveau = null; this.bruit = null;
+    this.ctx.abonner("iq", (re, im, centre, taux) => this.recevoir(re, im, centre, taux));
+  }
+
+  frequence() { return this.choix < STATIONS_FAX.length ? STATIONS_FAX[this.choix][1] : this.ctx.frequence() + DECALAGE_USB; }
+
+  recevoir(re, im, centre, taux) {
+    this.derniersIQ = performance.now();
+    const f = this.frequence();
+    this.couvert = Math.abs(f - centre) + 3000 < 0.42 * taux;
+    if (!this.couvert) { this.cle = ""; return; }
+    const cle = `${centre}/${taux}`;
+    if (cle !== this.cle) {
+      this.cle = cle;
+      const d1 = Math.round(taux / 240_000), fs1 = taux / d1;
+      this.nco = new NCO(taux);
+      this.etage1 = new FirComplexe(passeBas(taux, 30_000, d1 * 4 + 1), d1);
+      this.etage2 = new FirComplexe(passeBas(fs1, 6_000, 61), Math.round(fs1 / 48_000));
+      this.etage3 = new FirComplexe(passeBas(48_000, 2_500, 49), 4);
+    }
+    this.nco.freq = f - centre;
+    const [a, b] = this.etage3.traiter(...this.etage2.traiter(...this.etage1.traiter(...this.nco.melanger(re, im))));
+    if (!a.length) return;
+    let p = 0;
+    for (let k = 0; k < a.length; k++) p += a[k] * a[k] + b[k] * b[k];
+    p = 10 * Math.log10(p / a.length + 1e-20);
+    this.bruit = this.bruit === null ? p : Math.min(p, this.bruit + 0.02);
+    this.niveau = this.niveau === null ? p : 0.9 * this.niveau + 0.1 * p;
+    this.decodeur.traiter(a, b);
+  }
+
+  accorder() {
+    if (this.choix >= STATIONS_FAX.length) return;
+    const f = this.frequence() - DECALAGE_USB;
+    this.ctx.reglerMode("USB");
+    this.ctx.reglerFrequence(f + this.ctx.taux());      // la clé se recentre…
+    this.ctx.reglerFrequence(f);                        // … VFO 1,9 kHz sous la fréquence annoncée
+  }
+
+  nomFichier(partielle) {
+    const d = new Date(), h = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "_");
+    return `fax_${h}_${String(this.frequence() / 1000).replace(".", ",")}kHz${partielle ? "_partielle" : ""}.png`;
+  }
+
+  telecharger(lignes, partielle) {
+    if (!lignes.length) return;
+    const c = el("canvas", { width: LARGEUR_FAX, height: lignes.length }), g = c.getContext("2d"), img = g.createImageData(LARGEUR_FAX, lignes.length);
+    lignes.forEach((r, k) => { for (let i = 0; i < LARGEUR_FAX; i++) { const o = 4 * (k * LARGEUR_FAX + i); img.data[o] = img.data[o + 1] = img.data[o + 2] = r[i]; img.data[o + 3] = 255; } });
+    g.putImageData(img, 0, 0);
+    c.toBlob(b => { const a = el("a", { href: URL.createObjectURL(b), download: this.nomFichier(partielle) }); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000); }, "image/png");
+  }
+
+  creerPanneau() {
+    const choix = el("select", { title: "Station décodée : le module extrait son canal des IQ, quel que soit le mode du VFO" });
+    STATIONS_FAX.forEach(([nom, f], i) => choix.add(new Option(`${nom} · ${String(f / 1000).replace(".", ",")} kHz`, i, false, i === this.choix)));
+    choix.add(new Option("Fréquence du VFO (USB, +1,9 kHz)", STATIONS_FAX.length, false, this.choix === STATIONS_FAX.length));
+    choix.onchange = () => { this.choix = Number(choix.value); this.ctx.ecrire("station", this.choix); this.decodeur.reinitialiser(); };
+    const accorder = el("button", { type: "button", textContent: "Accorder", title: "VFO en USB 1,9 kHz sous la fréquence annoncée, pour écouter la station" });
+    accorder.onclick = () => this.accorder();
+    this.toile = el("canvas", { width: LARGEUR_FAX, height: 1, title: "Cliquez sur le bord gauche réel de la carte pour la recaler" });
+    this.toile.style.cssText = "width: 100%; display: block; background: #000; cursor: crosshair";
+    this.toile.onclick = e => { const r = this.toile.getBoundingClientRect(); this.decodeur.reglerBordGauche((e.clientX - r.left) / r.width); };
+    this.cadre = el("div", {}, this.toile);
+    this.cadre.style.cssText = "max-height: 260px; overflow: auto; background: #000";
+    this.statut = el("div", { className: "petit" });
+    this.diag = el("div", { className: "petit", title: "Niveau du canal au-dessus du bruit, fréquence moyenne mesurée (0 = fréquence annoncée ; blanc +400 Hz, noir −400 Hz)" });
+    this.diag.style.color = "var(--doux)";
+    const depart = el("button", { type: "button", textContent: "Démarrer", title: "Commence une carte maintenant (signal de départ manqué) ; cliquez ensuite sur son bord gauche" });
+    depart.onclick = () => this.decodeur.demarrerMaintenant();
+    this.bFin = el("button", { type: "button", textContent: "Terminer", title: "Clôt la carte en cours et la télécharge" });
+    this.bFin.onclick = () => this.decodeur.terminerMaintenant();
+    this.pente = el("input", { type: "number", step: 10, min: -2000, max: 2000, value: 0, title: "Pente en ppm (écart d'horloge avec l'émetteur), réglée au phasage ; à corriger si la carte penche" });
+    this.pente.style.width = "5.5em";
+    this.pente.onchange = () => this.decodeur.reglerPente(Number(this.pente.value) || 0);
+    const inverse = el("input", { type: "checkbox", title: "Échange noir et blanc (station reçue en LSB)" });
+    inverse.onchange = () => { this.decodeur.inverse = inverse.checked; };
+    this.auto = el("input", { type: "checkbox", checked: this.ctx.lire("auto", true) });
+    this.auto.onchange = () => this.ctx.ecrire("auto", this.auto.checked);
+    const enregistrer = el("button", { type: "button", textContent: "Enregistrer", title: "Télécharge la carte en cours en PNG" });
+    enregistrer.onclick = () => this.telecharger(this.decodeur.lignes, true);
+    const actions = el("div", { className: "scanner-choix cw-actions" }, depart, this.bFin, el("label", {}, "Pente ", this.pente, " ppm"),
+      el("label", { className: "sstv-auto" }, inverse, "Inverser"), el("label", { className: "sstv-auto", title: "Télécharge chaque carte terminée en PNG" }, this.auto, "Télécharger chaque carte"), enregistrer);
+    const aide = el("div", { className: "petit", textContent: "Ondes courtes : clé qui reçoit la HF (RTL-SDR Blog V4, échantillonnage direct) ou convertisseur. Horaires : programme de chaque station (DWD : dwd.de, « Seefunk »)." });
+    aide.style.color = "var(--doux)";
+    const contenu = el("div", { className: "cw-contenu" }, el("div", { className: "scanner-choix" }, choix, accorder), this.cadre, this.statut, this.diag, actions, aide);
+    const { panneau, dialogue } = panneauAgrandissable(this.ctx, { titre: FaxMeteo.nom, id: "fax-titre", contenu, actions,
+      tailleDefaut: 1.0, attenteTexte: "Carte affichée dans la fenêtre agrandie." });
+    this.dialogue = dialogue;
+    this.vue = { version: -1, lignes: 0 };
+    this.minuterie = setInterval(() => this.rafraichir(), 500);
+    this.rafraichir();
+    return panneau;
+  }
+
+  dessiner() {
+    const d = this.decodeur, n = d.lignes.length, g = this.toile.getContext("2d");
+    let debut = d.tout ? 0 : this.vue.lignes;
+    const hauteur = Math.max(1, Math.ceil(n / 50) * 50);
+    if (this.toile.height !== hauteur) { this.toile.height = hauteur; debut = 0; }
+    if (debut === 0) { g.fillStyle = "#000"; g.fillRect(0, 0, LARGEUR_FAX, hauteur); }
+    if (n > debut) {
+      const img = g.createImageData(LARGEUR_FAX, n - debut);
+      for (let k = debut; k < n; k++) {
+        const r = d.lignes[k];
+        for (let i = 0; i < LARGEUR_FAX; i++) { const o = 4 * ((k - debut) * LARGEUR_FAX + i); img.data[o] = img.data[o + 1] = img.data[o + 2] = r[i]; img.data[o + 3] = 255; }
+      }
+      g.putImageData(img, 0, debut);
+      const bas = this.cadre.scrollTop + this.cadre.clientHeight >= this.cadre.scrollHeight - 30;
+      if (bas) this.cadre.scrollTop = this.cadre.scrollHeight;
+    }
+    d.tout = false; this.vue.lignes = n;
+  }
+
+  rafraichir() {
+    const d = this.decodeur, maj = (e, t) => { if (e.textContent !== t) e.textContent = t; };
+    for (const t of d.terminees.splice(0)) if (this.auto.checked || t.partielle) this.telecharger(t.lignes, t.partielle);
+    if (d.version !== this.vue.version) { this.vue.version = d.version; if (d.lignes.length || d.tout) this.dessiner(); }
+    const khz = String(this.frequence() / 1000).replace(".", ",");
+    maj(this.statut, performance.now() - this.derniersIQ > 1500 ? "En attente des échantillons de la clé."
+      : !this.couvert ? `${khz} kHz n'est pas dans la bande reçue : cliquez sur « Accorder » (clé qui reçoit la HF ou convertisseur).`
+      : d.statut());
+    if (document.activeElement !== this.pente) this.pente.value = Math.round(d.pentePpm);
+    this.bFin.disabled = !d.enCours;
+    if (this.couvert && this.niveau !== null)
+      maj(this.diag, `niveau ${Math.round(this.niveau - this.bruit)} dB${d.frequence !== null ? ` · fréquence ${d.frequence >= 0 ? "+" : ""}${Math.round(d.frequence)} Hz` : ""}`);
+  }
+
+  arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, EnregistreurIQ, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, FaxMeteo, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR, DecodeurACARS, Tonalites];
