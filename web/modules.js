@@ -20,6 +20,7 @@ import { CarteRadar, couleurAltitude, couleurSymbole } from "./carte-adsb.js?v=2
 import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
 import { TAUX_CW, DUREE_FENETRE, DUREE_PAS } from "./cw.js?v=20261122-cw";
 import { DemodAFSK, trameVersTexte, positionAPRS } from "./aprs.js?v=20261122-carteaprs";
+import { MoteurTonalites, TAUX_TONALITES, texteCtcss, secondes } from "./tonalites.js?v=20261123-tonalites";
 import { DecodeurDMR as MoteurDMR, TAUX_DMR, FID as FID_DMR, SAP as SAP_DMR, nomSlot, texteAppel } from "./dmr.js?v=20261122-dmr";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
@@ -1613,4 +1614,139 @@ class DecodeurDMR {
   arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR];
+class Tonalites {
+  static nom = "Tonalités CTCSS et DTMF";
+  static description = "Sous-porteuse CTCSS d'accès d'un relais (fréquence normalisée, mesure, déviation), codes DTMF et tonalité 1750 Hz entendus sur la fréquence du VFO, quel que soit le mode.";
+
+  demarrer() {
+    this.cle = ""; this.f = null; this.derniersIQ = -Infinity; this.couvert = false;
+    this.moteur = null; this.bruit = null; this.crete = null;
+    this.sequence = ""; this.liSequence = null; this.tTouche = 0; this.derniereTouche = 0;
+    this.liCtcss = null; this.li1750 = null;
+    this.ctx.abonner("iq", (re, im, centre, taux) => this.recevoir(re, im, centre, taux));
+  }
+
+  recevoir(re, im, centre, taux) {
+    this.derniersIQ = performance.now();
+    const f = this.ctx.frequence();
+    this.couvert = Math.abs(f - centre) + 8_000 < 0.42 * taux;
+    if (!this.couvert) return;
+    const cle = `${centre}/${taux}`;
+    if (cle !== this.cle) {                  // nouvelle bande : chaîne neuve
+      this.cle = cle;
+      const d1 = Math.round(taux / 240_000), fs1 = taux / d1, d2 = Math.round(fs1 / TAUX_TONALITES);
+      this.nco = new NCO(taux);
+      this.etage1 = new FirComplexe(passeBas(taux, 30_000, d1 * 4 + 1), d1);
+      this.etage2 = new FirComplexe(passeBas(fs1, 7_000, d2 * 12 + 1), d2);
+      this.pr = 1; this.pi = 0;
+      this.moteur = new MoteurTonalites();
+    } else if (f !== this.f) {               // autre fréquence : autres tonalités
+      this.moteur = new MoteurTonalites();
+      this.clore(); this.liCtcss = null; this.li1750 = null;
+    }
+    this.f = f;
+    this.nco.freq = f - centre;
+    const [cr, ci] = this.etage2.traiter(...this.etage1.traiter(...this.nco.melanger(re, im)));
+    if (!cr.length) return;
+    let p = 0;
+    for (let k = 0; k < cr.length; k++) p += cr[k] * cr[k] + ci[k] * ci[k];
+    p = 10 * Math.log10(p / cr.length + 1e-20);
+    this.bruit = this.bruit === null ? p : Math.min(p, this.bruit + 0.02);
+    this.crete = this.crete === null ? p : Math.max(p, this.crete - 0.5);
+    const fm = new Float32Array(cr.length), k2 = TAUX_TONALITES / (2 * Math.PI);
+    let pr = this.pr, pi = this.pi;
+    for (let k = 0; k < cr.length; k++) { const a = cr[k], b = ci[k]; fm[k] = Math.atan2(b * pr - a * pi, a * pr + b * pi) * k2; pr = a; pi = b; }
+    this.pr = pr; this.pi = pi;
+    for (const ev of this.moteur.traiter(fm)) this.evenement(ev);
+  }
+
+  ligne(texte) {
+    const li = el("li", { textContent: texte });
+    this.liste.prepend(li);
+    while (this.liste.childElementCount > 300) this.liste.lastElementChild.remove();
+    return li;
+  }
+
+  clore() { this.sequence = ""; this.liSequence = null; }
+
+  evenement(ev) {
+    if (!this.liste) return;
+    const h = new Date().toTimeString().slice(0, 8);
+    if (ev.type === "ctcss") {
+      this.hCtcss = h; this.liCtcss = this.ligne(`${h}  ${texteCtcss(ev)}  …`);
+    } else if (ev.type === "ctcss_fin") {
+      const t = `${this.hCtcss ?? h}  ${texteCtcss(ev)}  ${secondes(ev.duree)}`;
+      if (this.liCtcss) this.liCtcss.textContent = t; else this.ligne(t);
+      this.liCtcss = null;
+    } else if (ev.type === "dtmf") {
+      if (!this.sequence || ev.t - this.tTouche > 2 || performance.now() - this.derniereTouche > 3000) {
+        this.clore(); this.hSequence = h; this.liSequence = this.ligne(`${h}  DTMF`);
+      }
+      this.sequence += ev.touche; this.tTouche = ev.t; this.derniereTouche = performance.now();
+      this.liSequence.textContent = `${this.hSequence}  DTMF ${this.sequence}`;
+    } else if (ev.type === "1750") {
+      this.h1750 = h; this.li1750 = this.ligne(`${h}  tonalité 1750 Hz (ouverture de relais)  …`);
+    } else if (ev.type === "1750_fin") {
+      const t = `${this.h1750 ?? h}  tonalité 1750 Hz (ouverture de relais)  ${secondes(ev.duree)}`;
+      if (this.li1750) this.li1750.textContent = t; else this.ligne(t);
+      this.li1750 = null;
+    }
+  }
+
+  creerPanneau() {
+    this.statut = el("div", { className: "petit" });
+    const gros = "font: 700 1.05rem 'Orbitron', sans-serif; color: var(--cyan); margin-top: 4px; user-select: text";
+    this.lCtcss = el("div", { className: "tonalite-gros" }); this.lCtcss.style.cssText = gros;
+    this.lDetail = el("div", { className: "petit" });
+    this.lDtmf = el("div", { className: "tonalite-gros" }); this.lDtmf.style.cssText = gros + "; overflow-wrap: anywhere";
+    this.diag = el("div", { className: "petit", title: "Crête du canal au-dessus du bruit, dernière analyse CTCSS (raie la plus forte, part de l'énergie 55–270 Hz), touches DTMF reçues" });
+    this.diag.style.color = "var(--doux)";
+    this.liste = el("ul", { className: "journal aprs-liste" });
+    const effacer = el("button", { type: "button", textContent: "Effacer" });
+    effacer.onclick = () => { this.liste.replaceChildren(); this.clore(); this.liCtcss = null; this.li1750 = null; };
+    const texte = () => [...this.liste.children].reverse().map(li => li.textContent).join("\n");
+    const copier = el("button", { type: "button", textContent: "Copier" });
+    copier.onclick = () => navigator.clipboard?.writeText(texte()).then(() => {
+      copier.textContent = "Copié"; setTimeout(() => { copier.textContent = "Copier"; }, 1200);
+    }).catch(() => {});
+    const enregistrer = el("button", { type: "button", textContent: "Enregistrer", title: "Télécharge les tonalités et les codes dans un fichier texte" });
+    enregistrer.onclick = () => {
+      const d = new Date(), h = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "_");
+      const a = el("a", { href: URL.createObjectURL(new Blob([texte() + "\n"], { type: "text/plain" })), download: `tonalites_${h}.txt` });
+      a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    };
+    const actions = el("div", { className: "scanner-choix cw-actions" }, effacer, copier, enregistrer);
+    const contenu = el("div", { className: "cw-contenu aprs-contenu" }, this.statut, this.lCtcss, this.lDetail, this.lDtmf, this.diag, this.liste, actions);
+    const { panneau, dialogue } = panneauAgrandissable(this.ctx, { titre: Tonalites.nom, id: "tonalites-titre", contenu, actions,
+      tailleDefaut: 1.1, attenteTexte: "Tonalités affichées dans la fenêtre agrandie." });
+    this.dialogue = dialogue;
+    this.minuterie = setInterval(() => this.rafraichir(), 200);
+    this.rafraichir();
+    return panneau;
+  }
+
+  rafraichir() {
+    if (this.sequence && performance.now() - this.derniereTouche > 3000) this.clore();
+    const m = this.moteur, c = m?.ctcss, en1750 = m?.ton1750 != null;
+    const maj = (e, t) => { if (e.textContent !== t) e.textContent = t; };
+    maj(this.statut, performance.now() - this.derniersIQ > 1500 ? "En attente des échantillons de la clé."
+      : !this.couvert ? "Le VFO est trop près du bord de la bande reçue."
+      : c || en1750 ? "Tonalité reçue."
+      : "Accordez le VFO sur un relais (sortie ou entrée) ou une fréquence FM. Le mode n'a pas d'importance : le module démodule lui-même.");
+    const v = x => x.replace(".", ",");
+    maj(this.lCtcss, c ? `CTCSS : ${c.norme !== null ? v(c.norme.toFixed(1)) + " Hz" : v(c.f.toFixed(1)) + " Hz (hors norme)"}` : "CTCSS : —");
+    const det = [];
+    if (c) det.push(`mesuré ${v(c.f.toFixed(2))} Hz · déviation ≈ ${Math.round(c.deviation)} Hz`);
+    if (en1750) det.push("tonalité 1750 Hz en cours");
+    maj(this.lDetail, det.join(" · "));
+    maj(this.lDtmf, `DTMF : ${this.sequence || "—"}`);
+    if (this.crete !== null && m) {
+      const a = m.mesure ? ` · raie ${v(m.mesure.f.toFixed(1))} Hz, ${Math.round(100 * m.mesure.part)} %` : "";
+      maj(this.diag, `crête ${Math.round(this.crete - this.bruit)} dB${a} · ${m.touches} touches`);
+    }
+  }
+
+  arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR, Tonalites];

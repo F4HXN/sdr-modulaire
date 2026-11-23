@@ -90,7 +90,7 @@ modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite
 modules-a-telecharger/  adsb.py, scanner_memoires.py, scanner_frequences.py,
                         pilotage_rigctl.py, sstv.py, decodeur_cw.py, decodeur_aprs.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
 outils/decodeur_cw/     entraînement du réseau du Décodeur CW (PyTorch, non nécessaire à l'exécution)
-tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py, test_decodeur_dmr.py
+tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py, test_decodeur_dmr.py, test_tonalites.py
 ```
 
 ## Trois niveaux d'extension
@@ -147,6 +147,7 @@ python3 -m tests.test_sstv                                            # décodeu
 python3 -m tests.test_decodeur_cw                                     # Décodeur CW de bout en bout (IQ → mode CW → texte)
 python3 -m tests.test_decodeur_aprs                                   # Décodeur APRS sur trames AFSK synthétiques
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_decodeur_dmr dmr.wav  # Décodeur DMR sur un flux de relais synthétique
+QT_QPA_PLATFORM=offscreen python3 -m tests.test_tonalites          # CTCSS, DTMF et 1750 Hz sur des émissions NFM synthétiques
 ```
 
 ## Modules disponibles
@@ -186,12 +187,18 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
   sur demande. L'appel est trouvé même sans son en-tête (LC intégré des salves vocales). La voix (AMBE+2) n'est
   pas décodée. Codes de la norme ETSI TS 102 361-1 vérifiés avec dsd-fme sur le flux de `tests/test_decodeur_dmr.py`.
   Aussi dans SDR Web (`web/dmr.js`, même algorithme, mêmes résultats).
+- **Tonalités CTCSS et DTMF** (relais VHF / UHF) : sur la fréquence du VFO, quel que soit le mode, la sous-porteuse
+  CTCSS d'accès d'un relais (tonalité normalisée parmi les 52, fréquence mesurée au centième de hertz, déviation,
+  durée), les codes DTMF entendus (regroupés en séquences) et la tonalité 1750 Hz d'ouverture des relais.
+  CTCSS par DFT sur 2 s avec interpolation (150,0 / 151,4 et 156,7 / 157,7 Hz bien séparés), DTMF par Goertzel.
+  Fonctionne jusqu'à ~5 dB de C/N sur les signaux de `tests/test_tonalites.py`.
+  Aussi dans SDR Web (`web/tonalites.js`, même algorithme, mêmes résultats).
 
 ## Pistes
 
 Déjà réalisées : stéréo + RDS en WFM, scanner de mémoires, scanner de fréquences, ADS-B,
 capteurs 433 MHz, pilotage rigctl (Gpredict), décodeur SSTV, décodeur CW, décodeur APRS, décodeur FT8/FT4,
-décodeur DMR (données), convertisseur HF,
+décodeur DMR (données), tonalités CTCSS / DTMF / 1750 Hz, convertisseur HF,
 version navigateur (SDR Web).
 
 Restent : voix DMR (dsd-fme dans l'appli), envoi des trames APRS vers aprs.jerko.fr / APRS-IS,
