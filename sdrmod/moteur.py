@@ -53,6 +53,11 @@ class Moteur(QObject):
         self._mode_demande: tuple[str, float] | None = None
         self._largeur_demandee: float | None = None
 
+        # Saturation : échantillons écrêtés par la clé (|I| ou |Q| ≥ 0,99 : octet 0 ou 255), comptés par le
+        # thread DSP. compte_sat : pour l'affichage ; mesure_sat : pour l'ajustement du gain. [écrêtés, total]
+        self.compte_sat = [0, 0]
+        self.mesure_sat = [0, 0]
+
         self.demod: Demodulateur | None = None
         self._commandes: queue.Queue = queue.Queue()
         self._file_iq: queue.Queue = queue.Queue(maxsize=8)
@@ -101,6 +106,12 @@ class Moteur(QObject):
         self.en_marche.emit(False)
 
     # ------------------------------------------------------------ commandes
+    def lire_saturation(self) -> float | None:
+        """Part des échantillons écrêtés depuis le dernier appel (None si aucun échantillon)."""
+        ecretes, total = self.compte_sat
+        self.compte_sat = [0, 0]
+        return ecretes / total if total else None
+
     def commande_source(self, nom: str, *args) -> None:
         """Exécute source.<nom>(*args) dans le thread de lecture."""
         if self._actif:
@@ -200,6 +211,11 @@ class Moteur(QObject):
             self.demod.regler_largeur(self._largeur_demandee)
             self._largeur_demandee = None
         demod = self.demod
+
+        ecretes = int(np.count_nonzero((np.abs(x.real) >= 0.99) | (np.abs(x.imag) >= 0.99)))
+        for c in (self.compte_sat, self.mesure_sat):
+            c[0] += ecretes
+            c[1] += len(x)
 
         # suppression de la composante continue (pic central des RTL-SDR)
         self._dc = 0.9 * self._dc + 0.1 * complex(x.mean())

@@ -17,6 +17,7 @@ modules à chaud**, sans redémarrer.
 - Bande passante réglable par mode (mémorisée), AGC audio, squelch en dBFS, volume
 - Détection de la clé : modèle, tuner, couverture, paliers de gain, taux max ; options non prises en charge grisées, fréquence en rouge hors couverture (menu Source → Informations sur le matériel)
 - RTL-SDR : taux d'échantillonnage, gain RF (auto ou manuel), correction ppm, échantillonnage direct I/Q (HF sur V3), bias-T
+- Saturation de la clé affichée en continu (part des échantillons écrêtés, en rouge au-delà de 0,05 %) et bouton « Ajuster » : gain le plus fort sans saturation, trouvé par dichotomie sur les paliers du tuner (~6 s), puis niveaux du spectre recalés ; même chose dans SDR Web
 - Convertisseur HF (Ham It Up…) : décalage en MHz dans les réglages ; l'afficheur et le spectre montrent la vraie fréquence HF, la clé est accordée sur fréquence + décalage
 - Réglages, modules actifs et disposition des fenêtres retrouvés au lancement suivant
 
@@ -90,7 +91,7 @@ modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite
 modules-a-telecharger/  adsb.py, scanner_memoires.py, scanner_frequences.py,
                         pilotage_rigctl.py, sstv.py, decodeur_cw.py, decodeur_aprs.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
 outils/decodeur_cw/     entraînement du réseau du Décodeur CW (PyTorch, non nécessaire à l'exécution)
-tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py, test_decodeur_dmr.py, test_tonalites.py, test_enregistreur_iq.py, test_decodeur_acars.py, test_fax_meteo.py, test_decodeur_ais.py
+tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py, test_decodeur_dmr.py, test_tonalites.py, test_enregistreur_iq.py, test_decodeur_acars.py, test_fax_meteo.py, test_decodeur_ais.py, test_gain.py
 ```
 
 ## Trois niveaux d'extension
@@ -152,6 +153,7 @@ QT_QPA_PLATFORM=offscreen HOME=$(mktemp -d) python3 -m tests.test_enregistreur_i
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_decodeur_acars      # ACARS : MSK synthétique, corrections, 3 canaux ensemble
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_fax_meteo carte.png # fax météo : départ, phasage, pente, arrêt, carte comparée point par point
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_decodeur_ais        # AIS : messages de gpsd, banc GMSK de 40 salves par niveau, 2 canaux
+QT_QPA_PLATFORM=offscreen HOME=$(mktemp -d) python3 -m tests.test_gain  # saturation et bouton « Ajuster » (clé simulée qui écrête)
 ```
 
 ## Modules disponibles

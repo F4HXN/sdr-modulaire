@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-from PySide6.QtCore import QByteArray, Qt, Signal
+from PySide6.QtCore import QByteArray, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QComboBox, QDockWidget, QFrame, QLabel, QMainWindow,
                                QMessageBox, QScrollArea, QToolButton, QVBoxLayout, QWidget)
@@ -199,6 +199,10 @@ class FenetrePrincipale(QMainWindow):
         p.zoom_change.connect(lambda v: self._param("zoom", "zoom", v))
         p.niveaux_change.connect(self._changer_niveaux)
         p.auto_echelle.connect(self._echelle_auto)
+        p.ajuster_gain.connect(self._ajuster_gain)
+        self._ajustement = None
+        self._minuterie_sat = QTimer(self, interval=500, timeout=self._maj_saturation)
+        self._minuterie_sat.start()
 
     @staticmethod
     def _texte_pas(p: int) -> str:
@@ -327,6 +331,81 @@ class FenetrePrincipale(QMainWindow):
     def _changer_niveaux(self, mini: float, maxi: float) -> None:
         self.reglages.niveau_min, self.reglages.niveau_max = mini, maxi
         self.vue.regler_niveaux(mini, maxi)
+
+    # ================================================================ saturation et ajustement du gain
+    SEUIL_SATURATION = 1e-4             # au-delà de 0,01 % d'échantillons écrêtés, le gain est trop fort
+
+    def _maj_saturation(self) -> None:
+        self.panneau.afficher_saturation(self.moteur.lire_saturation() if self.moteur.actif else None)
+
+    def _ajuster_gain(self) -> None:
+        """Cherche par dichotomie, sur les paliers du tuner, le gain le plus fort qui ne fait pas saturer."""
+        gains = list(self.panneau._gains)
+        if not self.moteur.actif or not gains:
+            self.statusBar().showMessage("Démarrez la réception : le gain se règle sur ce que reçoit la clé.", 8000)
+            return
+        if self._ajustement is not None:
+            return
+        self.panneau.b_ajuster.setEnabled(False)
+        self._ajustement = self._etapes_ajustement(gains)
+        self._pas_ajustement()
+
+    def _pas_ajustement(self) -> None:
+        """Fait avancer l'ajustement d'une étape ; chaque étape rend le délai avant la suivante (ms)."""
+        try:
+            delai = next(self._ajustement)
+        except StopIteration:
+            self._ajustement = None
+            self.panneau.b_ajuster.setEnabled(True)
+            return
+        except Exception as exc:                          # source arrêtée en cours de route…
+            log.exception("Ajustement du gain")
+            self._ajustement = None
+            self.panneau.b_ajuster.setEnabled(True)
+            self.statusBar().showMessage(f"Ajustement du gain interrompu : {exc}", 8000)
+            return
+        QTimer.singleShot(delai, self._pas_ajustement)
+
+    def _etapes_ajustement(self, gains: list[float]):
+        mesure = {}
+
+        def essayer(i: int):
+            self.panneau.choisir_gain(i)
+            self.statusBar().showMessage(f"Ajustement du gain : essai à {gains[i]:.1f} dB…".replace(".", ","))
+            yield 300                                    # les échantillons d'avant le changement sont passés
+            self.moteur.mesure_sat = [0, 0]
+            yield 500
+            if not self.moteur.actif:
+                raise RuntimeError("la réception s'est arrêtée")
+            ecretes, total = self.moteur.mesure_sat
+            mesure["taux"] = ecretes / total if total else 0.0
+
+        haut = len(gains) - 1
+        note = ""
+        yield from essayer(haut)
+        if mesure["taux"] <= self.SEUIL_SATURATION:
+            choisi, note = haut, " (gain maximal : aucune saturation)"
+        else:
+            yield from essayer(0)
+            if mesure["taux"] > self.SEUIL_SATURATION:
+                choisi, note = 0, (" : la clé sature même au gain minimal, un émetteur très proche ou très fort "
+                                   "est dans la bande")
+            else:
+                bas, haut = 0, haut - 1                  # bas : sans saturation ; au-dessus de haut : saturation
+                while bas < haut:
+                    m = (bas + haut + 1) // 2
+                    yield from essayer(m)
+                    if mesure["taux"] <= self.SEUIL_SATURATION:
+                        bas = m
+                    else:
+                        haut = m - 1
+                choisi = bas
+        self.panneau.choisir_gain(choisi)
+        yield 900
+        self._echelle_auto()
+        valeur = f"{gains[choisi]:.1f}".replace(".", ",")
+        self.statusBar().showMessage(f"Gain ajusté : {valeur} dB, le plus fort sans saturation{note}. "
+                                     "Niveaux du spectre recalés.", 15000)
 
     def _echelle_auto(self) -> None:
         db = self.vue.dernier_spectre()

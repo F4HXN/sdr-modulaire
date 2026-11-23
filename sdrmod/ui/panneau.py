@@ -26,6 +26,7 @@ def _curseur(mini: int, maxi: int, valeur: int) -> QSlider:
 class PanneauReglages(QWidget):
     taux_change = Signal(int)
     gain_change = Signal(object)        # float | None
+    ajuster_gain = Signal()
     ppm_change = Signal(int)
     direct_change = Signal(int)
     convertisseur_change = Signal(float)   # Hz
@@ -82,7 +83,16 @@ class PanneauReglages(QWidget):
         ligne.addWidget(self.gain_auto)
         ligne.addWidget(self.gain, 1)
         ligne.addWidget(self.gain_lbl)
+        self.b_ajuster = QPushButton("Ajuster")
+        self.b_ajuster.setToolTip("Cherche le gain le plus fort qui ne fait pas saturer la clé (quelques secondes), "
+                                  "puis recale les niveaux du spectre")
+        self.b_ajuster.clicked.connect(self.ajuster_gain)
+        ligne.addWidget(self.b_ajuster)
         f.addRow("Gain RF", ligne)
+        self.sat_lbl = QLabel("—")
+        self.sat_lbl.setToolTip("Part des échantillons que la clé écrête (octet 0 ou 255). Au-delà de 0,05 %, "
+                                "baissez le gain RF ou cliquez sur « Ajuster ».")
+        f.addRow("Saturation", self.sat_lbl)
         self.gain_auto.toggled.connect(self._emettre_gain)
         self.gain.valueChanged.connect(self._emettre_gain)
 
@@ -240,6 +250,24 @@ class PanneauReglages(QWidget):
             s.blockSignals(False)
         self._maj_libelles()
 
+    def choisir_gain(self, i: int) -> None:
+        """Gain manuel sur le palier i (émet gain_change)."""
+        self.gain_auto.blockSignals(True)
+        self.gain_auto.setChecked(False)
+        self.gain_auto.blockSignals(False)
+        self.gain.blockSignals(True)
+        self.gain.setValue(i)
+        self.gain.blockSignals(False)
+        self._emettre_gain()
+
+    def afficher_saturation(self, taux: float | None) -> None:
+        if taux is None:
+            self.sat_lbl.setText("—")
+            self.sat_lbl.setStyleSheet("")
+            return
+        self.sat_lbl.setText("aucune" if taux < 1e-4 else f"{100 * taux:.2f} %".replace(".", ","))
+        self.sat_lbl.setStyleSheet("color: #ff5252; font-weight: bold" if taux > 5e-4 else "")
+
     def afficher_niveau(self, dbfs: float) -> None:
         self.niveau.setValue(int(max(-120, min(0, dbfs))))
 
@@ -266,7 +294,7 @@ class PanneauReglages(QWidget):
 
     def _maj_libelles(self) -> None:
         g = self.gain_actuel()
-        self.gain_lbl.setText("auto" if g is None else f"{g:.1f} dB")
+        self.gain_lbl.setText("auto" if g is None else f"{g:.1f} dB".replace(".", ","))
         self.gain.setEnabled(not self.gain_auto.isChecked())
         s = self.squelch.value()
         self.squelch_lbl.setText("ouvert" if s <= -120 else f"{s} dBFS")
