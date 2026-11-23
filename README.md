@@ -90,7 +90,7 @@ modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite
 modules-a-telecharger/  adsb.py, scanner_memoires.py, scanner_frequences.py,
                         pilotage_rigctl.py, sstv.py, decodeur_cw.py, decodeur_aprs.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
 outils/decodeur_cw/     entraînement du réseau du Décodeur CW (PyTorch, non nécessaire à l'exécution)
-tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py, test_decodeur_dmr.py, test_tonalites.py, test_enregistreur_iq.py, test_decodeur_acars.py, test_fax_meteo.py
+tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py, test_decodeur_dmr.py, test_tonalites.py, test_enregistreur_iq.py, test_decodeur_acars.py, test_fax_meteo.py, test_decodeur_ais.py
 ```
 
 ## Trois niveaux d'extension
@@ -151,6 +151,7 @@ QT_QPA_PLATFORM=offscreen python3 -m tests.test_tonalites          # CTCSS, DTMF
 QT_QPA_PLATFORM=offscreen HOME=$(mktemp -d) python3 -m tests.test_enregistreur_iq  # formats IQ, enregistrement et relecture dans l'appli
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_decodeur_acars      # ACARS : MSK synthétique, corrections, 3 canaux ensemble
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_fax_meteo carte.png # fax météo : départ, phasage, pente, arrêt, carte comparée point par point
+QT_QPA_PLATFORM=offscreen python3 -m tests.test_decodeur_ais        # AIS : messages de gpsd, banc GMSK de 40 salves par niveau, 2 canaux
 ```
 
 ## Modules disponibles
@@ -198,6 +199,13 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
   CTCSS par DFT sur 2 s avec interpolation (150,0 / 151,4 et 156,7 / 157,7 Hz bien séparés), DTMF par Goertzel.
   Fonctionne jusqu'à ~5 dB de C/N sur les signaux de `tests/test_tonalites.py`.
   Aussi dans SDR Web (`web/tonalites.js`, même algorithme, mêmes résultats).
+- **Décodeur AIS (navires)** : 161,975 et 162,025 MHz décodés ensemble, quel que soit le mode du VFO, sans logiciel
+  externe. Positions (classes A et B), identité et voyage (nom, indicatif, type de navire, dimensions, destination),
+  stations côtières et aides à la navigation ; carte (navires orientés selon leur route, vecteur vitesse sur 6 min,
+  couleur selon le type) et tableau trié par distance. GMSK 9 600 bauds : composante continue par moyenne centrée
+  (décalage de la clé affiché), trois seuils, horloge bit recalée sur les passages par zéro ; HDLC et CRC comme l'APRS.
+  Lecture des champs vérifiée sur les exemples de la documentation de gpsd ; sur un banc de 40 salves avec ±1,5 kHz de
+  décalage : toutes jusqu'à 15 dB de C/N, ~3/4 à 13 dB. Aussi dans SDR Web (`web/ais.js`, mêmes résultats).
 - **Fax météo (WEFAX)** (ondes courtes) : cartes des stations météo (DWD Pinneberg 3 855 · 7 880 · 13 882,5 kHz,
   Northwood, Athènes, Boston), choisies dans une liste (ou VFO en USB + 1,9 kHz) ; repris du décodeur d'IC-7300 Scope.
   Le module extrait le canal de la station dans les IQ (mode du VFO indifférent), attend le signal de départ, cale le
@@ -226,7 +234,7 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
 
 Déjà réalisées : stéréo + RDS en WFM, scanner de mémoires, scanner de fréquences, ADS-B,
 capteurs 433 MHz, pilotage rigctl (Gpredict), décodeur SSTV, décodeur CW, décodeur APRS, décodeur FT8/FT4,
-décodeur DMR (données), tonalités CTCSS / DTMF / 1750 Hz, enregistreur IQ, décodeur ACARS, fax météo, convertisseur HF,
+décodeur DMR (données), tonalités CTCSS / DTMF / 1750 Hz, enregistreur IQ, décodeur ACARS, fax météo, décodeur AIS, convertisseur HF,
 version navigateur (SDR Web).
 
 Restent : voix DMR (dsd-fme dans l'appli), envoi des trames APRS vers aprs.jerko.fr / APRS-IS,

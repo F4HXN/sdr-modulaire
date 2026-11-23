@@ -1,0 +1,3387 @@
+# SPDX-License-Identifier: MIT
+"""Décodeur AIS (navires) pour SDR Modulaire, sans logiciel externe.
+
+Les deux canaux AIS, 161,975 MHz (AIS 1, canal 87B) et 162,025 MHz (AIS 2, canal 88B), sont décodés en
+même temps, quel que soit le mode du VFO : le module extrait ses canaux des IQ (étage commun centré sur
+162,000 MHz, puis un canal de 48 kHz par fréquence).
+
+Démodulation : discriminateur FM → passe-bas → composante continue retirée par une moyenne glissante
+centrée (décalage de fréquence de la clé ou de l'émetteur, sans retard sur un changement de salve) →
+trois seuils en parallèle → horloge bit recalée sur les passages par zéro, décision au milieu de chaque
+bit, NRZI. Seules les salves sont démodulées (porteuse au-dessus du bruit, mesuré entre les salves). Trame HDLC : fanions,
+bits de bourrage, CRC-16 (le même que l'AX.25) ; les octets passent poids faible d'abord, les champs du
+message se lisent poids fort d'abord (chaque octet est retourné).
+
+Messages lus : positions (types 1, 2, 3 de la classe A ; 18 et 19 de la classe B), identité et voyage
+(type 5 : nom, indicatif, type de navire, dimensions, destination, heure d'arrivée ; type 24), stations
+de base (4) et aides à la navigation (21). Navires sur une carte (orientés selon leur route, couleur
+selon leur type) et dans un tableau. Même algorithme dans SDR Web (web/ais.js).
+
+Fond de carte : côtes et frontières du monde, Natural Earth 1:50m (domaine public), simplifiées.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import queue
+import threading
+import time
+
+import numpy as np
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen, QPolygonF
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel,
+                               QListWidget, QPushButton, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
+from scipy import signal
+
+from sdrmod.dsp import NCO, Decimateur, plan_decimation
+from sdrmod.modules import Module
+
+CANAUX = [(161_975_000, "A"), (162_025_000, "B")]
+MILIEU = 162_000_000
+TAUX_AIS = 48_000
+DEBIT = 9600
+SPB = TAUX_AIS / DEBIT                 # 5 échantillons par bit
+DEVIATION = 2400.0                     # Hz (GMSK, indice 0,5)
+# Réglages choisis sur un banc de 40 salves par niveau (C/N 11 à 25 dB, décalages de ±1,5 kHz) :
+SEUILS = (-300.0, 0.0, 300.0)          # seuils autour de la composante continue (Hz)
+FENETRE_DC = 400                       # composante continue : moyenne centrée sur 80 bits (retard de 40 bits)
+COUPURE = 4_800.0                      # passe-bas du discriminateur (Hz)
+LARGEUR_CANAL = 7_500.0                # filtre du canal (Hz) : GMSK ±4,8 kHz et un décalage de ±2,5 kHz
+
+
+# ======================================================================= trame
+def crc_hdlc(octets: bytes) -> int:
+    """CRC-16 de l'HDLC (comme l'AX.25) : polynôme 0x1021 réfléchi, init 0xFFFF, complémenté."""
+    c = 0xFFFF
+    for o in octets:
+        c ^= o
+        for _ in range(8):
+            c = (c >> 1) ^ 0x8408 if c & 1 else c >> 1
+    return c ^ 0xFFFF
+
+
+def passe_bas_2(fc: float, fs: float) -> tuple[float, float, float, float, float]:
+    """Butterworth d'ordre 2 (transformation bilinéaire) : b0, b1, b2, a1, a2. Même calcul dans ais.js."""
+    k = math.tan(math.pi * fc / fs)
+    q = 1 / (1 + math.sqrt(2) * k + k * k)
+    b0 = k * k * q
+    return b0, 2 * b0, b0, 2 * (k * k - 1) * q, (1 - math.sqrt(2) * k + k * k) * q
+
+
+def octets_vers_bits(o: bytes) -> list[int]:
+    """Octets reçus (poids faible d'abord) → bits du message (chaque octet lu poids fort d'abord)."""
+    return [(b >> (7 - k)) & 1 for b in o for k in range(8)]
+
+
+class _Trancheur:
+    """Un seuil : horloge bit recalée sur les passages par zéro, décision au milieu de chaque bit,
+    NRZI (pas de changement = 1), trames HDLC dont le CRC est juste."""
+
+    GAIN = 0.15                    # part de l'écart corrigée à chaque passage par zéro
+
+    def __init__(self, decalage: float) -> None:
+        self.decalage = decalage
+        self.prec = 0.0            # dernière valeur du bloc précédent
+        self.centre = SPB / 2      # instant (absolu) du prochain milieu de bit
+        self.niveau = 0            # niveau du bit précédent (NRZI)
+        self.reg = 0
+        self.uns = 0
+        self.bits: list[int] | None = None
+
+    def traiter(self, d: np.ndarray, t0: int, sortie: list) -> None:
+        x = np.concatenate(([self.prec], d - self.decalage))     # x[i] est l'échantillon t0 + i − 1
+        fin = t0 + len(d) - 1
+        signe = np.signbit(x)
+        passages = []
+        for i in np.flatnonzero(signe[1:] != signe[:-1]):
+            a, b = x[i], x[i + 1]
+            passages.append(t0 + i - 1 + (a / (a - b) if a != b else 0.5))
+        passages.append(math.inf)
+        for tp in passages:
+            limite = min(tp, fin)
+            while self.centre <= limite:                          # bits dont le milieu précède ce passage
+                k = int(round(self.centre)) - t0 + 1
+                v = x[min(max(k, 0), len(x) - 1)]
+                niveau = 1 if v > 0 else -1
+                self._bit(1 if niveau == self.niveau else 0, sortie, self.centre)
+                self.niveau = niveau
+                self.centre += SPB
+            if tp == math.inf:
+                break
+            # un passage devrait tomber un demi-bit avant le prochain milieu
+            e = tp - (self.centre - SPB / 2)
+            e -= SPB * round(e / SPB)
+            self.centre += self.GAIN * e
+        if len(d):
+            self.prec = float(x[-1])
+
+    def _bit(self, b: int, sortie: list, t: float) -> None:
+        self.reg = ((self.reg << 1) | b) & 0xFF
+        if self.reg == 0x7E:                              # fanion
+            if self.bits is not None and len(self.bits) >= 7 + 8 * 10:
+                bits = self.bits[:-7]
+                if len(bits) % 8 == 0:
+                    o = bytes(sum(bits[i + k] << k for k in range(8)) for i in range(0, len(bits), 8))
+                    if crc_hdlc(o[:-2]) == o[-2] | (o[-1] << 8):
+                        sortie.append((t, o[:-2]))
+            self.bits, self.uns = [], 0
+            return
+        if self.bits is None:
+            return
+        if b:
+            self.uns += 1
+            if self.uns > 6:
+                self.bits = None
+                return
+            self.bits.append(1)
+        else:
+            if self.uns == 5:                             # bit de bourrage
+                self.uns = 0
+                return
+            self.uns = 0
+            self.bits.append(0)
+        if len(self.bits) > 8 * 140:
+            self.bits = None
+
+
+class DemodGMSK:
+    """Discriminateur FM à 48 kHz (en Hz) → messages AIS (octets sans le CRC), chacun rendu une seule fois."""
+
+    def __init__(self) -> None:
+        b0, b1, b2, a1, a2 = passe_bas_2(COUPURE, TAUX_AIS)
+        self.sos = np.array([[b0, b1, b2, 1.0, a1, a2]])
+        self.zi = np.zeros((1, 2))
+        self.hist = np.zeros(FENETRE_DC - 1)
+        self.t = 0                 # échantillons reçus
+        self.td = -(FENETRE_DC // 2)   # instant (absolu) du premier échantillon de décision du prochain bloc
+        self.trancheurs = [_Trancheur(s) for s in SEUILS]
+        self.recents: list[tuple[float, bytes]] = []
+
+    def sauter(self, n: int) -> None:
+        """Bloc non démodulé (pas de porteuse) : le temps avance quand même."""
+        self.t += n
+        self.td += n
+        for tr in self.trancheurs:
+            tr.centre = max(tr.centre, self.td + SPB / 2)
+
+    def traiter(self, fm: np.ndarray) -> list[bytes]:
+        y, self.zi = signal.sosfilt(self.sos, fm.astype(np.float64), zi=self.zi)
+        # composante continue : moyenne exponentielle (récurrence du 1er ordre, à état)
+        # composante continue : moyenne glissante centrée (pas de retard sur un changement de décalage,
+        # peu de biais sur les suites de bits identiques), au prix d'un retard d'un demi-fenêtre
+        b = np.concatenate((self.hist, y))
+        m = np.convolve(b, np.full(FENETRE_DC, 1 / FENETRE_DC), "valid")
+        d = b[FENETRE_DC // 2:FENETRE_DC // 2 + len(m)] - m
+        self.hist = b[len(b) - (FENETRE_DC - 1):]
+        trouvees: list = []
+        for tr in self.trancheurs:
+            tr.traiter(d, self.td, trouvees)
+        self.td += len(d)
+        self.t += len(fm)
+        nouvelles = []
+        for t, o in sorted(trouvees, key=lambda e: e[0]):
+            if any(o == r and abs(t - tr) < 20 * SPB for tr, r in self.recents):
+                continue                                  # même salve trouvée par un autre seuil
+            self.recents.append((t, o))
+            nouvelles.append(o)
+        self.recents = [(t, o) for t, o in self.recents if self.t - t < TAUX_AIS]
+        return nouvelles
+
+
+# ======================================================================= messages
+TEXTE6 = "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_ !\"#$%&'()*+,-./0123456789:;<=>?"
+STATUTS = {0: "en route au moteur", 1: "au mouillage", 2: "non maître de sa manœuvre", 3: "manœuvrabilité restreinte",
+           4: "handicapé par son tirant d'eau", 5: "amarré", 6: "échoué", 7: "en pêche", 8: "en route à la voile",
+           14: "AIS-SART (détresse)"}
+AIDES = {1: "point de référence", 3: "feu", 5: "feu", 6: "feu", 9: "bouée cardinale nord", 10: "bouée cardinale est",
+         11: "bouée cardinale sud", 12: "bouée cardinale ouest", 13: "bouée bâbord", 14: "bouée tribord",
+         19: "bouée de danger isolé", 20: "bouée d'eaux saines", 21: "bouée spéciale", 22: "balise",
+         24: "bouée cardinale nord", 25: "bouée cardinale est", 26: "bouée cardinale sud", 27: "bouée cardinale ouest",
+         28: "bouée bâbord", 29: "bouée tribord", 30: "bouée de danger isolé", 31: "bouée d'eaux saines"}
+
+
+def _u(b: list[int], a: int, n: int) -> int:
+    v = 0
+    for k in range(a, a + n):
+        v = (v << 1) | (b[k] if k < len(b) else 0)
+    return v
+
+
+def _s(b: list[int], a: int, n: int) -> int:
+    v = _u(b, a, n)
+    return v - (1 << n) if v >> (n - 1) else v
+
+
+def _t(b: list[int], a: int, n: int) -> str:
+    return "".join(TEXTE6[_u(b, a + k, 6)] for k in range(0, n, 6) if a + k + 6 <= len(b)) \
+        .split("@")[0].strip()
+
+
+def _position(b: list[int], a_lon: int, a_lat: int) -> tuple[float, float] | None:
+    lon, lat = _s(b, a_lon, 28) / 600_000, _s(b, a_lat, 27) / 600_000
+    return None if abs(lon) > 180 or abs(lat) > 90 else (lat, lon)
+
+
+def categorie(type_navire: int | None) -> str:
+    t = type_navire or 0
+    if t == 30:
+        return "pêche"
+    if t in (36, 37):
+        return "voilier ou plaisance"
+    if t in (31, 32, 33, 34, 50, 51, 52, 53, 54, 55, 58) or t == 35:
+        return "service, remorqueur, pilote"
+    if 40 <= t <= 49:
+        return "grande vitesse"
+    if 60 <= t <= 69:
+        return "passagers"
+    if 70 <= t <= 79:
+        return "cargo"
+    if 80 <= t <= 89:
+        return "pétrolier, citerne"
+    return "autre ou inconnu"
+
+
+def decoder_message(b: list[int]) -> dict | None:
+    """Bits du message (poids fort d'abord) → champs. None si le message est trop court."""
+    if len(b) < 38:
+        return None
+    t = _u(b, 0, 6)
+    m = {"type": t, "mmsi": _u(b, 8, 30)}
+    if t in (1, 2, 3) and len(b) >= 149:
+        m.update(statut=_u(b, 38, 4), vitesse=_u(b, 50, 10), position=_position(b, 61, 89),
+                 route=_u(b, 116, 12), cap=_u(b, 128, 9), classe="A")
+    elif t in (18, 19) and len(b) >= 142:
+        m.update(vitesse=_u(b, 46, 10), position=_position(b, 57, 85), route=_u(b, 112, 12), cap=_u(b, 124, 9),
+                 classe="B")
+        if t == 19 and len(b) >= 271:
+            m.update(nom=_t(b, 143, 120), type_navire=_u(b, 263, 8))
+    elif t == 4 and len(b) >= 134:
+        m.update(position=_position(b, 79, 107), classe="station de base",
+                 heure_utc=f"{_u(b, 38, 14):04d}-{_u(b, 52, 4):02d}-{_u(b, 56, 5):02d} "
+                           f"{_u(b, 61, 5):02d}:{_u(b, 66, 6):02d}:{_u(b, 72, 6):02d}")
+    elif t == 5 and len(b) >= 422:
+        m.update(imo=_u(b, 40, 30), indicatif=_t(b, 70, 42), nom=_t(b, 112, 120), type_navire=_u(b, 232, 8),
+                 longueur=_u(b, 240, 9) + _u(b, 249, 9), largeur=_u(b, 258, 6) + _u(b, 264, 6),
+                 eta=(_u(b, 274, 4), _u(b, 278, 5), _u(b, 283, 5), _u(b, 288, 6)), tirant=_u(b, 294, 8) / 10,
+                 destination=_t(b, 302, 120), classe="A")
+    elif t == 24 and len(b) >= 160:
+        if _u(b, 38, 2) == 0:
+            m.update(nom=_t(b, 40, 120), classe="B")
+        elif len(b) >= 162:
+            m.update(type_navire=_u(b, 40, 8), indicatif=_t(b, 90, 42), longueur=_u(b, 132, 9) + _u(b, 141, 9),
+                     largeur=_u(b, 150, 6) + _u(b, 156, 6), classe="B")
+    elif t == 21 and len(b) >= 219:
+        m.update(aide=_u(b, 38, 5), nom=_t(b, 43, 120), position=_position(b, 164, 192), classe="aide à la navigation")
+    return m
+
+
+def texte_message(m: dict, canal: str) -> str:
+    morceaux = [f"{canal}  MMSI {m['mmsi']:09d}", f"type {m['type']}"]
+    if m.get("nom"):
+        morceaux.append(m["nom"])
+    if m.get("indicatif"):
+        morceaux.append(m["indicatif"])
+    if m.get("vitesse") is not None and m["vitesse"] != 1023:
+        morceaux.append(f"{m['vitesse'] / 10:.1f} nd".replace(".", ","))
+    if m.get("route") is not None and m["route"] < 3600:
+        morceaux.append(f"route {m['route'] / 10:.0f}°")
+    if m.get("statut") in STATUTS:
+        morceaux.append(STATUTS[m["statut"]])
+    if m.get("position"):
+        la, lo = m["position"]
+        morceaux.append(f"{abs(la):.4f} {'N' if la >= 0 else 'S'} {abs(lo):.4f} {'E' if lo >= 0 else 'O'}".replace(".", ","))
+    if m.get("type_navire"):
+        morceaux.append(categorie(m["type_navire"]))
+    if m.get("destination"):
+        morceaux.append(f"→ {m['destination']}")
+    if m.get("aide") in AIDES:
+        morceaux.append(AIDES[m["aide"]])
+    if m.get("heure_utc"):
+        morceaux.append(f"{m['heure_utc']} UTC")
+    return " · ".join(morceaux)
+
+
+# ---------------------------------------------------------------- NMEA et émission (essais)
+def bits_depuis_nmea(charge: str, remplissage: int = 0) -> list[int]:
+    """Charge utile d'une phrase !AIVDM (armure 6 bits) → bits du message."""
+    bits = []
+    for c in charge:
+        v = ord(c) - 48
+        v = v - 8 if v > 40 else v
+        bits += [(v >> (5 - k)) & 1 for k in range(6)]
+    return bits[:len(bits) - remplissage] if remplissage else bits
+
+
+def bits_emis(bits_message: list[int]) -> list[int]:
+    """Bits d'une salve AIS avant NRZI : séquence d'apprentissage, fanion, message et CRC avec bourrage, fanion."""
+    b = list(bits_message) + [0] * (-len(bits_message) % 8)
+    octets = bytes(sum(b[i + k] << (7 - k) for k in range(8)) for i in range(0, len(b), 8))
+    crc = crc_hdlc(octets)
+    donnees = [(o >> k) & 1 for o in octets + bytes([crc & 0xFF, crc >> 8]) for k in range(8)]
+    bourre, uns = [], 0
+    for x in donnees:
+        bourre.append(x)
+        uns = uns + 1 if x else 0
+        if uns == 5:
+            bourre.append(0)
+            uns = 0
+    fanion = [0, 1, 1, 1, 1, 1, 1, 0]
+    return [0, 1] * 12 + fanion + bourre + fanion + [0] * 4
+
+
+# ======================================================================= carte des navires
+COULEURS = {"pêche": "#ffb74d", "voilier ou plaisance": "#d98cff", "service, remorqueur, pilote": "#00e5ff",
+            "grande vitesse": "#ffd166", "passagers": "#4fc3f7", "cargo": "#39ff9f", "pétrolier, citerne": "#ff5c5c",
+            "autre ou inconnu": "#9fb3c8"}
+
+
+def couleur_navire(n: dict) -> QColor:
+    if n.get("classe") == "station de base":
+        return QColor("#ffffff")
+    if n.get("classe") == "aide à la navigation":
+        return QColor("#ffd166")
+    return QColor(COULEURS[categorie(n.get("type_navire"))])
+
+
+def distance_km(lat1, lon1, lat2, lon2):
+    a = math.sin(math.radians(lat2 - lat1) / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(
+        math.radians(lat2)) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
+    return 12742 * math.asin(math.sqrt(a))
+
+
+def _anciennete(t: float) -> str:
+    s = time.time() - t
+    return f"{s:.0f} s" if s < 90 else f"{s / 60:.0f} min" if s < 5400 else f"{s / 3600:.0f} h"
+
+
+def nom_navire(n: dict) -> str:
+    return n.get("nom") or f"{n['mmsi']:09d}"
+
+
+class CarteNavires(QWidget):
+    """Carte (comme celle de l'APRS) : côtes, frontières, cercles de distance, navires orientés selon leur
+    route avec leur trace. Molette : zoom ; glisser : déplacer ; clic : choisir ; double-clic : recentrer."""
+
+    KM_DEG = 111.32
+
+    def __init__(self, sur_choix=None) -> None:
+        super().__init__()
+        self.setMinimumSize(360, 240)
+        self.lat0, self.lon0, self.km_px = 46.6, 2.4, 2.5
+        self.navires: list[dict] = []
+        self.station = None
+        self.selection = None
+        self.sur_choix = sur_choix
+        self._glisse = None
+        self._cotes = [self._decoder(l) for l in CARTE["cotes"]]
+        self._frontieres = [self._decoder(l) for l in CARTE["frontieres"]]
+
+    @staticmethod
+    def _decoder(l):
+        v = np.cumsum(np.array(l, dtype=np.float64).reshape(-1, 2), axis=0) / 100
+        return v, (v[:, 1].min(), v[:, 1].max(), v[:, 0].min(), v[:, 0].max())
+
+    def vers_ecran(self, lat, lon):
+        return QPointF(self.width() / 2 + (lon - self.lon0) * math.cos(math.radians(self.lat0)) * self.KM_DEG / self.km_px,
+                       self.height() / 2 - (lat - self.lat0) * self.KM_DEG / self.km_px)
+
+    def vers_geo(self, x, y):
+        lat = self.lat0 - (y - self.height() / 2) * self.km_px / self.KM_DEG
+        return lat, self.lon0 + (x - self.width() / 2) * self.km_px / (self.KM_DEG * math.cos(math.radians(self.lat0)))
+
+    def centrer(self):
+        pos = self.navires
+        if self.station:
+            self.lat0, self.lon0 = self.station
+        elif pos:
+            self.lat0 = sum(n["lat"] for n in pos) / len(pos)
+            self.lon0 = sum(n["lon"] for n in pos) / len(pos)
+        rayon = 10.0
+        for n in pos:
+            rayon = max(rayon, distance_km(self.lat0, self.lon0, n["lat"], n["lon"]) * 1.15)
+        self.km_px = max(0.01, min(50.0, 2 * rayon / max(1, min(self.width(), self.height()))))
+        self.update()
+
+    def wheelEvent(self, e):
+        x, y = e.position().x(), e.position().y()
+        lat, lon = self.vers_geo(x, y)
+        self.km_px = max(0.01, min(50.0, self.km_px * (1 / 1.2 if e.angleDelta().y() > 0 else 1.2)))
+        q = self.vers_ecran(lat, lon)
+        self.lat0, self.lon0 = self.vers_geo(self.width() / 2 + q.x() - x, self.height() / 2 + q.y() - y)
+        self.update()
+
+    def mousePressEvent(self, e):
+        self._glisse = [e.position().x(), e.position().y(), False]
+
+    def mouseMoveEvent(self, e):
+        if not self._glisse:
+            return
+        x, y = e.position().x(), e.position().y()
+        dx, dy = x - self._glisse[0], y - self._glisse[1]
+        if abs(dx) + abs(dy) > 2:
+            self._glisse[2] = True
+        if self._glisse[2]:
+            self.lat0, self.lon0 = self.vers_geo(self.width() / 2 - dx, self.height() / 2 - dy)
+            self._glisse[:2] = [x, y]
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        if self._glisse and not self._glisse[2]:
+            x, y, meilleur, dmin = e.position().x(), e.position().y(), None, 18
+            for n in self.navires:
+                q = self.vers_ecran(n["lat"], n["lon"])
+                d = math.hypot(q.x() - x, q.y() - y)
+                if d < dmin:
+                    meilleur, dmin = n["mmsi"], d
+            self.selection = meilleur
+            if self.sur_choix:
+                self.sur_choix(meilleur)
+            self.update()
+        self._glisse = None
+
+    def mouseDoubleClickEvent(self, e):
+        self.lat0, self.lon0 = self.vers_geo(e.position().x(), e.position().y())
+        self.update()
+
+    def paintEvent(self, _e):
+        g = QPainter(self)
+        g.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        g.fillRect(self.rect(), QColor("#040912"))
+        mono = QFont("monospace")
+        mono.setPixelSize(11)
+        g.setFont(mono)
+        ref = self.station or (self.lat0, self.lon0)
+        c = self.vers_ecran(*ref)
+        pas = next((p for p in (1, 2, 5, 10, 25, 50, 100, 200, 500) if p / self.km_px > 70), 500)
+        g.setPen(QPen(QColor(57, 255, 159, 40), 1))
+        for i in range(1, 13):
+            r = i * pas / self.km_px
+            g.drawEllipse(c, r, r)
+        g.setPen(QColor(57, 255, 159, 140))
+        for i in range(1, 13):
+            g.drawText(QPointF(c.x() + 4, c.y() - i * pas / self.km_px - 3), f"{i * pas} km")
+        for lignes, couleur, tirets in ((self._cotes, QColor(0, 229, 255, 140), False),
+                                        (self._frontieres, QColor(0, 229, 255, 72), True)):
+            stylo = QPen(couleur, 1.2 if not tirets else 1)
+            if tirets:
+                stylo.setDashPattern([4, 4])
+            g.setPen(stylo)
+            lat_h, lon_g = self.vers_geo(0, 0)
+            lat_b, lon_d = self.vers_geo(W, H)
+            kx = math.cos(math.radians(self.lat0)) * self.KM_DEG / self.km_px
+            ky = self.KM_DEG / self.km_px
+            for v, (a, b, c_, d) in lignes:
+                if b < lat_b or a > lat_h or d < lon_g or c_ > lon_d:
+                    continue
+                xs = W / 2 + (v[:, 0] - self.lon0) * kx
+                ys = H / 2 - (v[:, 1] - self.lat0) * ky
+                g.drawPolyline(QPolygonF([QPointF(x, y) for x, y in zip(xs.tolist(), ys.tolist())]))
+        if self.station:
+            g.setPen(Qt.PenStyle.NoPen)
+            g.setBrush(QColor("#ffd166"))
+            g.drawEllipse(c, 4, 4)
+            g.setPen(QColor("#ffd166"))
+            g.drawText(QPointF(c.x() + 7, c.y() + 14), "Station")
+        gras = QFont(mono)
+        gras.setBold(True)
+        maintenant = time.time()
+        for n in self.navires:
+            coul = couleur_navire(n)
+            choisi = n["mmsi"] == self.selection
+            vieux = maintenant - n["vu"] > 10 * 60
+            p = self.vers_ecran(n["lat"], n["lon"])
+            if len(n["trace"]) > 1:
+                tr = QColor(coul)
+                tr.setAlphaF(0.9 if choisi else 0.45)
+                g.setPen(QPen(tr, 2 if choisi else 1.2))
+                g.setBrush(Qt.BrushStyle.NoBrush)
+                g.drawPolyline(QPolygonF([self.vers_ecran(la, lo) for la, lo, _ in n["trace"]]))
+            g.setOpacity(0.45 if vieux else 1)
+            g.setPen(QPen(QColor("#040912"), 1.2))
+            g.setBrush(coul)
+            classe = n.get("classe")
+            route = n.get("route_deg")
+            if classe == "station de base":
+                g.drawRect(QRectF(p.x() - 4.5, p.y() - 4.5, 9, 9))
+            elif classe == "aide à la navigation":
+                g.drawPolygon(QPolygonF([QPointF(p.x(), p.y() - 6), QPointF(p.x() + 6, p.y()),
+                                         QPointF(p.x(), p.y() + 6), QPointF(p.x() - 6, p.y())]))
+            elif route is not None and (n.get("vitesse_nd") or 0) >= 0.5:
+                g.save()
+                g.translate(p)
+                g.rotate(route)
+                g.drawPolygon(QPolygonF([QPointF(0, -10), QPointF(4, -3), QPointF(4, 7), QPointF(-4, 7),
+                                         QPointF(-4, -3)]))           # coque : étrave pointue vers la route
+                # vecteur vitesse : chemin parcouru en 6 minutes
+                long_px = n["vitesse_nd"] * 1.852 * 0.1 / self.km_px
+                g.setPen(QPen(coul, 1))
+                g.drawLine(QPointF(0, -10), QPointF(0, -10 - long_px))
+                g.restore()
+            else:
+                g.drawEllipse(p, 4.5, 4.5)
+            if choisi:
+                g.setPen(QPen(QColor("white"), 1.5))
+                g.setBrush(Qt.BrushStyle.NoBrush)
+                g.drawEllipse(p, 13, 13)
+            g.setFont(gras)
+            g.setPen(QColor("#e6f1ff"))
+            g.drawText(QPointF(p.x() + 10, p.y() - 2), nom_navire(n))
+            g.setFont(mono)
+            g.setPen(coul)
+            v = n.get("vitesse_nd")
+            g.drawText(QPointF(p.x() + 10, p.y() + 11),
+                       (f"{v:.1f} nd · " if v is not None else "").replace(".", ",") + _anciennete(n["vu"]))
+            g.setOpacity(1)
+        g.fillRect(QRectF(8, H - 26, 250, 18), QColor(4, 9, 18, 190))
+        g.setPen(QColor("#9fb3c8"))
+        g.drawText(QPointF(14, H - 13), f"cercles tous les {pas} km · molette : zoom")
+        g.end()
+
+
+class FenetreCarteAIS(QWidget):
+    """Fenêtre séparée : carte à gauche, navires à droite, position de la station."""
+
+    COLONNES = ["Navire", "MMSI", "Type", "Vitesse", "Route", "Dist.", "Vu", "Destination"]
+
+    def __init__(self, module: "DecodeurAIS") -> None:
+        super().__init__(None, Qt.WindowType.Window)
+        self.module = module
+        self.setWindowTitle("AIS · navires reçus — SDR Modulaire")
+        self.resize(1200, 640)
+        self.carte = CarteNavires(sur_choix=self._choix_carte)
+        self.carte.station = module.station
+        self.tableau = QTableWidget(0, len(self.COLONNES))
+        self.tableau.setHorizontalHeaderLabels(self.COLONNES)
+        self.tableau.verticalHeader().hide()
+        self.tableau.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tableau.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tableau.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tableau.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.tableau.horizontalHeader().setStretchLastSection(True)
+        self.tableau.cellClicked.connect(self._choix_tableau)
+        self.resume = QLabel()
+        recentrer = QPushButton("Recentrer")
+        recentrer.clicked.connect(self.carte.centrer)
+        self.lat, self.lon = QDoubleSpinBox(), QDoubleSpinBox()
+        for boite, borne in ((self.lat, 90), (self.lon, 180)):
+            boite.setRange(-borne, borne)
+            boite.setDecimals(4)
+            boite.setSingleStep(0.01)
+        if module.station:
+            self.lat.setValue(module.station[0])
+            self.lon.setValue(module.station[1])
+        enregistrer = QPushButton("Enregistrer la station")
+        enregistrer.clicked.connect(self._station)
+        oublier = QPushButton("Sans station")
+        oublier.clicked.connect(lambda: self._station(effacer=True))
+        haut = QHBoxLayout()
+        haut.addWidget(self.resume, 1)
+        haut.addWidget(recentrer)
+        bas = QHBoxLayout()
+        for w in (QLabel("Station : lat."), self.lat, QLabel("lon."), self.lon, enregistrer, oublier):
+            bas.addWidget(w)
+        aide = QLabel("Facultatif : sert aux distances et aux cercles (reprise des modules APRS ou ADS-B si déjà saisie).")
+        aide.setStyleSheet("color: gray")
+        bas.addWidget(aide, 1)
+        separateur = QSplitter()
+        separateur.addWidget(self.carte)
+        separateur.addWidget(self.tableau)
+        separateur.setSizes([720, 480])
+        lay = QVBoxLayout(self)
+        lay.addLayout(haut)
+        lay.addWidget(separateur, 1)
+        lay.addLayout(bas)
+        self._premier = True
+
+    def _station(self, effacer=False):
+        st = None if effacer else (self.lat.value(), self.lon.value())
+        self.module.regler_station(st)
+        self.carte.station = st
+        self.carte.centrer()
+        self.actualiser()
+
+    def _choix_carte(self, mmsi):
+        self.carte.selection = mmsi
+        self.actualiser()
+
+    def _choix_tableau(self, ligne, _col):
+        item = self.tableau.item(ligne, 1)
+        n = self.module.navires.get(int(item.text())) if item else None
+        if n and "lat" in n:
+            self.carte.selection = n["mmsi"]
+            self.carte.lat0, self.carte.lon0 = n["lat"], n["lon"]
+            self.carte.update()
+
+    def actualiser(self):
+        tous = self.module.trier_navires()
+        places = [n for n in tous if "lat" in n]
+        self.resume.setText(f"{len(tous)} navire(s) et station(s) · {len(places)} placé(s) · "
+                            f"{self.module.nombre} message(s)")
+        self.carte.navires = places
+        if self._premier and places:
+            self._premier = False
+            self.carte.centrer()
+        self.carte.update()
+        st = self.module.station
+        self.tableau.setRowCount(len(tous))
+        for i, n in enumerate(tous):
+            v = n.get("vitesse_nd")
+            r = n.get("route_deg")
+            valeurs = [nom_navire(n) if n.get("nom") else ("station côtière" if n.get("classe") == "station de base"
+                                                           else "—"), f"{n['mmsi']:09d}",
+                       n.get("classe") if n.get("classe") in ("station de base", "aide à la navigation")
+                       else categorie(n.get("type_navire")) if n.get("type_navire") else "",
+                       f"{v:.1f} nd".replace(".", ",") if v is not None else "",
+                       f"{r:.0f}°" if r is not None else "",
+                       f"{distance_km(*st, n['lat'], n['lon']):.1f} km".replace(".", ",") if st and "lat" in n else "",
+                       time.strftime("%H:%M:%S", time.localtime(n["vu"])), n.get("destination", "")]
+            for j, x in enumerate(valeurs):
+                item = QTableWidgetItem(str(x))
+                if j == 0 and n.get("classe") != "station de base":     # le blanc de la carte ne se lit pas ici
+                    item.setForeground(couleur_navire(n))
+                self.tableau.setItem(i, j, item)
+            if n["mmsi"] == self.carte.selection:
+                self.tableau.selectRow(i)
+
+
+# ======================================================================= module
+class NCORapide(NCO):
+    """NCO dont l'oscillateur d'un bloc est calculé une fois pour toutes (blocs de taille constante)."""
+
+    _cle = None
+
+    def melanger(self, x: np.ndarray) -> np.ndarray:
+        n = len(x)
+        w = -2.0 * np.pi * self.freq / self.fs
+        if self._cle != (n, w):
+            self._cle = (n, w)
+            self._base = np.exp(1j * w * np.arange(n)).astype(np.complex64)
+        y = x * self._base
+        y *= np.complex64(np.exp(1j * self._phase))
+        self._phase = (self._phase + w * n) % (2.0 * np.pi)
+        return y
+
+
+class Canal:
+    """Un canal AIS : IQ de l'étage commun → 48 kHz → discriminateur → messages."""
+
+    def __init__(self, frequence: int, nom: str, fs: float, d2: int) -> None:
+        self.frequence, self.nom = frequence, nom
+        self.nco = NCORapide(fs)
+        self.dec = Decimateur(d2, fs, LARGEUR_CANAL)
+        self.prec = 0j
+        self.attente = None        # bloc précédent, pas encore démodulé (début de salve)
+        self.actif = 0
+        self.decalage = None       # décalage de fréquence moyen mesuré pendant les salves (Hz)
+        self.demod = DemodGMSK()
+        self.messages = 0
+        self.crete = None
+        self.bruit = None
+
+    def traiter(self, y: np.ndarray, centre: float) -> list[bytes]:
+        self.nco.freq = self.frequence - centre
+        z = self.dec.traiter(self.nco.melanger(y))
+        if not len(z):
+            return []
+        # puissance sur des fenêtres de 2 ms : le plancher se mesure entre les salves, même sur un canal chargé
+        q = np.abs(z[: len(z) // 96 * 96]) ** 2
+        fen = 10 * np.log10(q.reshape(-1, 96).mean(axis=1) + 1e-20) if len(q) else np.array([-200.0])
+        pmin, p = float(fen.min()), float(fen.max())
+        self.bruit = pmin if self.bruit is None else min(pmin, self.bruit + 0.02)
+        self.crete = p if self.crete is None else max(p, self.crete - 0.3)
+        zz = np.concatenate(([self.prec], z))
+        self.prec = z[-1]
+        fm = np.angle(zz[1:] * np.conj(zz[:-1])) * (TAUX_AIS / (2 * np.pi))
+        # Les messages AIS sont des salves de 27 ms : on ne démodule que quand une porteuse dépasse le
+        # bruit (plus le bloc d'avant, où commence la salve, et un bloc après).
+        if p > self.bruit + 4:
+            self.actif = 2
+            m = float(np.median(fm))
+            self.decalage = m if self.decalage is None else 0.8 * self.decalage + 0.2 * m
+        sortie = []
+        if self.actif > 0:
+            self.actif -= 1
+            if self.attente is not None:
+                sortie += self.demod.traiter(self.attente)
+            sortie += self.demod.traiter(fm)
+            self.attente = None
+        else:
+            if self.attente is not None:
+                self.demod.sauter(len(self.attente))
+            self.attente = fm
+        self.messages += len(sortie)
+        return sortie
+
+
+class MoteurAIS:
+    """IQ de la clé → messages des canaux AIS qui sont dans la bande reçue : (canal, octets)."""
+
+    def __init__(self, centre: float, taux: int) -> None:
+        lim = 0.42 * taux - 15_000
+        self.dedans = [(f, n) for f, n in CANAUX if abs(f - centre) < lim]
+        self.dehors = [(f, n) for f, n in CANAUX if abs(f - centre) >= lim]
+        d1, d2 = plan_decimation(taux, TAUX_AIS)
+        self.fs = taux / d1
+        self.nco = NCORapide(taux)
+        self.nco.freq = MILIEU - centre
+        self.dec = Decimateur(d1, taux, min(0.42 * self.fs, 45_000)) if d1 > 1 else None
+        self.canaux = [Canal(f, n, self.fs, d2) for f, n in self.dedans]
+
+    def traiter(self, iq: np.ndarray) -> list[tuple[str, bytes]]:
+        if not self.canaux:
+            return []
+        y = self.nco.melanger(iq)
+        if self.dec is not None:
+            y = self.dec.traiter(y)
+        sortie = []
+        for c in self.canaux:
+            sortie += [(c.nom, o) for o in c.traiter(y, MILIEU)]
+        return sortie
+
+
+class DecodeurAIS(Module):
+    nom = "Décodeur AIS (navires)"
+    description = ("Navires et stations côtières (AIS, 161,975 et 162,025 MHz décodés ensemble) : nom, MMSI, "
+                   "position, vitesse, route, type, destination ; carte et tableau. Sans logiciel externe.")
+
+    def demarrer(self) -> None:
+        self.blocs: queue.Queue = queue.Queue(maxsize=16)
+        self.recus: queue.Queue = queue.Queue()
+        self.etat = {"instant": 0.0, "canaux": [], "dehors": [], "perdus": 0, "calcul": 0.0, "saturation": 0.0}
+        self.navires: dict[int, dict] = {}
+        self.nombre = 0
+        self.journal = None
+        self.carte = None
+        self.station = self._lire_station()
+        self._actif = True
+        self._fil = threading.Thread(target=self._boucle, name="decodeur-ais", daemon=True)
+        self._fil.start()
+        self.abonner("iq", self._sur_iq)
+
+    def _sur_iq(self, iq: np.ndarray, centre: float, taux: int) -> None:
+        try:
+            self.blocs.put_nowait((iq, centre, taux))
+        except queue.Full:
+            self.etat["perdus"] += 1
+
+    def _boucle(self) -> None:
+        moteur, cle = None, None
+        while self._actif:
+            try:
+                tache = self.blocs.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if tache is None:
+                break
+            iq, centre, taux = tache
+            debut = time.perf_counter()
+            if (centre, taux) != cle:
+                cle = (centre, taux)
+                moteur = MoteurAIS(centre, taux)
+            sat = float(np.mean((np.abs(iq.real) > 0.95) | (np.abs(iq.imag) > 0.95)))
+            for canal, o in moteur.traiter(iq):
+                m = decoder_message(octets_vers_bits(o))
+                if m:
+                    self.recus.put((canal, m))
+            e = self.etat
+            e.update(instant=time.monotonic(), dehors=[f for f, _ in moteur.dehors], saturation=sat,
+                     canaux=[(c.nom, c.frequence, (c.crete or -99) - (c.bruit or -99), c.messages, c.decalage)
+                             for c in moteur.canaux])
+            e["calcul"] = 0.9 * e["calcul"] + 0.1 * (time.perf_counter() - debut) / (len(iq) / taux)
+
+    # ------------------------------------------------------------- navires
+    def mettre_a_jour(self, m: dict) -> None:
+        maintenant = time.time()
+        n = self.navires.setdefault(m["mmsi"], {"mmsi": m["mmsi"], "nb": 0, "trace": []})
+        n["vu"] = maintenant
+        n["nb"] += 1
+        for cle in ("nom", "indicatif", "type_navire", "destination", "classe", "longueur", "largeur", "imo"):
+            if m.get(cle) not in (None, "", 0):
+                n[cle] = m[cle]
+        if m.get("vitesse") is not None:
+            n["vitesse_nd"] = None if m["vitesse"] == 1023 else m["vitesse"] / 10
+        if m.get("route") is not None or m.get("cap") is not None:
+            route = m.get("route")
+            cap = m.get("cap")
+            n["route_deg"] = cap if cap is not None and cap < 360 else (route / 10 if route is not None and route < 3600 else None)
+        if m.get("statut") is not None:
+            n["statut"] = m["statut"]
+        if m.get("position"):
+            la, lo = m["position"]
+            n["lat"], n["lon"] = la, lo
+            if not n["trace"] or n["trace"][-1][:2] != (la, lo):
+                n["trace"].append((la, lo, maintenant))
+                del n["trace"][:-200]
+
+    def trier_navires(self) -> list[dict]:
+        st = self.station
+        if st:
+            return sorted(self.navires.values(),
+                          key=lambda n: distance_km(*st, n["lat"], n["lon"]) if "lat" in n else 1e9)
+        return sorted(self.navires.values(), key=lambda n: -n["vu"])
+
+    def _lire_station(self):
+        for nom in ("decodeur_ais", "decodeur_aprs", "adsb"):
+            try:
+                st = json.loads((self.ctx.dossier_donnees(nom) / "station.json").read_text())
+                return (float(st["lat"]), float(st["lon"]))
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        return None
+
+    def regler_station(self, st) -> None:
+        self.station = st
+        fichier = self.ctx.dossier_donnees("decodeur_ais") / "station.json"
+        try:
+            if st:
+                fichier.write_text(json.dumps({"lat": st[0], "lon": st[1]}))
+            else:
+                fichier.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------- interface
+    def creer_widget(self) -> QWidget:
+        w = QWidget()
+        w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+        ligne = QHBoxLayout()
+        self.resume = QLabel("—")
+        self.resume.setWordWrap(True)
+        accorder = QPushButton("Accorder")
+        accorder.setToolTip("Met la clé sur les deux canaux AIS (VFO sur 161,975 MHz en NFM pour écouter)")
+        accorder.clicked.connect(self.accorder)
+        ligne.addWidget(self.resume, 1)
+        ligne.addWidget(accorder)
+        lay.addLayout(ligne)
+        self.statut = QLabel("—")
+        self.statut.setWordWrap(True)
+        lay.addWidget(self.statut)
+        self.diag = QLabel("")
+        self.diag.setWordWrap(True)
+        self.diag.setStyleSheet("color: gray")
+        self.diag.setToolTip("Par canal : crête au-dessus du bruit et messages reçus ; part du temps réel utilisée")
+        lay.addWidget(self.diag)
+        self.liste = QListWidget()
+        self.liste.setWordWrap(True)
+        self.liste.setMaximumHeight(9 * self.liste.fontMetrics().lineSpacing())
+        lay.addWidget(self.liste)
+        boutons = QHBoxLayout()
+        carte = QPushButton("Carte")
+        carte.setToolTip("Navires sur une carte, avec le tableau")
+        carte.clicked.connect(self.ouvrir_carte)
+        effacer = QPushButton("Effacer")
+        effacer.clicked.connect(self.liste.clear)
+        copier = QPushButton("Copier")
+        copier.clicked.connect(lambda: QGuiApplication.clipboard().setText(
+            "\n".join(self.liste.item(i).text() for i in range(self.liste.count() - 1, -1, -1))))
+        self.c_journal = QCheckBox("Journal")
+        self.c_journal.setToolTip("Enregistre les messages, horodatés, dans le dossier du module")
+        self.c_journal.toggled.connect(self._basculer_journal)
+        for b in (carte, effacer, copier, self.c_journal):
+            boutons.addWidget(b)
+        lay.addLayout(boutons)
+        self.minuterie = QTimer(w, interval=250, timeout=self._rafraichir)
+        self.minuterie.start()
+        self._rafraichir()
+        return w
+
+    def accorder(self) -> None:
+        taux = self.ctx.taux()
+        self.ctx.regler_mode("NFM")
+        self.ctx.regler_frequence(CANAUX[0][0] + taux)          # force le recentrage de la clé…
+        self.ctx.regler_frequence(CANAUX[0][0])                 # … qui couvre alors les deux canaux
+
+    def ouvrir_carte(self) -> None:
+        if self.carte is None:
+            self.carte = FenetreCarteAIS(self)
+        self.carte.actualiser()
+        self.carte.show()
+        self.carte.raise_()
+        self.carte.activateWindow()
+
+    def _basculer_journal(self, actif: bool) -> None:
+        if actif:
+            nom = time.strftime("ais_%Y%m%d.txt")
+            self.journal = open(self.ctx.dossier_donnees("decodeur_ais") / nom, "a", encoding="utf-8")
+        elif self.journal:
+            self.journal.close()
+            self.journal = None
+
+    def _rafraichir(self) -> None:
+        nouveau = False
+        while True:
+            try:
+                canal, m = self.recus.get_nowait()
+            except queue.Empty:
+                break
+            self.nombre += 1
+            self.mettre_a_jour(m)
+            nouveau = True
+            ligne = f"{time.strftime('%H:%M:%S')}  {texte_message(m, canal)}"
+            self.liste.insertItem(0, ligne)
+            if self.liste.count() > 500:
+                self.liste.takeItem(500)
+            if self.journal:
+                self.journal.write(ligne + "\n")
+                self.journal.flush()
+        e = self.etat
+        if time.monotonic() - e["instant"] > 1.5:
+            self.statut.setText("En attente des échantillons du récepteur.")
+        elif not e["canaux"]:
+            self.statut.setText("Les canaux AIS (161,975 et 162,025 MHz) ne sont pas dans la bande reçue : "
+                                "cliquez sur « Accorder ».")
+        else:
+            dehors = (f" · hors de la bande : {', '.join(f'{f / 1e6:.3f}' for f in e['dehors'])} MHz"
+                      .replace(".", ",") if e["dehors"] else "")
+            sat = (f" · SATURATION {100 * e['saturation']:.1f} % : baissez le gain RF"
+                   if e["saturation"] > 0.001 else "")
+            self.statut.setText(f"Écoute de {' et '.join(f'AIS {n}' for n, *_ in e['canaux'])}{dehors}{sat}")
+        maintenant = time.time()
+        actifs = sum(maintenant - n["vu"] < 600 for n in self.navires.values())
+        self.resume.setText(f"{actifs} navire(s) ou station(s) entendus en 10 min · {self.nombre} message(s)")
+        if e["canaux"] and time.monotonic() - e["instant"] <= 1.5:
+            canaux = " · ".join(f"AIS {n} : crête +{d:.0f} dB, {k} msg" + (f", décalage {dec / 1000:+.1f} kHz".replace(".", ",")
+                                if dec is not None else "") for n, _, d, k, dec in e["canaux"])
+            perdus = f" · {e['perdus']} blocs perdus" if e["perdus"] else ""
+            self.diag.setText(f"{canaux} · calcul {100 * e['calcul']:.0f} %{perdus}")
+        if self.carte is not None and self.carte.isVisible():
+            if nouveau:
+                self.carte.actualiser()
+            else:
+                self.carte.carte.update()
+
+    def arreter(self) -> None:
+        self._actif = False
+        try:
+            self.blocs.put_nowait(None)
+        except queue.Full:
+            pass
+        self._fil.join(timeout=2)
+        if hasattr(self, "minuterie"):
+            self.minuterie.stop()
+        if self.carte is not None:
+            self.carte.close()
+            self.carte.deleteLater()
+            self.carte = None
+        if self.journal:
+            self.journal.close()
+            self.journal = None
+
+
+# Côtes et frontières du monde (Natural Earth 1:50m, domaine public), simplifiées :
+# [lon0, lat0, dlon1, dlat1, …] en centièmes de degré.
+CARTE = json.loads(
+    '{"cotes":[[18000,-1615,-15,-6,-21,-1,-28,-16,-40,-10,-15,-15,-12,-4,-11,5,-8,-17,10,-1,11,-18,17'
+    ',9,13,-1,19,19,12,-1,10,-9,51,7,-4,7,4,15,-9,-2,-27,-21,-1,11,6,11,38,36],[17726,-1705,2,-5,-10,'
+    '-6,8,11],[12737,79,-2,6,-6,-1,2,-7,6,2],[-8132,2469,-10,6,4,-11,6,5],[-8080,2485,-5,-5,5,5],[-80'
+    '63,2494,-4,-4,4,4],[12957,-3163,-62,-7,-88,-37,-75,-19,-54,-5,-64,5,-22,-4,-116,-58,-52,-14,-11,'
+    '-11,-26,-47,-22,-24,-14,-8,-14,1,-16,-8,-14,9,-29,1,-63,-10,-9,12,-65,4,-60,-4,-39,-9,-21,2,-36,'
+    '-3,-21,-13,-19,-27,-20,-9,-35,-2,-76,-51,-28,-6,-28,-5,-106,11,-53,19,-26,27,-16,10,-29,13,-15,-'
+    '4,-12,8,-4,21,2,53,19,-12,18,0,16,11,16,34,-6,52,9,10,2,17,1,51,-4,20,-52,88,-10,25,-11,52,-1,61'
+    ',-10,29,-23,27,-9,33,-37,46,-7,54,-7,19,-32,50,-53,67,14,-6,4,16,22,-48,15,-4,11,10,1,17,-26,23,'
+    '-19,39,5,11,9,-3,17,-20,-3,-22,4,-8,5,-3,8,15,14,-31,10,-7,13,10,-1,44,-54,87,-25,54,0,31,7,26,2'
+    '7,45,4,51,-12,27,28,70,16,11,-3,-35,7,-14,-2,-16,16,5,8,9,33,52,75,33,55,46,70,38,43,1,27,-8,27,'
+    '8,52,26,55,12,35,26,49,-4,18,8,66,12,57,24,34,28,49,84,18,9,34,28,1,7,-12,7,-9,42,1,24,10,17,46,'
+    '35,20,36,5,-1,17,-42,42,-66,3,49,7,1,17,-10,4,20,-1,6,-8,-1,-29,38,14,7,-2,20,4,4,8,-1,13,-19,18'
+    ',12,26,-13,47,-1,-10,6,-27,4,2,17,16,2,7,24,0,6,-4,-1,-11,-15,-12,21,6,27,12,-1,13,14,0,9,28,-13'
+    ',5,-7,4,3,1,13,-16,0,-7,15,18,9,2,7,32,-12,2,10,-14,8,-6,23,10,13,30,10,5,22,7,-3,-4,-24,8,9,8,-'
+    '3,7,-15,6,10,7,3,0,12,9,26,-6,13,7,2,6,-4,8,-16,14,14,17,-14,21,20,0,17,12,5,56,-29,21,-17,22,-2'
+    '9,31,-26,-12,-34,-1,-24,9,10,9,-7,-7,26,23,21,17,6,48,-11,11,-11,5,-17,5,29,19,-6,17,-21,1,29,21'
+    ',2,-25,18,10,9,-9,0,-23,17,8,18,25,23,13,41,30,12,12,15,-13,15,4,19,15,8,8,19,22,4,0,22,12,0,13,'
+    '-13,0,19,15,3,0,13,20,3,7,11,5,-14,10,-7,45,5,17,-5,19,9,16,-11,3,12,7,5,20,1,-8,8,4,39,-19,16,-'
+    '41,2,-13,12,-12,5,-1,3,15,9,20,-13,10,11,7,-2,35,-29,18,12,10,-2,23,-30,17,-2,17,-9,37,-1,52,-22'
+    ',12,-1,19,8,30,-21,19,-3,70,39,-9,-12,6,-4,-19,-16,0,-6,4,-3,20,9,7,-4,7,-23,18,-1,7,12,-8,14,2,'
+    '4,17,18,10,-1,7,-17,11,-10,18,-1,5,-11,-41,-43,-2,-5,7,-17,-13,-23,-5,-1,-12,10,-36,-16,0,-32,6,'
+    '-19,-4,-12,-7,-22,-47,-61,4,-16,76,-48,8,-17,29,-14,12,2,0,-14,8,-6,22,1,30,-19,40,-16,21,-25,34'
+    ',-24,76,-18,10,-11,14,-32,19,-5,60,-32,47,8,32,21,14,40,25,36,19,58,-2,17,6,29,18,55,-11,59,7,32'
+    ',-11,22,-1,13,18,54,-4,32,17,16,14,-2,1,6,-8,16,-17,9,1,14,18,37,9,-7,-1,15,19,63,3,32,16,7,13,1'
+    '7,8,0,7,-4,-6,-12,17,-14,12,-30,3,-51,12,-10,19,-3,-8,-22,1,-13,14,-10,15,-24,19,-80,-4,-30,21,-'
+    '61,20,-11,25,16,26,7,18,-26,64,-45,-4,-16,2,-38,19,-58,-3,-35,32,-47,16,-3,-1,-16,23,-57,-10,-63'
+    ',19,-24,11,-4,-3,-29,8,-14,31,-21,31,-7,14,-13,28,1,32,-39,11,-2,7,-8,16,-3,29,-19,23,-6,16,-14,'
+    '12,-19,-15,1,-5,-11,11,-16,41,-39,13,-35,12,-10,7,-44,18,-42,12,5,15,-16,4,3,-7,21,8,14,6,1,15,-'
+    '21,31,-19,4,0,-1,18,5,1,14,-21,2,-60,6,-28,31,-32,35,-23,19,-3,14,-8,30,-48,33,-20,4,-16,15,-24,'
+    '14,-7,12,-16,1,-26,11,-18,13,-9,-8,-34,8,-68,-4,-21,27,-58,6,-28,13,-19,-1,-29,5,-14,-2,-18,-25,'
+    '-44,-8,-60,-24,-67,2,-35,-11,-52,-15,-36,-23,-26,-9,-39,-25,-24,-8,0,5,-4,-3,-4,-35,-14,-33,-45,'
+    '-5,-17,-14,-6,3,-12,-4,-23,-4,-6,-12,-2,11,-2,-27,-27,-9,-20,-9,-39,2,-12,-10,-3,-1,-14,-12,-3,-'
+    '37,-62,-14,-72,-10,-30,3,-41,-6,-27,-12,-2,-33,-22,-122,-6,-38,-10,-48,-29,-54,-44,-64,-7,0,-5,1'
+    '2,-11,9,7,4,-2,1,-23,-8,-8,-6,3,-18,25,-9,4,-13,-7,-15,23,-18,1,-21,12,6,12,8,3,-6,15,-19,0,-10,'
+    '-14,-23,-12,-24,16,19,0,16,14,5,11,-23,19,-49,-24,19,-2,8,-5,-57,-25,-29,-24,-27,-12,-31,8,-77,3'
+    '5,-27,-1,-27,12,-20,1,-13,-12,-17,3,-21,19,-20,9,-38,5,-24,13,-18,26,-43,39,-4,19,12,40,-13,29,-'
+    '26,36,-43,32,-7,11,10,-2,11,8,11,-9,4,18,-5,5,-9,3,-31,-19,-36,-10,-34,3,22,28,11,31,-2,26,-40,5'
+    '9,-17,-29,-5,-27,-18,-41,-23,1,-32,-11,-26,0,13,32,38,1,10,31,-3,22,3,22,16,30,28,28,-8,38,14,11'
+    ',-8,32,-13,19,1,-24,-35,-37,-20,-44,-81,-40,-54,-63,11,-28,-3,-4,-18,12,-14,-8,-33,30,-9,6,-11,-'
+    '1,10,10,16,-11,7,2,-23,62,-33,33,-4,19,-13,18,-11,7,-31,2,-13,19,-7,23,13,2,0,18,-30,14,-14,14,-'
+    '24,9,-34,0,-45,22,-55,-5,-49,31,-33,15,-25,5,-36,-10,-65,2,-56,-5],[17857,-1775,2,10,-40,34,-57,'
+    '-15,-22,-17,2,-11,-17,-17,7,-17,14,-7,39,-10,31,0,17,11,34,6,-10,33],[16694,-2209,-25,14,-39,31,'
+    '-64,37,-47,50,-21,9,-54,40,-12,-3,-26,17,-2,-9,12,-12,1,-13,20,-26,56,-55,31,-24,58,-32,28,-11,8'
+    ',-13,29,-17,30,-12,20,6,3,6,-6,17],[12769,-8,2,37,-15,20,-2,12,7,24,-9,7,-10,33,12,22,9,37,27,30'
+    ',14,6,-15,-37,12,-13,0,-37,-12,-17,-24,-15,-2,-7,10,-9,15,-2,9,21,19,12,0,16,6,8,20,12,27,5,1,-4'
+    '6,-40,-23,-4,-15,35,-18,8,-19,21,-14,-45,17,-47,8,-6,-3,-3,-39,9,-30,27,-48,18,-16,-15,2,-5,8,-1'
+    '8,8,-16,29,-20,18,0,16],[7032,-4906,-11,-7,-15,-1,-29,-11,-23,-1,-13,8,3,6,20,0,-5,5,0,10,-28,-1'
+    '4,-26,3,-2,6,11,16,-2,9,-5,2,1,7,-8,2,-17,-19,-6,-22,11,-9,-8,-7,7,-21,-9,-21,3,-5,18,0,10,5,6,1'
+    '2,46,-12,14,5,17,-9,20,-1,19,12,-6,5,-18,1,-1,-7,-7,1,-13,4,-11,9,24,11,18,0,22,-9,0,6,10,4,7,13'
+    ',-8,12,-16,2],[6312,8097,98,3,21,18,49,2,51,-10,7,-4,-1,-9,7,-4,-89,-17,-136,-6,-67,12,60,15],[5'
+    '739,8014,-11,5,-9,21,-18,7,7,2,140,-3,78,-12,-86,-2,-12,-2,-2,-10,-46,-10,-41,4],[-2547,7078,8,5'
+    ',-4,9,-30,12,-89,-16,-62,-1,-38,4,-9,-1,-3,-11,3,-8,-23,-9,-10,-13,14,-4,130,10,38,-10,31,12,51,'
+    '8,5,6,-12,7],[16068,-969,-5,10,-28,17,-38,-1,-22,16,-6,0,-8,-8,1,-18,6,-11,17,-15,47,-3,33,-11,1'
+    '7,7,-3,9,-11,8],[11930,1075,-1,-18,-7,-9,-20,-13,-91,-100,-9,-8,-14,-3,-53,-53,-13,-34,30,17,5,1'
+    '0,42,24,14,22,30,16,34,51,1,15,41,14,18,27,23,8,9,9,-16,45,2,36,-5,4,-19,-38,-5,-12,4,-10],[1231'
+    '0,1154,-21,-10,4,9,-9,7,-23,-4,-58,34,-11,-5,-3,-6,18,-7,3,-8,-5,-54,-9,-23,-1,-43,25,18,32,7,25'
+    ',13,3,17,22,13,10,17,4,25,-6,0],[12351,1092,-25,7,-28,-10,-2,-19,-14,-20,4,-41,-15,-10,-24,-3,-7'
+    ',-14,1,-13,15,-21,31,-16,12,-26,20,3,13,18,-17,34,1,25,41,92,-6,14],[12520,1046,-4,18,-15,15,3,3'
+    '5,-11,23,-11,3,-18,-9,-31,23,-2,-5,14,-57,21,4,13,-18,-5,-34,5,-11,-1,-16,25,-14,-4,34,15,-18,1,'
+    '8,10,-1,2,5,-7,15],[12563,1123,-6,1,4,8,-10,22,-5,23,0,18,8,24,-22,13,-1,13,-7,8,-9,4,-58,-4,-28'
+    ',4,16,-42,23,-13,20,-24,12,-2,-8,-20,17,-27,7,-2,7,-12,40,-2,11,-8,-4,11,-7,7],[12148,1284,4,29,'
+    '-32,30,-8,-5,-20,12,-16,-3,-29,5,-12,-5,-1,-6,12,-2,5,-13,17,-13,8,-16,4,-22,10,-10,2,-14,20,-26'
+    ',12,-3,8,8,7,0,2,12,13,22,-6,20],[15582,-638,-18,16,-17,7,-10,18,-17,14,-11,21,-9,8,-27,10,-2,-3'
+    '1,5,-18,25,-28,19,-10,1,-22,13,-19,28,-14,10,0,17,10,2,-4,5,11,-14,31],[15302,-411,-99,86,-22,8,'
+    '-33,23,-25,7,-6,8,-34,22,0,-14,-8,-3,32,-9,81,-57,31,-11,9,-7,39,-55,1,-37,21,-33,13,16,2,19,9,1'
+    '3,-1,10,-10,14],[13877,-739,-23,1,-24,-6,-22,-13,-25,-36,-18,-46,65,-2,24,14,25,21,20,36,-3,11,-'
+    '19,20],[13077,-342,-10,3,-10,26,-19,14,-40,1,-50,19,-31,-14,-5,-1,-6,10,-7,1,-79,-4,-32,-35,5,-1'
+    '2,-1,-17,21,35,15,-8,14,-18,10,-3,12,2,22,20,10,-1,1,-9,50,-12,5,2,-1,10,33,0,18,-14,79,-39,5,29'
+    ',-9,15],[12716,-334,-13,17,-22,10,-25,0,-34,-8,-13,4,-6,-6,3,-25,12,-16,51,-24,54,19,0,24,-7,5],'
+    '[12298,-815,-13,6,-6,-4,-3,-6,16,-3,-7,-8,-29,-13,-13,-17,-11,-3,-35,17,-53,-12,-43,21,-26,5,-14'
+    ',8,-26,-2,-39,-18,-9,2,-6,-28,10,-16,21,8,20,-4,23,2,49,-14,15,4,14,-2,8,11,17,-1,7,-8,44,16,38,'
+    '1,35,13,-1,12,20,15,-3,18],[12070,-990,-20,23,-21,2,-7,14,-28,21,-14,-8,-61,0,-16,-6,-7,-8,13,-1'
+    '9,51,-6,33,-20,21,-23,30,-9,26,8,10,10,3,7,-13,14],[11904,-846,-11,16,-18,-3,-4,-8,-4,9,-12,5,-2'
+    '6,-9,-17,24,-20,3,-16,-6,1,-13,21,-18,19,-7,6,-6,-2,-6,-11,0,-13,-8,-16,2,-24,28,-21,0,-20,6,-32'
+    ',-16,-6,-13,3,-15,-4,-15,2,-5,27,-9,15,7,18,0,80,19,19,17,5,-19,30,5,10,-2,-8,9,15,4,11,-5,12,8,'
+    '-9,11,0,10],[11640,-820,-34,-24,2,-30,-21,0,0,-9,51,-10,21,4,-8,7,22,43,-4,9,-29,10],[11555,-821'
+    ',-40,14,-21,-12,-44,7,-3,-5,14,-21,23,-5,22,-14,8,-13,-5,-13,5,-2,8,3,11,20,37,21,-15,20],[10637'
+    ',-246,-16,27,-5,32,-13,28,-12,9,-19,-3,3,-13,-5,-7,-11,20,-13,-4,-9,-9,0,-15,-23,-16,-1,-7,16,-7'
+    ',26,3,24,-10,2,-13,13,-18,-3,-15,9,-18,25,-7,30,-17,12,-1,-6,17,10,24,11,9,-45,11],[2296,5861,-4'
+    '1,2,-22,-5,-6,-7,-41,-1,12,-11,-13,-9,3,-4,31,-11,-20,-15,1,-7,15,4,12,19,10,6,36,1,40,21,19,1,-'
+    '36,16],[2424,7790,-56,-2,-56,11,3,10,30,6,-33,9,-82,-1,-9,18,-17,17,-59,2,-122,-12,14,-7,19,1,-3'
+    ',-9,26,-8,5,-8,20,-11,61,-14,-32,-15,-13,-15,-33,-5,6,-11,12,-2,101,6,34,7,29,-2,4,-1,-5,-4,-24,'
+    '-7,5,-7,-6,-4,12,-5,25,1,30,11,28,-1,36,8,39,20,77,10,-66,14],[6210,8087,-50,2,-132,-9,-19,5,-37'
+    ',-1,-33,-13,-10,-14,6,-6,30,-8,63,6,77,-7,63,17,40,3,15,17,-13,8],[4701,8056,29,5,41,16,33,-10,6'
+    '4,-4,1,9,-24,9,-101,4,-64,-9,-190,-15,74,-7,33,3,17,-12,37,3,17,8,33,0],[5145,8074,-65,17,-68,1,'
+    '-88,-10,-9,-11,4,-5,0,-10,-10,-4,-46,-1,-23,6,-50,-4,-126,-23,35,-12,90,6,9,-3,-35,-10,11,-3,43,'
+    '5,22,-3,19,10,40,-4,3,5,-5,6,-28,3,13,5,78,3,20,5,-4,4,10,3,111,4,74,15,-25,5],[4923,6951,-39,-2'
+    ',-43,-14,-9,-8,-4,-23,16,-24,23,-7,51,5,45,8,46,27,7,-9,12,5,-1,10,-10,7,-94,25],[6039,6996,-75,'
+    '24,-59,26,-26,-3,-32,-16,21,-22,27,-16,19,3,36,-5,8,-13,14,-3,50,-2,22,4,4,16,-9,7],[7144,7334,-'
+    '21,11,-29,6,-79,-7,-15,-8,2,-14,-10,-14,12,-4,34,1,125,12,-4,11,-15,6],[9259,8000,-116,5,-36,-7,'
+    '6,-8,25,-6,77,-16,29,0,72,6,44,8,20,8,-121,10],[11208,7455,-7,-2,-6,-14,-7,-3,-38,-1,14,-8,56,-1'
+    '2,58,-5,48,17,13,13,-131,15],[14104,7424,-63,3,-31,-9,8,-18,33,-8,50,8,9,17,-6,7],[2617,3522,-14'
+    ',0,-24,-10,-4,2,-2,21,-25,-4,-76,11,-41,-6,-5,11,-15,3,9,4,-3,6,-16,-7,-16,1,-11,12,-7,-15,-6,6,'
+    '-4,-4,-2,-11,1,-12,8,-6,24,1,58,-9,25,-7,4,-14,5,-2,137,9,7,2,8,28,-15,-10],[2446,3815,-18,7,-8,'
+    '32,-10,13,-22,2,-36,12,-21,22,-44,-16,7,-3,9,3,22,-7,37,-25,3,-11,39,-5,17,-27,15,-10,14,-5,8,5,'
+    '1,10,-13,3],[3427,3557,-66,-22,-67,4,-6,-21,-23,0,-26,-13,-9,3,2,-13,13,-22,24,-8,18,1,7,-8,7,-1'
+    ',5,10,35,8,29,22,35,2,-14,21,3,9,62,37,-29,-9],[1884,5790,-3,-7,-9,3,-18,-3,-40,-27,1,-22,-4,-7,'
+    '18,-19,-14,-16,19,6,14,18,22,8,8,12,13,4,-12,8,2,23,27,13,-18,8,-6,-2],[1207,5498,2,21,32,10,-2,'
+    '10,-17,8,10,12,25,9,-5,24,9,11,-3,3,-26,6,-28,-7,-17,-8,6,-7,-11,-20,-13,3,1,18,-7,5,-16,-2,-1,-'
+    '6,-14,-13,-34,-3,3,-8,11,-4,7,-13,-2,-14,12,-13,36,-1,9,-27,12,-15,19,5,2,16],[1079,5513,3,19,-1'
+    '7,29,-14,-5,-22,5,-43,-9,0,-16,13,-20,45,-11,18,0,17,8],[324,3976,-9,3,5,10,-4,3,4,4,-4,1,-38,-1'
+    '2,-41,-24,0,-4,13,-9,13,8,7,-2,10,-15,27,-9,17,9,22,31,-1,6,-5,2,-16,-2],[-12072,-7375,-229,8,-2'
+    '4,-7,-10,-10,36,0,37,-13,-26,-13,12,-12,-20,-2,2,-6,65,-10,129,7,-5,7,6,10,72,17,-11,13,-18,10,-'
+    '16,1],[-12723,-7359,2,-13,20,-1,17,7,26,-1,8,-3,3,-11,23,-8,115,-29,115,-8,10,3,4,15,-33,11,-2,3'
+    ',11,6,-9,5,-41,9,-45,-9,-81,3,-6,2,3,6,57,5,-30,13,-7,9,-44,14,-53,3,-67,-2,-16,-15,2,-7,18,-7],'
+    '[-6679,-7961,-90,8,-12,-2,4,-4,69,-17,9,-3,9,-12,49,-6,9,-11,82,13,-8,18,-29,3,-14,12,-78,1],[-5'
+    '729,-6437,-12,7,19,8,-5,5,2,7,-27,9,4,5,-37,-9,7,14,-5,11,-44,-12,-17,-19,29,1,1,-11,12,-3,-28,-'
+    '7,9,-6,24,5,5,-1,-3,-6,4,-2,9,11,12,1,2,-7,39,-1],[-6313,-6457,-15,0,10,10,-9,9,4,6,-10,5,-16,1,'
+    '-19,-8,1,-8,-25,-4,5,-5,-30,-7,-10,-12,53,-13,18,10,28,1,44,15,-9,5,-20,-5],[-7421,-7092,66,20,-'
+    '16,8,-33,9,-7,-3,0,-8,-35,7,-1,-14,-12,-6,-20,16,-16,4,-18,-16,-112,-11,-25,-8,-1,-5,15,-13,18,-'
+    '1,197,21],[-7485,-7018,18,5,9,13,14,5,-37,20,-45,0,-8,-9,-34,-4,-13,-10,8,-12,88,-8],[-9973,-720'
+    '3,-10,-2,-25,21,-14,1,-191,-16,-16,-4,-2,-5,5,-6,24,-4,182,-9,105,-20,51,-2,23,-6,116,3,22,-5,98'
+    ',-1,4,6,-7,7,50,4,5,16,-8,7,0,11,-8,1,-103,-20,-26,4,68,17,18,15,-26,6,-49,-1,-22,-9,-11,-15,-15'
+    ',-10,-11,0,-12,9,11,10,-11,12,-24,-4,-10,-20,-25,0,-1,10,9,11,-10,9,-43,6,-34,-9,-12,-8,-17,-4,-'
+    '31,3,-17,-9],[-7538,-7282,-35,-6,13,-7,36,-6,-4,-4,-14,0,-9,-6,-26,6,-25,-4,-8,-6,10,-14,143,-32'
+    ',12,4,8,11,-30,18,17,5,28,23,-6,5,-19,6,-91,7],[-6890,-6774,32,1,14,7,6,10,20,0,19,9,-2,5,-23,5,'
+    '55,22,-28,12,4,19,25,13,-3,8,-12,1,-51,-18,-48,-43,-26,-17,-5,-5,1,-13,22,-16],[-18000,7154,89,6'
+    ',67,-6,86,-26,8,-6,-2,-5,-30,-10,-134,-13,-35,-2,-49,7],[-5779,-5164,-17,6,15,6,-17,14,-28,-4,-3'
+    ',-4,6,-12,-4,1,-24,9,-1,6,11,0,3,5,-5,5,-27,-1,-22,6,3,-9,-21,-13,4,-20,-20,-5,-31,-19,3,-4,-11,'
+    '-11,0,-5,25,-18,6,11,27,3,-13,15,55,-8,-3,16,84,23,5,7],[-3590,-5455,-17,0,-10,17,-16,13,-12,-6,'
+    '-9,6,-11,-1,4,7,-9,8,-23,3,-8,-3,-37,13,-64,-3,40,-3,-7,-4,0,-5,6,-4,13,1,49,-18,12,0,16,-13,22,'
+    '-4,26,-27,16,-9,29,11,-11,5,1,16],[-7411,-4336,34,1,2,19,21,9,10,13,-13,18,-22,17,32,12,-6,16,9,'
+    '3,2,9,-11,29,-51,10,-2,-2,4,-7,-5,-22,-9,-11,-4,-26,4,-11,-5,-29,-18,-35,28,-13],[-5957,-5168,28'
+    ',20,2,5,-12,7,-8,-5,-32,-4,-13,6,-22,-9,-43,12,6,-13,26,-15,-33,-7,8,-5,22,4,4,-5,-35,-18,-17,0,'
+    '-20,-11,27,-13,18,0,16,5,10,15,33,2,35,29],[-7503,-4984,7,31,22,11,-14,-27,7,-24,5,-8,17,0,9,15,'
+    '4,17,-6,7,5,33,-10,54,-22,4,-11,-2,-8,-9,3,-14,-23,-12,-3,-7,12,-4,0,-8,-24,0,-14,-9,16,-13,-3,-'
+    '14,-18,1,-5,-8,2,-9,10,2,15,-8,27,1],[-7340,-4477,5,-6,12,-3,24,8,23,23,-2,4,-25,13,-23,3,-2,-14'
+    ',-17,-15,5,-13],[-6388,4966,20,-13,11,-13,53,-18,82,-14,42,1,10,5,-12,14,-22,11,-105,38,-104,17,'
+    '-24,-1,-12,-4,5,-6,56,-17],[-5984,4594,-9,8,8,9,-2,5,-36,4,-7,11,-20,-11,-9,-8,2,-6,-16,-10,27,1'
+    ',-24,-20,-36,-7,-3,5,12,9,-7,4,17,10,-24,-4,53,23,9,10,1,14,15,36,-10,15,2,8,-8,1,-13,-3,-25,-18'
+    ',-37,-50,-17,-13,-9,-23,5,-22,21,-15,57,2,28,6,55,29],[-16900,6335,-55,2,-7,6,-40,6,-10,13,-31,8'
+    ',-60,-11,-42,3,-20,11,-10,-3,-7,-17,3,-11,27,-9,57,12,42,-7,26,-10,8,-8,37,-8,14,-16,32,21,51,0,'
+    '9,4,4,10,-28,4],[-16563,6003,-8,4,2,15,-4,9,-31,2,-14,7,-55,-8,-11,-10,-60,-1,30,-20,99,-25,4,2,'
+    '1,7,51,6,-4,12],[-16327,5477,-11,5,-17,22,-26,1,-46,-15,-21,1,-23,-22,-18,-8,-1,-7,8,-12,23,-2,1'
+    '9,5,17,12,16,5,49,1,22,11,28,-7,-19,10],[-7635,1815,-35,11,-21,13,-96,13,-11,-5,-24,-2,-12,-16,5'
+    ',-7,25,-5,27,-29,41,-5,16,-12,8,17,18,-3,9,12,33,-10,31,4,-14,24],[-6563,1838,-44,9,-3,-4,-9,5,-'
+    '87,4,-10,-2,-10,-14,9,-14,-3,-23,6,-2,63,2,26,-4,28,2,14,9,21,18,-1,14],[-15241,5765,-7,5,5,13,-'
+    '19,2,-27,-8,4,13,-31,7,-7,-1,6,-5,-5,-11,-17,0,-10,-7,-21,14,-11,1,-9,-6,2,-6,19,-10,-15,-2,4,-2'
+    '0,11,-13,-12,5,-20,20,-2,7,-9,2,-42,-9,-17,-19,14,-16,7,-17,16,-12,8,-1,8,10,-6,8,-14,1,14,4,20,'
+    '-2,-6,-10,10,3,21,-6,-28,-17,10,-5,21,9,12,10,-1,7,-8,2,46,18,22,1,17,8,20,3,-10,10,-22,2,6,3,60'
+    ',-2,12,12,-19,5],[-15217,5818,10,0,9,6,1,7,-35,10,-6,-6,-29,10,-17,-3,7,-7,0,-7,-21,2,-40,-21,45'
+    ',-10,25,7,8,10,6,-6,23,3,-2,8,6,4,10,-7],[-13100,5573,-27,23,-35,-13,-3,-24,-20,-17,4,-20,5,-5,1'
+    '2,13,19,11,3,-13,23,-7,11,6,10,22,-2,24],[-13247,5494,13,-3,15,-18,17,0,4,7,0,41,-23,1,5,10,-26,'
+    '16,-21,-1,12,12,34,-11,-26,21,-17,21,-16,10,-34,9,2,10,-12,13,-40,0,1,-10,6,-7,-23,-15,2,-4,6,-2'
+    ',31,10,8,-2,5,-10,-17,-12,-17,4,-10,-5,13,-10,18,0,7,-8,27,-2,-5,-9,12,-10,-16,-7,34,-28,8,-2,0,'
+    '10,8,1,3,-14,12,-6],[-13398,5701,30,-21,3,-28,5,-6,44,4,0,11,-17,22,30,-21,7,6,1,20,-12,9,-19,3,'
+    '-4,-3,-41,9,-16,1,-11,-6],[-13488,5724,-19,18,-38,11,-17,-18,-20,-7,5,-18,-4,-9,15,2,16,21,5,1,7'
+    ',-6,4,-11,14,-5,-12,-10,-1,-11,17,0,0,-9,14,-7,14,2,-10,-16,17,-24,13,-6,5,8,-3,22,5,8,-1,12,-26'
+    ',52],[-13410,5730,19,5,-6,10,5,4,-2,9,-33,30,-4,15,13,-2,25,-34,10,-5,-14,25,-27,27,-44,2,-24,19'
+    ',14,-27,12,-44,17,-16,-13,-28,3,-11,7,-5,8,2,18,9,16,15],[-13569,5742,7,6,1,17,5,2,63,-19,6,11,-'
+    '11,13,-36,5,11,5,26,0,4,13,-2,7,-40,10,-26,-13,-8,5,7,2,3,9,-20,12,-30,-7,-5,-10,-18,12,-5,-8,-1'
+    '4,-4,-6,-13,11,-10,38,-20,17,-22,22,-3],[-12877,5260,4,-24,5,-7,17,23,-4,42,-8,17,-40,17,-15,-32'
+    ',16,-20,12,-9,7,1,8,8,-2,-16],[-13235,5319,39,12,7,40,19,28,3,15,-27,-10,-19,-1,2,-17,-8,-18,-34'
+    ',-3,-3,4,35,12,5,7,-10,20,-8,3,-22,-4,-10,6,-39,3,-5,-15,2,-17,18,-28,47,-22,-26,3,-6,-6,23,-12,'
+    '17,0],[-13112,5222,-2,7,-18,1,6,12,-17,0,-16,16,13,12,-27,6,-24,12,34,4,-2,18,-10,10,-14,3,-26,-'
+    '7,-40,-2,8,-7,33,-7,0,-4,-12,-3,9,-15,61,-38,14,-16,20,-9,10,7],[-6216,4649,-97,-7,-55,14,-10,-1'
+    '1,-13,6,3,10,-21,17,11,13,-1,15,-23,-16,-18,-21,1,-5,25,-4,3,-17,35,-3,-4,-3,7,-8,16,-8,36,-5,6,'
+    '3,-12,1,29,12,-8,-10,11,-2,6,-8,-13,-5,12,0,2,-7,14,-3,26,3,-6,3,1,17,51,22,-14,7],[-7210,4102,-'
+    '8,3,-40,-13,31,23,-36,-16,-94,-7,-8,-8,-5,3,-18,-8,-15,-15,2,-6,19,8,2,-4,-10,-5,71,8,85,24,44,1'
+    '7,-20,-4],[15220,-429,-8,8,-15,-11,-15,10,-23,2,-5,-10,12,-34,1,-24,-10,-6,-24,-2,-19,-15,-19,-3'
+    '1,-22,-9,-10,-1,-11,6,-22,-8,-12,2,-11,21,1,12,9,12,-8,6,-8,-13,-5,-31,-13,-7,-20,0,-27,-6,-36,1'
+    '0,-44,-3,-13,4,-9,-7,0,-13,6,-10,32,-10,38,-25,28,4,27,-21,82,3,34,19,42,15,19,17,10,20,35,-1,21'
+    ',10,6,10,-15,21,2,15,25,5,14,22,-4,24,5,15,-21,5],[12420,-926,-32,-19,-21,-26,-8,-26,13,-11,-12,'
+    '-19,15,-8,11,1,32,16,25,3,53,48,4,10,41,29,108,37,18,13,25,6,38,30,-33,10,-35,-14,-82,-3,-42,-9,'
+    '-20,-7,-15,-21,-38,-26,-45,-14],[14779,-4322,-14,20,4,4,8,-2,3,7,-23,8,-3,-15,-9,-3,-4,14,-11,10'
+    ',5,-14,-9,-14,-1,-15,-8,-4,-17,10,-1,-6,9,-6,-21,-33,-17,1,-15,9,-51,-4,-5,17,24,2,-2,4,-34,3,-7'
+    ',5,-19,24,-12,7,-22,39,-7,31,17,-11,10,-15,6,10,-20,24,-10,-5,1,18,-46,60,-13,44,7,31,32,-12,24,'
+    '2,54,-25,50,-14,25,2,15,6,13,-9,1,11,13,7,33,3,13,-4,17,16,25,-3,10,9,25,-7,7,-10,0,-87,5,-40,-1'
+    ',-4,-4,1,-1,11,-10,8,6,4,-3,5,-14,-20,-16,-49,7,-50,-19,-6],[9787,8076,-17,7,-95,13,-28,14,-67,1'
+    '8,-64,-1,-10,-8,-22,-5,-177,-15,-36,-12,-12,-9,67,1,-68,-26,-68,-5,-38,-12,12,-9,56,-9,167,-17,7'
+    '0,12,261,11,24,8,-13,2,-26,20,8,7,75,9,1,6],[9952,7913,-48,16,50,-1,14,4,10,31,14,11,14,4,-11,7,'
+    '-66,17,-69,3,-13,-4,3,-6,-15,-7,-29,2,-41,-14,-6,1,4,8,39,17,-12,8,-31,7,-209,-6,-22,-8,-29,7,-6'
+    '4,-16,-9,-11,-41,-13,-45,-7,-33,-13,115,-10,9,-9,48,-22,34,-4,40,5,27,-10,101,-2,75,-15,85,-4,10'
+    '3,4,49,13,-12,14,-29,3],[10515,7882,-52,2,-18,4,0,8,-36,5,-29,14,-85,-9,-36,-19,-18,-3,47,41,22,'
+    '5,-31,9,-39,4,-22,-6,0,-6,7,-5,-24,0,-19,11,-18,-1,-5,-1,-5,-10,-34,-5,-15,-8,-2,-10,-13,-4,-4,-'
+    '8,10,-11,-34,1,-20,-5,-14,-7,-2,-11,-24,-23,-34,-11,-39,-19,21,-6,35,-2,135,23,142,3,18,-3,20,7,'
+    '72,0,58,8,44,0,57,16,3,9,-3,8,-16,15],[14369,7586,-76,-3,-144,31,-50,-18,-6,-9,1,-17,-12,-7,-16,'
+    '0,-16,6,-11,11,-34,3,-31,12,-93,25,-118,-21,-13,-8,21,-15,-35,2,-9,-3,-5,-20,7,-20,-31,2,-3,-4,6'
+    ',-9,21,-12,46,-11,41,-21,101,-14,23,3,22,21,13,6,59,-11,172,14,30,-14,18,-3,66,15,-51,16,-36,22,'
+    '-11,11,-6,20,46,6,39,-1,5,-8,-26,-9,-3,-9,3,-11,9,-7,35,-15,85,-8,39,6,47,17,-15,10,7,5,56,11,-1'
+    '0,6,-157,27],[14334,7357,-70,23,-71,11,-85,-4,-49,-31,-21,-8,-69,-5,10,-7,14,0,73,9,94,-14,159,-'
+    '9,30,3,-3,21,-12,11],[15069,7516,-16,-6,-43,12,-102,4,-49,-2,-11,3,3,12,-8,2,-93,3,-44,-8,-26,1,'
+    '-5,14,-21,7,-20,-10,-19,-28,99,-20,49,-4,46,-13,96,-6,79,3,74,12,24,24,-13,0],[17578,-3680,10,-1'
+    '6,11,-48,12,-10,2,-5,-8,3,-1,-4,73,-29,57,-10,22,9,17,19,28,16,26,-2,27,-12,-15,-27,-12,-59,-19,'
+    '-14,-10,-3,-7,-30,6,-12,-6,-10,-12,13,-27,4,-22,-5,-22,-10,-13,-15,-1,-19,17,-11,-27,-49,-15,-13'
+    ',-71,-92,-67,-40,-9,4,-5,15,-29,0,2,18,-3,2,-3,-7,-8,-4,-12,4,52,67,9,33,-9,18,-15,16,-44,14,-22'
+    ',17,-42,13,-12,8,-5,11,8,18,23,11,33,7,20,17,12,56,12,21,-4,12,13,10,-20,35,4,11,-6,1,-12,23,7,1'
+    ',7,-13,7,11,13,3,-15,14,-18,-5,-12,5,-10,21,-19,24,6,1,15,-12,5,9,-10,13,4,14,-12,8,-2,-9,-21,13'
+    ',-13,21,1,-11,25,-31,-7,-6,-5,3,-64,82,22,22,-13,-4,-12,-14,-7,6,-4,10,-15,13,7,9,0,10,-48,56,33'
+    ',3,-8,-11,32,-44,17,14,2,-11,32,-12,5,4,26,-11,4,-16,18,5,22,-33,-3,-9,7,-12,-18,-1,40,-51,-5,-1'
+    '8,7,-12,-10,-23,17,-7,6,6,35,-14,5,-17,11,-6,11,6,-8,47,-10,13,1,6,6,2,22,-27,9,1,1,-6],[17289,-'
+    '4312,33,14,33,46,29,25,5,14,35,32,4,7,-6,6,-14,1,8,11,-9,13,30,24,0,9,-23,-15,-10,1,16,8,10,14,-'
+    '30,3,2,-8,-6,-3,-6,-14,-10,-3,12,20,-3,6,11,9,-5,0,-21,-7,-51,-29,-11,0,-13,43,-22,8,-7,10,3,13,'
+    '21,2,-30,0,-37,-24,-13,-19,-5,-25,-14,-34,-22,-18,-24,-7,-24,-61,6,-6,-12,-4,-16,-20,1,-16,-3,-3'
+    ',-4,17,-23,-21,0,-10,-7,7,-15,-5,9,-8,-15,5,-16,-7,10,-7,-16,2,-38,-27,5,-2,-7,-1,-1,-8,-66,-24,'
+    '-3,-4,4,-9,-11,5,-26,-13,-16,2,-28,-11,-51,-42,5,-16,-12,6,-31,-17,-1,-19,-6,13,-24,-17,9,-8,-13'
+    ',3,-10,-7,0,-10,20,-7,-11,-3,4,-9,-29,10,5,-10,-14,0,-5,-13,26,1,-19,-12,1,-5,19,-1,-49,-10,-2,-'
+    '15,23,7,1,-7,-8,-8,8,-1,19,9,-21,-17,2,-7,10,-3,54,-1,17,9,14,-4,16,-18,35,1,13,-9,1,-10,5,-6,39'
+    ',4,33,-6,59,8,50,39,15,17,44,12,1,8,-9,11,24,46,17,18,2,6,-13,7,15,0,16,61,-7,4,12,1,8,11,22,2,5'
+    '2,22,-14,20,26,-17,18,14,10,-4,-8,-7,25,3,17,-8,15,2,5,7,-5,12,-26,6,-12,18,-16,-2,20,11,-11,8,1'
+    '0,1,17,14],[12659,755,-5,17,-10,11,2,37,-8,13,-1,15,-23,12,18,24,-2,11,-11,17,0,16,-10,-2,-21,25'
+    ',-41,25,-6,-9,12,-53,-3,-13,-29,2,-7,-16,-27,10,-8,-10,-6,-31,-11,-4,-22,8,-20,-37,-40,-18,-5,1,'
+    '13,13,-3,24,-17,19,-25,8,-9,-13,-19,-5,-10,-9,-5,-7,0,-14,-9,-6,-52,-11,-15,-10,-11,-14,-8,-45,-'
+    '13,-16,-2,-12,13,-15,11,2,33,69,15,12,9,1,8,-5,5,-19,15,2,11,15,8,-17,21,-12,10,40,18,1,30,-16,2'
+    '4,-26,-2,-13,-20,-28,9,-59,13,-17,72,-35,11,-1,19,20,4,-4,-3,-27,5,-13,6,-3,11,6,21,32,0,24,-8,2'
+    '5,-21,22,2,11,24,31,5,15,13,7,22,-49,15,-53,5,42,-5,12,10,3,15,13,11,17,4,37],[12229,1823,-11,-1'
+    '7,-3,-40,9,-23,15,-12,2,-13,11,-6,-2,-6,-36,-88,-35,-10,-19,-15,-4,-10,5,-16,-20,-29,-1,-11,30,-'
+    '53,-7,-6,0,-10,14,-41,14,-15,30,-9,8,7,-9,15,29,17,14,0,30,-13,14,-23,-1,-17,4,-4,13,0,7,9,1,10,'
+    '-5,4,6,8,11,-9,30,-9,13,-8,-5,-8,-20,-2,-6,-5,27,-38,-3,-16,35,-7,0,-25,-8,-22,-10,2,-8,10,7,23,'
+    '-32,-1,-32,13,-1,18,-14,22,-30,18,-26,29,-11,2,-2,-4,4,-23,16,-26,1,-15,-8,-6,-8,7,-2,10,-12,16,'
+    '-31,27,-29,15,-28,-10,-5,-13,-11,-6,-24,3,-17,8,-9,12,-11,2,-9,-10,-2,39,30,30,2,16,-36,23,-3,-1'
+    '1,4,-29,-3,-4,-12,1,-19,34,-17,6,-15,58,-4,41,-12,17,0,25,6,7,33,-28,18,2,5,9,-8,37,1,23,10,33,0'
+    ',35,-6,20,24,87,21,9,29,2,49,-24,36,-9,9,4,11,16,7,1,8,-10,-1,-17],[14066,-885,-17,23,-51,45,14,'
+    '25,-19,-18,-54,-9,-11,8,-3,13,-6,-11,-26,-17,-4,2,-3,9,23,56,-34,34,11,5,20,-3,12,4,-13,-1,-20,6'
+    ',-25,20,26,8,-42,52,-14,39,7,11,-17,3,4,9,10,4,-25,-3,-3,24,-75,46,-3,6,-8,-4,-11,7,-47,10,-64,2'
+    '9,-53,9,-25,-1,-45,25,-7,12,3,13,18,1,-13,2,-21,-6,-16,7,-12,-4,-12,15,-18,-2,-25,24,-4,10,2,23,'
+    '14,20,-14,-4,-5,-27,-5,-6,-8,1,2,-11,-12,-21,-2,-17,-15,-16,-28,-3,-6,3,-16,36,12,15,-12,26,-40,'
+    '31,-30,7,-8,12,26,11,49,-11,31,30,16,5,42,-11,9,-7,5,17,15,6,0,9,-11,1,11,11,2,8,-21,-9,-75,-8,-'
+    '46,5,-19,-2,-29,25,-9,43,-20,2,-44,15,-17,-7,-12,4,5,14,14,11,7,31,54,16,33,25,38,10,35,-7,61,-3'
+    '1,55,-4,9,-8,-4,-15,19,-36,-15,-36,8,-59,27,-52,2,25,9,7,6,-3,7,-39,14,2,5,-30,15,-12,21,-4,24,2'
+    ',37,35,15,27,23,15,15,31,45,7,23,9,10,8,-5,19,50,27,29,9,20,-14,54,-17,16,-13,98,-43,36,0,10,-6,'
+    '37,-4,10,-6,3,-10,44,-2,136,-57,36,-12,60,-11,56,-38,41,-2,15,-16,21,-11,25,-25,24,-4,44,-43,2,-'
+    '36,-4,-22,10,-7,55,-15,63,-30,35,-3,19,-11,23,-26,5,-34,-14,-6,-59,0,-17,-11,1,-10,23,-45,53,-50'
+    ',41,-22,12,-45,20,-14,13,-36,21,-4,41,6,6,-15,-6,-23,6,-9,22,-9,39,-4,14,-6,-3,-5,-22,-7,11,-20,'
+    '49,-18,31,-7,18,2,-21,-10,-19,3,-4,-3,24,-18,-17,-12,-16,-1,-30,7,-27,23,-81,9,-29,10,-22,-3,-16'
+    ',6,-50,6,-22,16,-14,24,-39,28,-9,14,3,19,-10,-3,-23,14,-55,84,-35,16,-76,15,-8,7,-3,10,-35,6,-6,'
+    '-3,-2,-8,-8,1,-12,-9,-9,0,-24,9,-25,21,29,-48,-10,0,5,-8,-6,-1,-31,3,9,-20,-52,-11,-38,4,-19,-5,'
+    '-7,0,-10,15,-14,-3,12,0,14,-17,33,2,31,-12,27,-29,-1,-20,-72,-37,-42,16,-61,-4,-21,6,-28,-7,-47,'
+    '37],[11977,-48,-5,39,15,13,-6,20,10,21,13,12,2,12,23,29,13,-13,10,-3,8,3,27,40,10,6,11,2,13,-7,1'
+    '9,-2,19,-17,28,2,57,-7,40,-17,23,9,78,-10,42,18,14,17,12,4,7,16,19,8,20,23,17,-6,7,-14,-11,-12,-'
+    '15,-30,-27,-25,-19,-27,-8,-9,-21,-9,-69,-8,-26,3,-19,16,-8,0,-116,-5,-32,6,-51,-6,-43,9,-23,-8,-'
+    '16,-18,-18,-47,5,-36,18,-31,28,-17,15,-33,36,-4,12,7,13,22,30,29,16,-10,23,0,31,17,61,0,-6,10,34'
+    ',9,21,-8,5,-13,-5,-22,-15,0,-8,9,-10,4,-15,-3,-39,-45,-26,-21,-39,-13,-21,-21,-26,7,-3,-5,-1,-7,'
+    '23,-20,19,-9,31,-51,21,-16,2,-14,9,-15,-8,-8,-7,-34,33,-26,11,-20,16,2,5,-17,-3,-16,-15,5,0,-7,-'
+    '25,-1,-36,-12,-6,-8,2,-17,-3,-4,-12,-2,-33,9,-10,18,13,49,-31,17,-42,40,2,12,14,23,0,42,-6,8,-11'
+    ',2,-23,-2,-39,-28,-1,-10,14,-30,5,-36,-8,-38,6,-53,-14,-53,15,-44,-12,5,-36,-4,-23,-11,-16,8,-18'
+    ',19,-2,11,23,79,3,49,-14,30,-1,22,-11,5,-37,-8,-12,14,-6,24,5,23,-8,21,31,24,8,34,15,21,-1,52,20'
+    ',50,20,23,13,-18,-7,38],[11061,-815,90,-16,61,-1,56,-9,57,12,69,-28,34,-4,18,-13,12,-3,2,4,-15,1'
+    '7,-6,15,5,51,-6,13,-31,14,-57,-9,-49,6,-22,11,0,25,-14,8,-11,29,-45,4,-10,8,-25,4,-20,12,-36,-4,'
+    '-21,25,-14,2,-9,-5,-16,-34,-15,-14,-23,5,-38,0,-32,9,-21,-6,-61,8,-8,6,-8,26,-19,18,-19,-1,-47,8'
+    ',-20,10,-14,14,-28,8,-4,-11,-18,-9,-75,19,-21,-21,-8,-34,-8,-4,-5,3,-8,-20,-10,-11,-9,3,-2,9,-13'
+    ',-12,2,-6,4,0,64,-2,58,-19,-11,-26,13,-8,74,-8,27,-7,25,-15,42,-9,23,-2,12,9,17,4,54,-3,76,-19,5'
+    '7,-26],[10082,214,6,14,17,-2,25,-25,11,-25,7,-7,30,-7,24,-18,14,-18,8,-27,15,-15,18,-9,28,-3,18,'
+    '-14,4,-9,-6,-7,-46,-20,35,6,44,23,14,-3,10,-9,21,-34,-36,-24,-2,-17,10,-11,-7,-11,9,-17,19,-14,4'
+    '8,-16,16,1,16,-78,5,-10,28,-17,-2,-14,-18,-20,0,-17,32,23,43,-1,18,-11,46,-62,2,-11,-16,-19,-6,-'
+    '20,1,-12,8,-10,-10,-33,6,-85,-7,-67,-7,-14,-13,2,-27,25,-27,-20,-44,23,-2,-12,6,-25,-8,-1,-53,51'
+    ',-24,31,-91,61,-38,32,-41,55,-48,36,-34,51,-19,14,-23,34,-3,32,-37,63,-20,50,-43,49,-19,36,-34,1'
+    '6,-17,14,-36,114,-20,37,-51,34,-29,8,-10,8,-11,49,-20,13,-42,60,-17,13,-36,11,-21,25,-74,69,-28,'
+    '52,4,13,-2,15,17,7,34,-5,29,-23,22,-8,37,-5,35,5,22,-6,36,0,36,-33,9,-22,25,-25,-1,-22,7,-10,35,'
+    '-16,12,-17,37,-18,58,-40,79,-99,17,-7,20,-17,-7,19],[11212,291,-50,-9,-18,-19,0,-25,-9,-2,-11,8,'
+    '-3,-6,0,-18,6,-6,-12,-40,-12,-18,3,-7,16,-9,-12,0,-21,13,-21,2,-33,17,-24,-2,-25,6,-14,10,-9,17,'
+    '-25,-11,-11,-21,-19,-21,-7,-26,12,1,-17,-12,-5,-34,3,-43,32,-33,-7,-4,-7,-26,1,-18,24,-19,-10,-9'
+    ',2,-12,39,-9,19,-16,11,-17,6,-26,-8,-33,14,-14,16,-97,31,8,13,-13,20,11,-7,-9,10,-7,44,14,26,-5,'
+    '6,9,13,-17,0,-47,4,-2,42,23,32,-8,16,8,21,13,6,26,31,-32,27,5,2,-22,8,-4,25,7,12,11,16,-8,10,12,'
+    '-4,-12,4,-8,11,-4,8,10,8,-32,2,-41,6,-6,127,57,10,25,20,22,-11,15,2,5,6,-5,10,8,5,32,-7,-2,1,5,2'
+    '1,4,2,10,-2,20,-22,7,11,9,0,27,-14,0,24,18,3,13,20,14,-1,29,6,-14,11,-4,9,3,24,26,32,16,-1,22,-9'
+    ',23,6,56,23,49,21,16,2,7,-7,14,29,-23,33,-6,36,8,9,9,-34,34,-56,38,-29,33,25,19,3,10,-28,43,-15,'
+    '8,6,6,-13,4,7,2,-3,11,-26,13,-3,5,6,13,-3,6,-18,16,-11,3,39,1,6,10,12,-9,15,5,-31,39,3,5,10,7,10'
+    ',14,31,-9,54,13,5,8,-4,4,-37,33,7,16,12,3,29,-6,46,14,12,10,1,17,-8,6,-22,0,-37,16,-8,14,-16,8,-'
+    '10,1,-28,-11,-4,8,19,7,-12,19,-18,-11,-32,-6,12,6,2,6,-2,20,8,7,-5,20,-36,21,-4,24,-12,5,-22,-31'
+    ',-12,-5,6,22,-2,12,-5,4,-29,-47,-35,-39,-8,-25,-18,-27,-14,-8,-12,2,-2,5,-18,-19,5,-16,11,-6,-6,'
+    '-14,-15,-12,-23,-3,-11,0,2,12,-5,0,-58,-36,-41,-8,-9,-34,-47,-50,-41,-53,-30,-14,-62,-16],[5862,'
+    '7423,5,6,-17,17,3,4,51,-1,11,6,3,12,6,2,43,-8,10,5,-2,9,33,1,42,14,-26,7,4,4,44,6,64,24,26,1,45,'
+    '11,159,24,262,31,189,30,73,29,-4,4,8,10,-7,8,-38,14,-96,8,-118,-19,-29,-7,-30,-17,-81,-10,-49,-1'
+    '0,-149,-14,-177,4,-17,-5,2,-11,-11,-5,-66,3,-16,-3,-8,-9,-116,-13,-82,-19,3,-7,-31,-8,-17,-17,-5'
+    '2,4,-25,-3,-3,-2,7,-9,-31,-14,-41,9,-24,-2,-11,-5,1,-3,18,-9,34,1,16,-5,-59,-16,-33,-17,8,-7,48,'
+    '-6,-80,-8,-70,-46,-25,-2,-63,-17,44,-23,-7,-6,17,-13,71,10,54,-9,88,-6,53,7,17,13,41,16,-8,9,-17'
+    ',6,2,3,45,-7,11,8,-10,16,67,12,18,10],[5158,7207,31,8,36,-2,37,17,13,18,11,7,-4,4,10,8,-24,1,-15'
+    ',6,2,3,36,13,46,2,-12,5,-6,13,1,5,16,7,39,7,45,-1,60,11,155,-16,8,-3,-3,-6,-21,-11,0,-13,-7,-9,-'
+    '40,-4,-2,-10,-8,-7,-22,-5,-4,-14,4,-10,12,-9,-22,-28,17,-7,35,-36,63,-40,44,-18,74,-20,-48,-14,-'
+    '50,6,-14,8,-12,0,-13,-2,30,-12,-13,-3,-29,10,-5,-4,-15,3,-14,-3,-9,2,-2,5,-64,-2,-40,7,-5,-6,-12'
+    '2,19,23,4,-2,14,8,4,19,-2,-3,6,33,0,-57,17,3,3,-21,1,-9,6,1,8,8,5,-5,1,-45,-4,-49,4,-48,-7,-25,6'
+    ',-18,12,-8,18,1,10,14,14],[14233,5428,34,-31,4,-7,-7,-16,5,-1,-1,-6,-13,-2,-4,-6,7,-5,-5,-9,-11,'
+    '-4,-10,0,-18,9,-29,-11,1,-60,-6,-23,-14,-29,1,-34,14,-14,-9,-5,29,-22,20,-30,0,-22,-14,-37,8,-41'
+    ',-1,-65,-12,-49,-15,-33,27,-46,4,-28,-22,-42,8,-45,-17,-45,-4,-24,13,-44,12,-9,13,17,20,46,17,15'
+    ',11,1,14,-10,45,-5,7,-8,8,-45,15,33,-9,39,-11,6,-16,-2,-28,53,-19,13,-19,29,1,33,46,104,7,9,28,9'
+    ',35,2,32,-6,49,-36,17,-25,-2,23,-26,18,-9,13,-29,72,-23,38,-29,97,-6,5,-1,17,-14,11,-3,16,-10,20'
+    ',-2,41,15,26,0,35,-10,34,-30,49,6,35,-22,25,-7,3,-14,-14,-22,0],[14521,4358,-11,18,27,57,-50,-35'
+    ',-15,-5,-24,2,-38,15,-34,3,-88,54,-94,84,-27,-11,-8,-14,-1,-10,14,-22,6,-22,-2,-24,-10,-22,-2,-2'
+    '4,-24,-38,1,-26,-4,-10,-7,-8,-16,-2,-32,3,-33,13,-10,-4,1,-13,9,-12,-6,-10,-32,-22,-22,-8,-6,-20'
+    ',1,-17,22,-21,5,-16,-9,-21,-1,-18,14,-10,23,10,28,30,34,-8,15,7,-42,31,-20,1,-20,16,2,15,13,12,2'
+    '3,0,28,-22,42,21,44,3,66,-32,73,-26,7,8,12,34,15,18,39,28,23,9,43,-2,29,5,43,18,16,-1,11,12,21,1'
+    '0,-16,0,-18,-11,-15,2,-13,28],[13314,3430,-12,3,-36,-8,-24,10,-11,-3,-7,-9,-9,-39,-41,21,-51,-10'
+    ',-16,7,-15,-4,-3,28,6,9,5,4,35,2,91,61,44,40,22,9,35,5,11,-10,24,5,36,0,119,24,10,-3,-4,-13,10,-'
+    '6,35,-3,12,5,30,22,-9,22,6,13,29,24,34,38,5,21,-3,25,12,18,48,14,2,-8,-44,-32,9,-9,3,-19,23,-9,9'
+    ',2,17,18,81,27,31,25,26,37,47,26,16,40,28,38,11,35,13,18,2,21,-7,24,-25,6,17,10,10,24,-9,34,11,1'
+    '3,17,4,8,8,6,16,0,19,29,0,5,-31,7,-6,19,11,18,-6,11,11,1,22,-4,3,-40,-10,9,34,16,0,22,-13,19,5,-'
+    '6,-30,3,-38,3,-11,34,-32,19,-50,-1,-36,-8,-32,-24,-14,-11,-21,-8,-36,-36,-6,-15,-19,-3,-20,11,-4'
+    '8,-4,-36,-3,-11,-24,-27,-16,-50,5,-17,25,-34,-23,-6,-18,-15,-4,-24,-7,-9,-29,-14,-14,-14,-8,1,-4'
+    ',5,4,5,-1,29,27,29,-11,8,-16,-1,-6,-17,-12,-8,2,-9,7,-7,-6,-10,-21,15,-22,-2,-12,-13,-4,-31,-11,'
+    '-14,-14,-8,-8,8,4,27,10,6,-18,9,-14,-3,-33,-36,-6,-13,-65,6,-48,-8,23,12,-1,7,-25,0,-7,6,-2,-11,'
+    '-7,1,-2,25,5,6,-10,1,-11,-7,-16,-30,35,-25,-3,-11,-52,-14,-41,-62,-22,-7,-25,6,-32,46,-3,28,28,2'
+    '1,4,12,-6,3,-32,-2,-30,14,-27,-2,-26,-5,-33,-21,-43,-6,-31,-13],[13470,3393,-6,11,0,19,-14,-2,-4'
+    '2,15,-13,-1,-24,-11,-11,0,3,-17,-16,-10,-34,-4,-14,16,-5,1,-16,-11,-14,-30,-61,-35,38,9,0,-10,10'
+    ',-4,-8,-23,6,-5,1,-9,21,-2,-7,-14,23,-1,11,9,4,14,13,10,14,28,34,15,33,-6,22,-20,6,19,14,17,36,2'
+    '1,-7,3,3,8],[13198,3284,3,8,-10,5,4,8,-10,7,5,13,-36,2,17,23,-1,10,-12,5,-21,-8,-20,3,-11,7,-11,'
+    '20,-11,5,-12,1,-24,-10,-11,-20,-20,-3,-34,-16,1,-12,-23,2,-3,-10,32,-22,9,-17,-16,4,-15,17,1,-18'
+    ',14,-15,-6,-16,28,20,20,-9,9,2,-1,15,-15,0,-5,25,11,8,14,-9,17,-26,2,-10,-7,-7,14,-4,-25,-40,-20'
+    ',-13,0,-32,13,-17,-3,-15,-14,-4,5,-12,39,-11,5,9,-10,13,2,16,10,16,12,-1,2,-9,-10,-4,9,-31,-10,-'
+    '25,41,24,-6,12,3,6,27,-4,12,27,0,21,20,59,32,37],[12191,2506,-32,22,-7,0,-15,-12,-33,-13,-41,-55'
+    ',-50,-83,1,-25,-6,-31,24,-54,26,-19,16,-40,10,-4,11,58,35,47,10,20,21,88,22,48,-1,29,11,15,-2,9]'
+    ',[11097,1988,-8,11,-24,15,-5,-4,-1,-12,-20,8,0,-8,-5,6,-17,1,-9,-6,-43,-1,-14,-8,-25,-2,-8,-11,1'
+    '0,-1,-61,-46,-3,-39,6,-37,33,-17,49,-15,18,4,12,14,20,2,5,3,-2,6,40,24,19,54,18,27,19,10,-4,22],'
+    '[8183,743,-16,35,-25,37,-5,28,-14,8,-3,15,-18,27,-8,4,-23,40,-46,43,-27,1,-3,-7,10,-9,21,-4,17,-'
+    '13,-11,-1,-23,11,1,-37,-17,-31,1,-21,-9,-28,-4,-36,-3,-3,-3,3,0,24,-4,-11,15,-135,24,-68,17,-14,'
+    '23,-6,22,3,59,22,33,23,13,18,9,29,1,39,-4,14],[4440,-1992,5,49,-21,35,-1,34,-19,45,-3,49,-7,22,4'
+    ',19,44,69,2,46,47,7,31,22,12,-9,26,5,10,18,46,7,15,-16,9,-2,4,2,-10,9,-1,10,15,20,46,29,5,-2,4,-'
+    '21,7,2,4,13,-5,15,19,21,7,17,11,6,4,-11,-7,-18,5,-1,29,37,19,-3,-15,13,-4,17,23,41,-10,10,0,13,1'
+    '4,13,22,-12,15,18,21,11,18,16,12,43,-13,37,14,3,28,36,5,0,68,-99,23,-97,7,-69,20,-42,4,-24,-8,-2'
+    '4,-19,-33,-19,16,-13,34,-15,1,-8,-7,5,-56,12,-18,1,-23,-11,-21,4,-12,-17,-11,-15,-31,3,-66,-12,-'
+    '44,-44,-119,-57,-182,-44,-112,-35,-140,-19,-35,-19,-57,-15,-19,-30,-17,-57,-8,-65,-33,-39,2,-31,'
+    '21,-46,10,-9,11,-22,12,-13,36,-24,34,-2,56,7,21,-15,45,-21,29,-10,41,1,33,7,26,10,14,6,29,30,18,'
+    '11,31,33,49,16,46],[5306,3904,4,-28,-8,29,7,4,-3,-5],[5010,4483,-10,11,2,10,9,4,-7,-13,14,-10,-8'
+    ',-2],[5029,4508,6,0,-7,-12,-2,6,3,6],[-16025,-7927,-191,48,-96,7,-14,0,-87,-28,-7,-5,-8,-20,5,-7'
+    ',91,-18,145,-20,157,-14,125,3,5,7,-68,34,-57,13],[-6673,-7838,-31,6,-44,-4,-315,-54,-82,-23,-22,'
+    '-12,-11,-25,25,-12,55,-5,65,-1,60,6,10,10,-6,8,44,23,177,53,75,30],[-4395,-7860,16,17,1,9,-7,8,-'
+    '24,9,-76,18,-114,16,-84,4,-63,-3,-162,-23,-27,-17,-87,-39,-16,-17,14,-5,-26,-12,-2,-15,-21,-18,3'
+    '5,-6,9,-9,-11,-8,-78,-31,-112,-32,-6,6,-10,1,-59,-11,-34,7,-65,-38,-31,-8,0,-19,19,-11,439,9,14,'
+    '7,44,7,566,45,8,3,-4,6,-25,10,47,2,20,9,8,9,5,22,-3,10,-24,18,-6,14,-27,26,-18,8,-163,3,14,10,14'
+    ',3,112,6],[-5950,-8012,-29,2,0,10,8,12,-16,10,-71,4,-76,-15,-1,-6,10,-3,-5,-2,-38,-2,-1,-11,9,-8'
+    ',41,-5,-44,-8,-435,-4,-19,3,-5,9,-16,4,-39,-7,59,-15,191,-31,20,10,93,6,20,-18,27,-6,209,-12,75,'
+    '22,6,7,4,32,20,13,21,1,-18,8],[-7054,-7266,133,13,6,10,61,27,30,34,1,9,-8,82,-3,5,-11,4,-1,14,-6'
+    '3,59,-33,51,-29,26,-20,5,-17,-4,3,17,-6,18,-31,17,-145,-15,-19,-6,-8,-18,6,-9,34,-15,2,-10,-16,-'
+    '39,15,-14,61,-15,40,6,39,-2,71,-24,-71,4,-73,-18,-13,-12,2,-5,25,-8,93,-11,11,2,6,-9,-5,-16,-51,'
+    '18,-81,-3,-31,-13,-22,-4,-99,8,-35,-6,7,-6,78,-15,-41,-5,-85,7,-13,-3,-2,-5,3,-5,21,-8,-10,-5,-7'
+    '6,19,-19,-7,4,-18,-47,10,-24,-2,-24,-9,1,-10,-5,-8,3,-5,56,-18,36,0,43,-11,46,15,-29,15,5,2,85,-'
+    '7,52,26,15,2,44,-18,100,-9,-7,-8,-14,-4,-87,-9,24,-13,25,-3,88,12,32,-7,-22,-9,-44,-5,-187,9,-35'
+    ',-13,8,-7,23,-10,25,-1,16,-8,145,6,38,-5],[-6575,-5465,-49,12,-105,48,-72,49,-15,25,-33,5,-3,8,9'
+    ',12,10,4,9,-6,-10,18,-23,21,-22,11,-38,-9,-24,18,-9,0,-26,-24,-18,-9,-25,10,-19,-3,25,-19,-26,-9'
+    ',-7,-18,13,-17,12,-3,45,7,37,-3,4,-11,-74,-24,-6,-4,0,-13,16,-22,94,-32,-26,-14,-5,13,-38,13,-25'
+    ',-7,-25,3,-1,7,-29,14,-9,13,25,2,-15,36,-17,-10,6,-9,-23,-6,1,-23,10,-13,22,-6,24,-19,-1,-4,-39,'
+    '4,0,14,-10,2,-28,-11,-28,4,-25,-10,-19,7,-13,-10,3,-7,7,-3,39,1,21,-7,73,-12,22,6,14,-7,11,0,31,'
+    '11,23,-15,41,-5,86,9,129,-10,42,-11,56,11,35,-1,25,5,17,20,-19,5,-38,-2],[-7451,2038,-22,19,-23,'
+    '10,-76,4,-2,10,14,3,-6,6,6,9,-12,12,-35,2,-19,10,-39,5,-8,8,-14,-3,3,7,-26,19,-15,-11,-12,13,19,'
+    '-1,4,4,-36,23,-8,2,8,-10,-14,1,-23,10,-27,21,-55,26,-59,4,-27,17,-13,16,-17,9,3,6,-54,5,-29,16,-'
+    '49,-5,-12,11,-32,-4,-52,7,-57,-15,-59,-7,-86,-35,-24,-24,-2,-12,5,-19,-20,-4,-36,-17,5,-3,34,10,'
+    '0,-15,47,16,13,23,52,5,64,47,90,-2,14,-8,-1,-9,-37,-11,23,-18,41,-3,8,-8,8,1,6,3,3,13,15,-20,54,'
+    '-1,1,6,26,-25,87,-28,17,-4,37,7,9,-3,15,-18,9,-36,37,-29,12,-4,77,-8,12,-15,1,-8,-45,-33,-17,-22'
+    ',156,13,39,-3,22,-7,26,0,14,12,3,-11,49,16,38,2,10,9,-2,12,-34,9],[2686,8016,-102,2,-105,12,-18,'
+    '-1,-31,7,-7,-6,-28,0,-26,-9,-58,-2,21,24,-31,4,-56,-7,-3,-3,2,-18,-15,-14,-59,11,-5,6,-10,2,-65,'
+    '1,-54,15,-63,8,-12,-2,20,-13,-6,-10,-57,10,1,-7,16,-7,19,-3,-20,-4,-56,7,-86,-5,42,-8,52,-2,-60,'
+    '-11,6,-7,41,-10,67,-3,72,5,66,-3,-29,-12,-67,0,-15,-4,46,-10,63,-5,10,-4,201,1,-17,-8,20,-10,105'
+    ',-4,80,17,40,-2,49,6,37,22,107,25,12,4,-5,15,-29,10],[2072,7867,38,1,29,6,-8,6,-81,18,27,8,-61,9'
+    ',-5,-7,-22,-2,-14,9,-77,3,-30,8,14,8,0,9,-7,6,-35,12,-13,-1,-60,-21,6,9,-4,5,27,17,-13,10,-61,14'
+    ',-25,2,-18,-5,-40,14,-30,-4,-3,-6,4,-7,-14,-4,-14,-16,6,-16,46,-54,-58,19,-71,51,-22,9,-24,3,-55'
+    ',-21,-3,-11,5,-10,-10,-4,-58,14,-5,9,-77,0,48,12,74,3,14,4,-1,6,-22,4,-94,-8,-47,4,-6,-2,7,-9,-5'
+    '9,11,-45,-4,-10,-6,-28,8,-19,-4,13,-12,-7,-6,0,-6,47,-39,31,2,10,6,-4,7,40,1,10,-2,-19,-12,9,-12'
+    ',11,-5,31,-3,-13,-5,-72,8,-18,-3,49,-12,-10,-2,1,-9,49,-13,40,-21,49,-14,96,3,53,14,-21,8,9,9,-5'
+    ',10,22,4,33,-9,30,15,6,-1,1,-5,-14,-13,17,-12,52,2,59,17,25,0,-33,-16,28,-9,44,1,-17,-5,-122,-4,'
+    '-12,-3,4,-7,-36,-1,-109,-15,6,-6,-37,8,-26,-6,11,-18,30,-8,76,1,74,9,47,-2,85,5,12,-10,-211,-11,'
+    '-22,-16,-32,5,-31,-2,-7,-5,5,-11,32,-17,75,-14,43,-20,91,-28,24,-3,36,8,-8,15,27,16,-10,8,29,18,'
+    '18,17,23,10,38,2,7,6,10,21,4,24,56,5,1,5,-5,5,10,14,62,29,104,6],[968,4082,-13,11,7,9,-39,24,-41'
+    ',-31,-25,-10,-21,0,-14,6,-3,-26,16,-15,12,-21,-6,-37,14,-8,-1,-11,-9,-1,-5,-24,2,-27,23,-28,23,-'
+    '2,9,5,9,28,43,-10,7,3,15,85,-7,25,17,23,-13,32],[864,4212,6,-2,0,-6,-8,-11,12,0,2,-6,-4,-11,17,-'
+    '6,-8,-11,38,-21,18,30,3,25,16,23,-3,39,-8,11,1,32,-10,4,-2,-25,-5,-8,-15,4,-43,-18,-14,-19,11,-8'
+    ',-11,-6,7,-10],[1534,3822,-22,-7,-33,2,-28,-12,-46,-1,-26,-6,-50,21,-13,0,-11,-11,-15,-5,-17,15,'
+    '-18,-13,-11,-23,9,-15,11,-8,28,-2,88,-43,34,-4,12,-5,24,-25,28,-9,33,-2,1,15,18,22,-13,15,6,3,-1'
+    '1,9,-2,13,13,32,40,49,-13,2,-16,-7],[-5211,6949,21,11,-11,9,3,3,-7,9,-68,13,-57,27,-71,9,-36,2,-'
+    '42,-10,-4,-9,6,-8,45,-11,-47,1,-13,-24,19,-10,91,-7,16,-7,-52,-7,43,-14,98,10,66,13],[-12342,487'
+    '0,-8,-12,-32,50,-18,14,-64,21,-19,10,-10,11,0,9,-60,61,-117,18,-122,34,-32,-3,-11,-9,8,-13,21,-1'
+    '1,33,4,-2,7,28,-3,-6,-4,4,-14,-15,8,-27,-3,-5,-10,12,-6,-2,-16,39,3,12,-11,10,9,7,-7,-2,-12,9,-7'
+    ',13,0,8,6,22,-6,15,-16,18,-6,22,1,-41,-8,-1,-17,13,3,12,-7,6,6,22,-7,8,3,-4,-11,3,-4,11,3,20,-9,'
+    '-19,-10,29,-14,61,6,12,20,-4,-18,-29,-21,2,-6,10,-5,90,-27,55,-12,12,11,12,-2,5,5,-14,24],[-6868'
+    ',1890,-22,9,-72,13,1,9,29,-1,9,7,-9,6,-42,-3,-8,7,-14,30,-23,-3,-25,13,-20,1,-19,11,-12,2,-33,-6'
+    ',-28,5,-27,-20,-39,4,-42,16,-24,3,-44,-8,-8,-4,-4,-9,4,-6,35,-5,35,-17,-7,-20,3,-11,-7,-6,46,-40'
+    ',-3,-10,-24,-2,-17,-12,-80,9,-64,14,-16,-4,-9,-17,6,-10,33,-13,21,-18,13,15,24,6,63,-10,38,7,44,'
+    '1,35,-22,8,-24,19,-13,33,43,4,18,31,10,12,-1,16,-12,30,3,16,12,25,7,50,0,34,-3,21,-19,6,0,10,14,'
+    '12,6,10,19,-34,29],[-4838,-35,-1,5,-13,5,-60,9,-42,-7,-71,11,-21,-4,-19,-11,-13,-42,0,-32,7,-7,1'
+    '3,-2,-2,-5,-13,2,-3,-11,16,-46,16,-10,33,5,4,5,26,-9,22,8,8,20,28,-9,6,19,8,-10,16,3,13,15,-4,10'
+    ',14,12,13,22,0,21,7,2,12,31],[-399,5758,70,13,25,-4,97,3,20,-9,9,-14,-24,-21,-24,-40,-24,-22,-18'
+    ',-13,-63,-15,42,4,24,-8,-2,-7,-10,-5,-21,-1,-38,-16,-43,7,18,-8,56,-7,21,8,24,0,45,-13,49,-33,43'
+    ',-87,56,-20,59,-38,-13,-10,33,-41,-39,13,-39,-2,37,-3,42,-22,14,-13,9,-18,-31,-25,23,-10,10,2,18'
+    ',14,50,-1,32,-7,28,-14,6,-7,3,-21,-16,-35,-18,-13,-18,-2,4,-12,-8,-5,-23,1,-21,-8,15,-4,3,-4,-4,'
+    '-8,-47,-10,11,1,16,-9,20,-3,52,0,-1,-18,-36,-13,-8,-12,-19,0,-47,-15,-50,3,-59,-4,-63,13,9,-8,-1'
+    '9,-7,-51,-2,7,-10,-8,-3,-31,4,-8,-4,-35,11,-22,1,-40,-9,-18,-31,-10,-8,-11,-1,-40,16,-54,-10,-28'
+    ',-13,-11,-12,-11,-2,-20,8,-19,-5,-4,3,0,5,9,7,23,5,45,28,31,25,6,20,22,5,11,16,35,4,70,-2,71,53,'
+    '-31,-16,-24,-4,-31,-15,-27,2,-33,18,-34,-2,14,9,-30,8,-21,0,-30,-11,-22,8,-8,15,-6,2,17,12,71,20'
+    ',23,13,17,21,-10,7,4,9,-8,12,2,10,-58,-11,4,8,23,12,14,13,51,17,43,4,23,-9,-7,13,11,4,14,-12,17,'
+    '0,-16,4,-15,16,0,8,13,14,-10,4,-2,7,2,7,13,5,3,22,-30,-5,-40,34,-2,9,13,21,19,14,23,4,-51,0,-41,'
+    '-17,-17,0,-12,7,-27,-9,-30,9,-9,-16,-23,17,-3,13,11,0,38,51,-4,10,-17,10,6,23,25,1,-26,11,4,11,-'
+    '13,-13,-16,-4,-12,-10,-1,18,22,16,-38,-21,-4,-4,3,-21,-17,-38,-9,-6,-12,3,9,26,18,18,-12,1,1,25,'
+    '8,19,14,26,20,25,-46,-23,-21,3,-11,13,-16,3,40,13,-13,5,27,20,3,13,-10,10,-13,5,-3,6,6,6,18,5,-1'
+    '6,9,7,18,6,6,45,0,-25,19,7,17,33,2,-8,12,2,14,9,6,17,-1,9,-6,23,6,6,-6,117,14,21,-2,-6,-22,-10,-'
+    '9,-78,-36,-5,-11,18,-3,-22,-14,-5,-10,14,0],[-954,5166,-58,-6,52,27,-48,-10,-26,3,-4,7,47,25,-48'
+    ',1,3,8,23,7,36,-3,-14,15,28,15,85,13,-21,8,-19,-13,-38,2,-36,-8,46,25,7,8,-7,5,16,15,37,11,-21,4'
+    ',-37,-1,-12,9,-25,1,8,5,-29,2,4,7,-7,7,40,5,-19,6,1,7,32,8,0,7,-33,-2,5,24,-7,-2,-5,11,-11,-3,3,'
+    '10,50,5,24,-1,17,-9,15,8,45,-5,-7,11,15,9,24,7,10,13,-33,-3,-30,7,38,21,-1,13,12,13,52,4,-1,6,9,'
+    '1,11,-14,-10,-15,18,8,-4,20,22,5,-7,6,6,1,35,-13,-21,-10,-5,-5,4,-3,15,2,8,10,47,6,35,-2,26,-30,'
+    '15,-10,1,-6,-17,-8,0,-4,30,2,5,-4,5,-18,-19,11,1,-17,10,-1,-5,-10,-22,-3,-19,-19,-20,4,6,-7,-19,'
+    '-3,21,-41,-1,-21,12,-44,-14,-19,-5,-20,-24,-19,14,-10,-24,-6,-22,2,-11,-5,-8,9,-3,-8,-53,-7,-9,-'
+    '11,-25,-5,-19,-11,-35,6,6,-4,0,-11,-46,-16,-49,-8,-16,3,-38,-5,13,12,17,6],[-18000,6898,53,-7,19'
+    ',-8,41,-8,33,-16,-21,7,6,-11,59,-13,8,-10,-4,-6,26,8,-48,18,-9,5,12,-3,72,-25,-11,-5,5,-2,29,0,1'
+    '95,-54,12,-23,-14,-9,21,1,16,7,15,-9,-9,-26,16,-17,1,-14,-10,-6,-5,-10,25,-2,17,-6,11,-20,31,13,'
+    '6,-9,-5,-15,30,20,-15,9,-28,6,-3,5,17,6,5,9,-8,16,-25,10,-18,1,-3,4,87,5,52,-7,-16,-12,-3,-10,9,'
+    '-1,8,2,-5,11,4,2,23,-5,44,1,-49,11,121,-13,44,-25,85,-34,4,-2,-13,-7,30,4,11,-9,-5,-3,46,-3,5,-8'
+    ',-10,-6,-33,1,-38,-14,-2,-21,-11,-4,-33,4,-42,15,-3,-2,5,-4,35,-20,-12,-5,-30,3,-44,-3,-5,4,-32,'
+    '4,-16,9,-34,1,43,-18,-7,-5,19,1,2,-3,-10,-15,-35,-3,37,-4,8,-16,-38,-14,-48,-6,-2,-3,29,-3,-12,-'
+    '9,2,-7,41,-9,11,-11,-36,-2,-5,9,-11,3,-5,-2,3,-14,-9,-7,-15,-2,-22,7,0,6,7,3,-2,10,-27,-17,-13,-'
+    '1,-84,36,-47,9,-40,1,-41,19,-1,22,-6,12,-17,12,-97,14,-43,-11,-92,0,-12,9,3,15,-29,12,-15,17,19,'
+    '-2,6,11,10,8,6,20,-34,-21,-24,4,-3,15,-5,-7,-15,-2,1,-13,-29,-3,-6,5,-10,-16,-1,-12,6,-10,36,-16'
+    ',2,-12,-35,-33,-30,-12],[-1479,6633,-33,-20,11,-7,31,-4,1,-12,-14,-14,44,3,7,-11,-15,-10,30,6,55'
+    ',-12,-5,-12,-13,-5,16,-7,-11,-9,19,-7,-4,-8,-25,-5,0,-13,-19,-12,-35,1,1,-7,-9,-4,4,-10,-20,-12,'
+    '-39,-12,-24,0,-57,-12,-81,-31,-118,-16,-9,-7,3,-5,-7,-5,-13,-4,-17,3,3,-6,-43,-6,-155,15,-29,13,'
+    '2,6,11,1,-5,5,-24,-7,-8,5,-41,10,3,5,-34,-8,-120,-3,-9,19,4,6,19,-9,32,5,32,14,20,17,21,3,-19,2,'
+    '-40,-9,15,8,-10,2,5,10,36,12,-8,2,-44,-12,-21,9,7,11,-22,6,-88,3,-47,-8,-21,12,11,6,57,3,15,5,9,'
+    '-3,32,8,90,0,9,6,2,8,-26,-6,-47,7,67,25,-106,13,-100,-17,-58,12,23,8,39,-7,-15,8,-8,16,47,-10,33'
+    ',7,-41,3,-13,7,31,3,-26,14,4,5,31,-5,-17,9,15,7,39,-9,4,-11,36,5,5,-5,-1,-11,18,4,-1,16,-50,14,4'
+    '7,6,-21,7,-43,0,23,10,46,-1,102,-40,-11,-6,21,-7,-6,-16,-9,-4,-20,2,19,-8,1,-6,10,0,-7,-11,20,-5'
+    ',10,-15,19,30,14,7,12,2,23,-9,9,15,0,31,15,7,18,-5,38,-25,16,-3,6,4,-3,17,8,10,53,10,57,-30,14,-'
+    '15,4,10,-22,26,2,7,39,-2,36,-18,40,24,31,-7,35,7,6,8,-11,17,5,3,50,3,28,-15,1,-7,16,-6,30,3,38,1'
+    '2,26,0,-19,-5],[-6485,1833,-4,4,-13,0,17,-4],[17857,5198,-6,1,-3,-5,3,-4,7,2,3,3,-4,3],[1418,360'
+    '6,7,-5,7,3,-14,2],[1387,4076,0,-5,9,1,-9,4],[1195,3684,-1,-6,11,-2,-3,6,-7,2],[619,5348,14,3,-14'
+    ',-3],[571,5347,22,-1,-22,1],[503,5331,-12,-6,20,6,-8,0],[542,5343,-23,-4,23,4],[-17904,-1799,5,1'
+    ',-6,6,-3,-2,4,-5],[-17885,-1820,9,-3,0,4,-9,-1],[-17833,-1788,-3,-4,11,-3,-8,7],[-15151,-1657,3,'
+    '-10,4,5,-7,5],[-14981,-1755,3,6,-12,2,1,-8,8,0],[-12035,3406,-9,-3,13,-1,-4,4],[-11953,3328,-5,0'
+    ',4,-6,10,0,-9,6],[-6776,-5582,-7,-1,0,-3,22,-3,10,5,-25,2],[-6997,1257,-7,4,-3,-6,17,-13,-7,15],'
+    '[-6538,1097,-3,-3,4,-3,16,0,-17,6],[-7317,1897,-11,-2,-1,-5,47,-19,2,7,-37,19],[-2516,3702,-4,-2'
+    ',4,-6,13,0,-5,8,-8,0],[1698,4293,21,-1,-10,4,-44,4,9,-9,24,2],[1712,4312,-46,9,-28,0,30,-9,44,0]'
+    ',[1663,4327,-21,5,3,7,44,-8,-26,-4],[-265,4947,10,-4,4,6,-14,-2],[-222,4927,-2,-9,23,0,-1,5,-20,'
+    '4],[14568,1873,3,6,-6,2,3,-8],[14563,1638,3,-4,6,2,-9,2],[14515,1416,7,-5,5,7,-12,-2],[-5987,439'
+    '5,-25,0,20,-5,19,10,-14,-5],[-9684,2809,-2,4,-4,-1,-14,-22,20,19],[-8894,2968,7,7,-7,-7],[-8872,'
+    '3026,16,-4,-16,4],[-8811,3027,-21,-3,16,-1,9,2,-4,2],[-6311,1809,9,-7,1,8,-10,-1],[-6557,1814,7,'
+    '-4,21,3,-28,1],[-6262,1713,9,-1,0,5,-9,3,0,-7],[-6443,1851,1,-5,10,6,-11,-1],[-6479,1834,13,1,-1'
+    '3,-1],[-6465,1844,-2,-4,12,4,-10,0],[-6489,1770,31,5,-19,4,-11,-2,-1,-7],[-7745,2508,-11,-5,10,-'
+    '4,19,5,-18,4],[-8109,2473,-5,-2,5,-2,16,7,-16,-3],[11413,2229,10,-8,2,5,-12,3],[-7662,3469,7,-4,'
+    '-7,4],[-17508,-2113,-8,-13,-20,15,4,4,16,-10,8,4],[5266,4552,-11,-5,11,-7,3,6,-3,6],[4799,4555,-'
+    '4,10,-3,-9,5,-9,2,8],[-5850,-5200,-4,-3,11,-7,-1,9,-6,1],[4257,1541,-1,-13,6,9,-2,6,-3,-2],[4005'
+    ',1610,-5,-6,11,-5,-6,11],[3692,2543,-39,26,-3,-4,22,-12,16,-15,4,5],[3659,2570,-1,16,-4,-13,5,-3'
+    '],[10127,297,5,2,-1,8,-4,-10],[13468,-646,-5,-2,3,-8,7,5,-5,5],[12355,-151,-6,-2,-1,-15,5,-3,7,1'
+    ',2,7,-7,12],[12670,3440,-5,-5,12,-5,-7,10],[15280,7619,-24,-5,23,-5,10,3,-9,7],[6722,6958,-19,-1'
+    '0,23,-4,8,9,-1,4,-11,1],[6646,7070,0,7,-7,-4,2,-11,16,-12,-11,20],[5524,8033,-26,-7,22,-3,28,4,-'
+    '24,6],[1840,5909,-3,-7,12,8,-9,-1],[1862,5955,-7,-7,2,-4,13,8,-8,3],[-12285,4720,-6,5,2,2,4,-7],'
+    '[10565,-1045,-7,-6,12,-5,1,13,-6,-2],[-8634,1644,8,-1,-37,-13,29,14],[16374,-7471,2,-9,22,-3,23,'
+    '22,-47,-10],[16468,-6726,2,-15,-6,-9,5,-6,14,2,8,12,-23,16],[16759,-7802,-17,1,-56,-19,-75,11,-1'
+    '0,-4,11,-14,16,-4,66,9,44,-3,26,11,-5,12],[16327,-6677,-3,6,-15,1,14,-17,5,-1,-1,11],[16845,-773'
+    '9,-99,0,-38,7,3,5,-12,8,-27,3,-21,-3,-10,-6,22,-13,-41,-14,51,-33,66,20,113,-3,83,16,-7,7,-83,6]'
+    ',[16989,-7346,-15,14,-26,-22,23,-9,13,3,12,9,-7,5],[16272,-7560,-13,-7,20,-3,18,13,-25,-3],[1004'
+    '1,-6547,-14,-13,2,-5,26,-5,43,2,28,15,-18,13,-20,2,-27,-2,-20,-7],[8534,-6672,-3,-6,5,-7,29,-13,'
+    '29,9,-13,12,-47,5],[9230,-6571,-5,-3,8,-7,34,4,-17,7,-20,-1],[8638,-6667,-15,-6,11,-6,31,7,-27,5'
+    '],[8516,-6652,-9,-6,7,-6,19,3,-17,9],[6980,-7189,-11,-8,5,-7,5,-1,13,13,-12,3],[6867,-7210,-26,-'
+    '20,41,7,2,6,-11,8,-6,-1],[9673,-6606,-23,1,-10,-3,-9,-11,8,-3,54,2,9,4,-1,6,-28,4],[7207,-7052,-'
+    '19,11,-8,15,-15,-8,1,-16,18,-12,24,1,-1,9],[16231,-6625,-1,-15,21,-12,10,4,-30,23],[10017,-6613,'
+    '-9,-7,18,-2,3,11,-12,-2],[9866,-6645,9,-3,20,6,-35,4,6,-7],[10319,-6533,0,9,-5,5,-25,6,-13,-4,3,'
+    '-7,32,-7,7,-14,22,0,-21,12],[-14758,-7666,-19,8,-23,0,42,-8],[-14576,-7551,-39,-6,91,-14,-18,12,'
+    '-34,8],[-14687,-7684,-22,0,-3,-3,8,-6,-4,-6,92,4,-8,7,-63,4],[-13283,-7442,-3,-4,31,-4,19,9,-47,'
+    '-1],[-14924,-7690,-6,-2,6,-7,23,-3,57,4,-80,8],[-14837,-7679,5,2,-6,3,-28,2,-67,0,-14,-4,49,-9,6'
+    '1,6],[-13123,-7441,-53,9,-40,-11,32,-11,66,-6,11,2,10,6,1,6,-2,5,-25,0],[-11955,-7411,49,11,18,1'
+    '2,-8,7,-26,3,-58,-3,14,-18,-25,-9,9,-4,27,1],[-11638,-7387,-100,-21,-2,-4,17,-7,66,6,6,3,-7,4,43'
+    ',15,-23,4],[-12749,-7441,-64,8,3,-14,58,-17,29,6,8,10,-8,5,-26,2],[-14922,-7734,-16,6,-28,-2,22,'
+    '-7,51,-2,-29,5],[-16280,-8286,-100,2,17,-6,8,-9,50,-11,75,-4,66,11,-116,17],[-15008,-7674,-10,5,'
+    '-69,-5,21,-5,58,5],[-14715,-7620,26,-6,20,1,-26,15,-47,3,7,-8,20,-5],[-14695,-7655,-33,0,-8,-7,4'
+    '5,-9,12,8,-16,8],[-16047,-8159,-47,13,-152,15,-74,3,-67,-4,-8,-7,70,-9,278,-11],[-15102,-7722,-4'
+    '9,-5,104,-10,11,2,-66,13],[-15393,-8003,-10,4,-164,22,-8,-6,71,-7,10,-7,101,-6],[-14929,-7714,6,'
+    '2,-6,3,-13,1,-9,8,-36,12,-52,-2,-40,-8,33,-10,117,-6],[-15826,-8195,-73,17,91,-33,25,8,-43,8],[-'
+    '607,-7040,-37,-5,28,-16,27,6,-6,12,-12,3],[307,-7038,-49,-15,12,-9,34,2,13,5,9,10,-3,5,-16,2],[-'
+    '340,-7106,0,-6,9,-8,36,-1,-31,16,-14,-1],[131,-7002,-28,-3,-8,-4,0,-8,21,-21,5,0,25,24,-5,10,-10'
+    ',2],[-253,-7077,-22,8,-29,2,-53,-3,56,-15,5,-9,16,-4,-3,-13,5,-6,41,13,28,22,-44,5],[413,-7042,2'
+    '4,-8,16,2,9,11,-3,8,-9,4,-24,1,-19,-5,6,-13],[4864,-6670,-28,0,-6,-7,8,-4,39,3,1,5,-14,3],[1591,'
+    '-6973,-21,-4,-13,-11,9,-8,50,-11,16,23,31,9,-38,5,-34,-3],[2669,-7011,-39,4,-32,-13,-3,-6,6,-11,'
+    '46,-8,32,3,8,9,-18,22],[-3099,-7982,-69,19,-32,-10,18,-12,140,-16,81,10,-26,9,-79,9,-12,8,-8,-8,'
+    '2,-4,-15,-5],[-3399,-7928,-154,19,-52,-9,-52,-3,-3,-7,255,-8,12,4,-6,4],[-274,-7051,6,5,-3,14,-2'
+    '4,4,-34,-6,-21,-15,6,-5,70,3],[-2060,-7420,-5,10,4,21,9,9,-6,18,-29,-6,-15,-20,-11,-6,-80,-12,-1'
+    '1,-5,87,-2,19,-10,13,-21,11,-4,25,-1,7,5,0,12,-18,12],[-1630,-7248,-16,1,-6,-6,7,-12,13,-5,22,2,'
+    '-20,20],[-1279,-7201,-9,1,-8,-6,7,-8,17,-5,21,2,-28,16],[-3196,-7960,3,3,-22,4,-23,0,-20,-13,24,'
+    '-1,38,7],[-4578,-6059,7,-6,31,0,23,-8,-4,8,-29,10,-43,2,-1,-9,16,3],[-5412,-6120,-6,-7,11,-3,5,1'
+    '6,-10,-6],[-6842,-7933,-13,-11,14,-2,98,-4,17,5,-4,6,6,6,17,6,-96,4,-39,-10],[-5539,-6107,-5,-4,'
+    '14,-14,63,13,-72,5],[-5547,-6320,-12,7,-45,-3,-35,-7,-12,-10,5,-9,8,-2,55,14,67,-5,8,3,-8,12,-31'
+    ',0],[-5576,-6342,-48,-5,28,-11,24,9,-4,7],[-5745,-6446,2,-8,19,-3,25,10,10,14,-56,-13],[-5906,-6'
+    '224,-14,-4,14,-7,22,5,-22,6],[-5856,-6224,9,10,13,2,16,-5,5,2,-4,3,2,6,19,-2,32,8,-10,8,-24,1,-4'
+    '2,-3,-28,-7,-32,-20,18,4,26,-7],[-6202,-6403,-2,-5,9,0,15,11,-22,-6],[-6198,-6930,-26,12,-20,3,-'
+    '13,-3,7,-11,28,-20,5,-15,8,-9,9,1,9,19,10,2,3,7,-4,6,-16,8],[-6318,-6474,-28,-6,-10,-11,24,5,14,'
+    '12],[-6209,-6423,3,9,-21,5,0,5,-6,3,-12,0,-16,-11,13,-9,-2,-4,-28,-23,20,-3,7,6,11,-1,21,9,2,7,8'
+    ',7],[-6241,-6297,9,10,-21,-5,-13,-15,25,10],[-5953,-6245,18,4,-5,4,-26,2,13,-10],[-5635,-6317,9,'
+    '0,20,9,0,6,-43,4,-12,-7,26,-12],[-6080,-6266,10,4,32,0,6,-9,10,-4,37,14,-15,-1,-14,7,-44,-2,-22,'
+    '9,-17,-11,-18,0,9,-9,26,2],[-5734,-6388,24,4,-6,2,-52,1,34,-7],[-6133,-6986,-6,-3,1,-6,27,-1,-4,'
+    '8,-18,2],[-6069,-6880,3,3,-4,5,-11,3,-20,-2,32,-9],[-6055,-7051,-33,-1,-10,-8,8,-9,16,-2,25,6,4,'
+    '11,-10,3],[-6052,-7100,-9,8,-34,-5,30,-9,10,1,3,5],[-6064,-6290,-10,-5,5,-5,7,-2,6,1,-6,4,12,0,-'
+    '14,7],[-6056,-6370,-15,3,-9,-5,-1,-12,-16,-1,19,-5,13,3,-4,6,13,11],[-9400,-7282,-11,-4,3,-2,32,'
+    '-3,-24,9],[-9078,-7273,-3,12,-14,5,-35,1,-37,-7,31,-29,-9,-6,-6,-23,35,2,27,10,11,9,3,7,-3,7,-12'
+    ',3,12,9],[-10497,-7294,-16,-5,8,-14,17,-7,22,-1,12,4,-43,23],[-9457,-7247,-65,-13,-5,-5,84,4,-14'
+    ',14],[-7155,-7044,20,14,-45,1,12,-15,13,0],[-7220,-6974,21,4,-47,25,-40,2,-10,-10,18,-12,58,-9],'
+    '[-7405,-7322,-10,-10,18,-6,25,8,18,18,-29,1,-22,-11],[-6606,-6588,21,4,4,15,14,4,3,10,-19,2,-14,'
+    '-4,-10,-10,2,-7,-10,-3,-3,-6,0,-4,12,-1],[-6687,-6627,5,-4,22,11,-2,7,4,5,-20,-3,-1,-12,-8,-4],['
+    '-6715,-6765,-27,6,-32,-7,5,-3,0,-7,15,-3,19,2,20,12],[-6726,-6684,-7,9,-10,1,-8,-2,1,-4,-9,-8,18'
+    ',-2,15,6],[-18000,-1696,18,19,-4,8,-14,-10],[-18000,-1654,10,11,-10,-6],[18000,-1696,-7,-4,-3,4,'
+    '10,17],[-7884,835,-8,-12,-4,21,10,1,2,-10],[15461,4938,0,-9,10,-2,10,4,-1,16,10,16,-8,2,-21,-27]'
+    ',[5861,8134,47,6,29,-7,-27,-4,-49,5],[5390,8054,-4,2,2,5,53,-7,3,-4,-16,-8,-47,6,9,6],[6059,8109'
+    ',87,1,11,-5,-43,-10,-31,-2,-77,5,53,11],[5234,8021,-13,5,47,6,17,8,48,0,16,-8,36,-5,-33,-8,-118,'
+    '2],[5594,8016,7,4,-2,12,3,2,92,3,18,-5,-4,-23,-9,-2,-118,2,-9,1,22,6],[5895,8004,59,8,26,-4,11,-'
+    '9,-58,-7,-41,6,3,6],[-6654,-5517,-9,-8,8,-2,8,4,3,4,-10,2],[-7512,-4487,5,-4,4,4,-5,7,-6,-2,2,-5'
+    '],[-7523,-4867,-39,-9,-3,17,14,36,-5,16,17,5,5,-5,18,-36,0,-19,-7,-5],[-7530,-5048,-13,0,-5,-17,'
+    '7,-11,8,-1,4,17,17,9,-18,3],[-7331,-5325,-34,18,-72,14,-20,16,-14,2,15,-17,29,-16,40,-2,37,-22,3'
+    '6,-3,-17,10],[-6831,-5536,3,10,-5,4,-28,6,21,12,-6,8,-44,-6,-98,14,-4,-18,-7,-7,17,-11,16,1,1,-9'
+    ',24,-12,17,-4,6,1,-18,17,6,13,29,-9,12,2,-4,-13,6,-8,53,-6,11,-9,15,-5,3,1,-1,12,-25,16],[-7512,'
+    '-4892,0,15,-46,-9,-6,-8,13,-7,2,-7,-15,-12,13,-3,39,31],[-6025,-5140,-3,12,21,-3,-4,-9,-14,0],[-'
+    '2630,-5838,-15,-4,19,-7,-4,11],[5419,1266,-37,-4,-29,10,-21,-19,28,-19,53,2,38,19,-32,11],[5345,'
+    '2437,-4,4,-22,-12,14,-3,12,11],[5879,2050,-15,-16,0,-13,13,6,7,15,11,10,-7,16,-9,-18],[5260,2428'
+    ',6,5,-3,5,-5,-3,2,-7],[5607,2698,-16,-7,-15,4,0,-14,-46,-15,1,-7,11,-1,43,15,10,-3,24,22,9,3,-7,'
+    '5,-14,-2],[5380,2414,13,0,-10,12,-20,-9,17,-3],[4206,1680,-3,-4,4,-5,-12,4,0,19,-9,6,0,-11,-8,-4'
+    ',12,-17,17,-1,9,-10,1,14,-11,9],[4025,1570,-7,-6,-8,20,-14,5,4,-6,-6,-9,13,-6,-12,2,3,-9,42,-3,1'
+    ',5,-16,7],[4269,1367,10,10,-10,-10],[5047,2623,0,-26,10,-16,5,19,-6,20,3,4,-12,-1],[4269,1401,8,'
+    '-6,3,6,-4,6,-7,-6],[4835,2978,-17,20,-10,-18,14,-20,12,9,1,9],[17937,-1726,2,-13,6,8,-8,5],[1793'
+    '1,-1794,-6,-9,9,-8,2,4,-5,13],[17875,-1769,3,-6,5,2,0,11,-8,-7],[16832,-1679,14,-5,2,5,-11,3,-17'
+    ',17,-6,-5,4,-16,14,1],[16830,-1634,-14,26,-10,-10,-13,-5,9,-9,28,-2],[16845,-1754,-18,-1,-11,-16'
+    ',12,0,3,-4,-6,-3,27,-2,6,10,-13,16],[16800,-1528,-17,-3,-16,-14,17,-3,16,20],[16718,-1539,-5,25,'
+    '-6,7,1,13,-9,0,-7,-20,-11,-2,-6,33,-14,19,-4,0,-4,-21,12,-36,-2,-20,13,-16,0,-6,33,5,11,9,-2,10]'
+    ',[16816,-1546,-4,-22,9,-29,6,8,-11,43],[16813,-1532,4,-7,2,6,-5,34,-4,-3,3,-30],[16779,-1639,-11'
+    ',13,-27,16,-7,18,-14,3,-5,-19,7,-8,10,4,3,-3,10,-40,8,-2,8,7,15,-2,8,7,-5,6],[16723,-1565,-11,3,'
+    '-3,-7,11,-6,3,10],[15979,-841,5,8,-41,30,-32,13,-38,30,-27,6,11,-11,3,-11,34,-28,70,-33,24,-19,-'
+    '9,15],[15741,-731,-26,20,-5,15,-7,7,-43,25,-15,0,4,-12,61,-56,21,-2,13,-9,8,6,-11,6],[15359,-410'
+    ',6,-2,1,8,-7,-6],[12128,602,-7,-2,-5,8,-12,2,-16,-15,5,-5,29,4,7,-7,12,9,-13,6],[11430,-710,10,-'
+    '7,-2,9,-8,-2],[13418,3452,7,-10,12,10,-19,0],[-7508,-4782,16,6,-1,4,-16,3,-17,-7,7,-9,11,3],[-74'
+    '66,-4360,-9,6,-9,-3,3,-6,15,3],[-7363,-4468,-6,13,-9,-1,-4,-5,13,-22,6,1,0,14],[-7457,-4859,-5,2'
+    '5,-11,21,-12,11,2,17,-7,1,-8,-8,-22,-5,-5,-6,24,-51,9,-9,35,4],[-6405,-5473,-50,1,-21,-11,12,-7,'
+    '32,10,35,-1,15,8,-23,0],[-6197,-3911,-12,2,5,-8,17,-6,-1,6,-9,6],[-5975,-5214,-4,1,3,-11,8,1,0,5'
+    ',-7,4],[-6088,-5179,-14,0,-13,-5,12,-10,8,-1,7,16],[-7247,-5403,26,22,-27,22,-40,1,-7,14,-10,5,-'
+    '6,-4,1,-8,-27,4,-8,6,-24,-2,-16,-12,21,-2,17,-17,16,1,1,-21,9,-5,13,-1,4,17,28,-3,-2,-9,-18,-12,'
+    '5,-4,44,8],[-6774,-5526,25,8,9,-9,14,-1,15,9,2,7,-16,14,-86,5,-19,-5,13,-9,7,-14,36,-5],[-7028,-'
+    '5507,-14,16,-38,-6,-13,3,-6,7,-38,4,-7,-6,5,-4,19,4,21,-10,5,-7,23,-5,11,3,12,-10,18,7,2,4],[-67'
+    '29,-5578,3,4,-11,15,-19,-12,27,-7],[-7459,-5139,3,11,-5,7,-13,0,-30,-11,-11,4,-15,-28,1,-7,24,23'
+    ',20,-3,12,6,14,-2],[-7496,-5024,12,4,-4,9,-45,10,-12,-33,20,-4,29,14],[-7454,-5197,-11,10,-13,5,'
+    '-4,19,-9,-2,-1,-9,-9,2,-10,-7,9,-25,17,-23,16,-1,15,31],[-7394,-4391,15,3,-5,9,-30,-3,2,-7,18,-2'
+    '],[-7167,-5423,20,0,33,-14,14,12,-2,14,-15,0,-38,15,-45,8,-15,-6,-6,-11,24,-16,2,-9,28,7],[-7428'
+    ',-5192,11,-2,5,5,-36,16,6,-12,14,-7],[-7373,-4512,-15,39,-12,14,2,10,24,10,4,12,-12,4,-8,10,-9,-'
+    '1,-9,-5,-2,-20,-11,-4,-9,3,-20,-7,2,-11,-14,-7,27,-26,15,-23,11,-6,-1,-13,25,-1,2,6,8,1,2,15],[-'
+    '7423,-4561,-9,15,1,29,-11,-3,-8,-9,1,-14,-20,-23,1,-8,31,0,14,13],[-7369,4556,-27,-12,39,3,9,23,'
+    '-21,-14],[-7370,4559,13,10,-15,-2,-14,-10,16,2],[-6103,4558,-5,-2,8,-8,9,9,-12,1],[-6148,4756,8,'
+    '8,-15,-1,-37,-20,-9,-20,18,-1,6,4,-14,2,2,6,31,22,10,0],[-6456,4787,-10,-1,-2,-11,15,6,2,8,-5,-2'
+    '],[-6459,4791,11,5,0,5,-11,-10],[-7109,4690,-3,-4,9,1,20,13,-26,-10],[-6632,4426,11,13,-11,-13],'
+    '[-6869,4425,-1,-7,8,2,-7,5],[-6690,4463,14,5,1,11,-9,-3,-6,-13],[-6830,4446,-11,-10,0,-7,9,-4,1,'
+    '7,12,1,-5,11,-6,2],[11307,-688,-20,-2,-14,-17,3,-7,37,-8,34,0,19,11,17,-1,6,7,19,6,-11,12,-90,-1'
+    '],[15884,-5470,1,-5,3,4,8,24,-6,-4,-6,-19],[-17407,-1864,8,-6,7,11,-8,2,-7,-7],[-15149,-1686,13,'
+    '0,-11,12,-2,-12],[-15734,186,2,11,-12,6,-5,0,12,-8,-7,-10,-9,8,-5,-3,33,-17,7,1,-16,12],[-13902,'
+    '-970,-15,-7,10,-8,24,11,-19,4],[-13913,-993,0,-8,7,8,-7,0],[-13869,-1053,7,7,-7,3,0,-10],[-14932'
+    ',-1769,-6,17,-13,2,-13,-6,6,-17,24,0,5,-9,11,-4,0,12,-14,5],[-14022,-878,-3,-7,3,-8,17,6,-1,7,-1'
+    '6,2],[-14014,-936,4,-8,7,10,-11,-2],[-17233,-1347,-45,-5,24,-27,32,-1,4,12,-4,12,-11,9],[-17901,'
+    '-1718,4,-3,-1,-10,7,9,-10,7,0,-3],[-15941,387,3,-2,3,3,4,-4,-5,-2,9,-2,1,4,-8,8,-7,-5],[-17186,-'
+    '1381,-19,-5,14,-14,46,-5,-1,7,-11,4,-3,6,-26,7],[-17069,-1426,-13,-5,9,-4,16,8,-12,1],[-16991,-1'
+    '899,-4,-8,5,-7,11,10,-4,7,-8,-2],[-17620,-1330,4,-3,1,11,-5,-8],[-17497,-2135,5,-10,1,15,-6,-5],'
+    '[13460,762,-8,-9,1,-17,7,2,3,12,2,21,-5,-9],[14573,1806,11,8,-3,3,-8,-11],[14571,1522,-3,-9,7,-2'
+    ',7,16,-11,-5],[14479,1353,-14,-10,0,-12,5,-5,4,0,4,15,16,16,-10,5,-5,-9],[14559,1503,3,-11,4,5,-'
+    '1,9,-6,-3],[13809,949,-2,-7,11,9,1,8,-10,-10],[17833,-1893,-37,-19,6,-3,14,3,13,12,7,-5,13,3,0,5'
+    ',-16,4],[16744,-1417,-4,-11,14,-3,6,13,-9,4,-7,-3],[16750,-1388,5,7,-7,10,-9,-8,6,-12,5,3],[1697'
+    '5,-2015,-1,-5,7,-4,9,5,-15,4],[16936,-1946,-2,13,-5,1,-7,-16,13,-14,9,-3,5,11,-13,8],[16930,-188'
+    '7,-10,7,6,4,-8,3,-4,10,-12,-1,-3,-23,30,-12,4,5,-3,7],[16801,-2143,-2,9,-17,-5,6,-19,9,-6,15,2,2'
+    ',17,-13,2],[16656,-2056,-7,-15,13,11,-2,7,7,8,-5,3,-4,1,-2,-15],[16729,-2089,-2,19,-7,3,-14,-5,-'
+    '1,-4,14,-4,-8,-10,-8,-2,10,-14,27,-10,3,10,-14,17],[16744,-2254,-2,-8,9,-4,2,8,-9,4],[15993,-191'
+    '7,1,-16,4,9,-2,13,-3,-6],[16686,-1158,-11,-1,6,-9,12,1,-7,9],[16602,-1066,-11,-1,-12,-9,3,-8,31,'
+    '8,3,7,-14,3],[16008,-1149,-8,2,0,-11,27,-8,17,-15,14,1,-50,31],[16137,-949,-11,17,0,13,-10,23,-2'
+    '2,16,6,19,-25,30,-15,-2,11,-21,-5,-8,21,-54,32,-23,13,-20,5,-2,0,12],[16229,-1078,0,7,-18,26,-27'
+    ',0,-36,21,-18,4,-1,-13,20,-3,5,-21,25,-15,33,-10,25,0,-8,4],[16141,-960,0,-8,14,-9,0,14,-19,28,5'
+    ',-25],[15918,-913,5,4,0,6,-8,3,-11,-7,14,-6],[16032,-906,-15,6,-7,-3,1,-5,26,-10,4,4,-9,8],[1596'
+    '5,-845,-6,7,-5,-7,10,-7,5,1,-4,6],[15789,-857,-6,25,-22,16,-1,15,-17,3,-11,-18,-9,-5,0,-10,7,-2,'
+    '5,5,21,1,3,-18,16,-7,7,-9,7,4],[15821,-868,-5,-11,2,-4,7,3,-4,12],[15791,-857,-3,-10,6,-7,7,-2,1'
+    '0,8,-4,7,6,5,-2,2,-11,3,-9,-6],[15741,-848,-6,5,-14,-14,18,-16,-6,8,8,17],[15672,-770,-16,13,-6,'
+    '-7,17,-30,14,22,-9,2],[15657,-796,-3,-11,5,-13,-2,24],[15719,-808,0,14,-9,8,-14,-8,0,-7,8,-11,11'
+    ',0,4,4],[15574,-697,-6,-12,16,-1,2,6,-12,7],[16292,532,7,-4,-1,5,-6,-1],[15819,698,-6,-8,5,-10,1'
+    '3,1,2,8,-4,6,-10,3],[17551,-3618,-10,11,-7,-6,2,-10,19,-10,-4,15],[17387,-4075,-6,-4,-3,-13,13,6'
+    ',5,7,0,8,-9,-4],[16657,-4564,-4,-6,21,0,1,4,-6,4,-12,-2],[-17627,-4376,9,2,-39,2,-19,-4,-9,-6,29'
+    ',-3,4,-5,-11,-14,3,-7,8,-1,19,9,-6,8,-5,0,-6,9,6,4,-8,4,11,2,3,-11,11,11],[-17623,-4424,1,-9,10,'
+    '6,-3,5,-8,-2],[16908,-5250,-6,0,2,-3,9,-4,10,2,-5,5,-10,0],[16621,-5061,4,7,-15,0,-3,-14,-18,-13'
+    ',8,-1,4,4,23,-7,-6,14,4,2,-1,8],[16816,-4699,-12,6,0,4,11,-1,-1,4,-18,17,-18,-1,2,-21,-28,-35,66'
+    ',16,8,7,-2,5,-8,-1],[13706,-1566,-5,7,-7,-12,11,-11,4,4,-3,12],[13688,-1550,-3,-13,4,4,-1,9],[13'
+    '652,-1554,-1,-9,8,0,2,9,-9,0],[13257,-1132,6,15,-5,20,-10,-7,9,-28],[14900,-2022,-2,7,-4,-13,10,'
+    '-1,-4,7],[14897,-2004,-8,-10,7,1,1,9],[14628,-1823,-18,-2,20,-23,4,8,-6,17],[14220,-1059,-7,-8,6'
+    ',-9,8,6,-7,11],[14222,-1015,0,-9,6,-1,6,6,-4,5,-8,-1],[14215,-1005,-5,-7,4,-6,5,9,-4,4],[13959,-'
+    '1640,-30,-7,-13,-16,0,-11,27,8,13,13,14,2,-11,11],[13949,-1699,-8,-10,1,-4,15,4,-8,10],[13689,-1'
+    '420,-10,4,-4,9,4,12,12,12,-2,4,-4,4,-5,-9,-4,-1,-6,17,-4,0,-24,-18,1,-27,-9,-8,55,-8,6,11,-6,-2]'
+    ',[13616,-1374,-4,-8,9,-2,7,5,-6,13,-6,-8],[13669,-1118,-16,-26,21,25,4,18,-5,-1,-4,-16],[13634,-'
+    '1160,14,13,-21,-11,-9,-10,16,8],[13046,-1168,-12,34,-5,0,-14,-14,5,-18,-13,-2,-3,-11,4,-4,24,6,1'
+    '8,-7,11,2,-3,8,-12,6],[13144,-1131,-17,12,-25,-14,-11,2,-16,-7,-13,0,-19,20,-6,-3,14,-41,44,-31,'
+    '34,22,9,13,8,-1,8,15,-10,13],[12512,-1449,-3,-10,4,-5,7,6,0,11,-8,-2],[12450,-1529,-2,-5,8,-9,5,'
+    '7,-6,9,-5,-2],[11543,-2067,-11,-18,7,-2,6,8,-2,12],[11313,-2588,-15,36,-3,-1,-4,-4,5,-21,20,-31,'
+    '2,4,-5,17],[14731,-4328,-15,-15,-6,2,5,-9,16,0,5,10,-5,12],[14802,-4264,3,-8,12,7,-10,6,-5,-5],['
+    '14735,-4308,-5,-8,5,-7,8,-1,-8,16],[14475,-4047,-4,-2,4,-10,4,15,-4,-3],[14412,-3979,-3,15,-14,6'
+    ',-9,-16,-2,-16,6,-22,21,10,1,23],[14833,-4031,-32,-7,9,-7,22,2,3,-7,5,1,7,6,-14,12],[14811,-4026'
+    ',20,9,-6,7,5,11,-12,5,-25,21,-16,-14,11,-4,1,-10,22,-25],[14819,-4059,5,7,-12,0,7,-7],[13805,-35'
+    '76,-45,2,4,8,-6,4,-25,3,-69,-16,-10,-14,22,-14,39,-1,6,6,24,-9,14,4,8,13,17,3,23,-3,5,5,-7,9],[1'
+    '4530,-3832,-2,-7,6,-3,15,7,-19,3],[14522,-3846,-9,-7,23,-3,-5,7,-9,3],[15340,-2751,0,-16,5,-4,9,'
+    '27,-10,3,-4,-10],[15347,-2704,-9,-1,-1,-9,5,-19,5,29],[15330,-2492,-2,18,-14,-7,10,-11,-5,-15,-1'
+    '5,-12,2,-11,-8,-25,7,-23,30,72,1,8,-6,6],[15123,-2359,1,6,-18,7,-3,-7,15,-21,6,-4,6,6,-7,13],[15'
+    '048,-2227,1,-5,6,1,-3,8,-3,2,-1,-6],[14987,-2215,2,-7,4,3,-2,14,-4,-10],[11728,831,1,-12,7,2,-1,'
+    '8,-7,2],[11699,805,-2,-16,6,-8,5,7,0,19,-9,-2],[11985,1064,-9,-9,3,-9,13,3,9,8,-16,7],[11976,114'
+    '7,-3,-4,12,-4,1,14,-10,-6],[12023,1222,-4,-5,-9,0,-18,15,-5,-12,14,-19,9,-2,21,2,3,7,-11,14],[11'
+    '996,1196,-10,-1,10,-28,8,3,3,8,-3,14,-8,4],[12263,1070,-9,-9,0,-19,14,8,6,15,-4,9,-7,-4],[12405,'
+    '1103,-1,24,-7,-8,-4,-23,-22,-49,-32,-50,-6,-55,16,17,21,54,30,27,5,19,0,44],[12376,1128,-5,-3,3,'
+    '-10,8,0,-6,13],[12449,1007,-15,9,-17,-2,-35,-32,5,-14,7,-6,18,-2,24,3,12,12,10,0,0,28,-9,4],[124'
+    '74,924,-9,-1,-1,-5,14,-10,3,6,-7,10],[12370,924,-5,4,-16,-9,12,-9,10,3,-1,11],[12021,534,-38,-21'
+    ',-1,-6,14,1,16,14,7,-5,6,9,-4,8],[12206,674,-23,-8,-2,-5,15,-19,24,6,5,10,7,2,-26,14],[12613,994'
+    ',-6,12,-7,-13,-1,-9,6,-8,12,4,-5,7,1,7],[12570,1007,-5,18,2,19,-15,-13,-3,-19,18,-23,3,18],[1202'
+    '1,1382,-9,4,-2,-8,17,-10,-6,14],[12200,1355,-13,2,-5,-15,1,-9,17,-13,12,17,-1,9,-11,9],[12200,12'
+    '60,-1,-16,-7,-11,9,-22,14,54,-15,-5],[12225,1256,1,-6,5,3,-2,6,-4,-3],[12260,1249,-18,-3,18,-17,'
+    '8,9,-8,11],[12304,1311,-8,0,-1,-5,42,-36,-33,41],[12378,1245,-7,16,-9,6,-3,-4,3,-6,16,-20,0,8],['
+    '12321,1211,-5,-18,26,26,11,1,21,-20,-1,-5,12,-4,20,-16,-1,22,-13,20,-45,33,-22,8,3,-18,-6,-29],['
+    '12434,1393,-12,15,-10,-10,0,-19,-8,-13,14,-13,7,6,8,-2,7,11,2,19,-8,6],[12196,1423,0,-7,21,-15,1'
+    ',4,-22,18],[12184,1504,-2,-8,10,-16,-1,-13,8,-1,3,10,-5,13,8,8,-8,8,-13,-1],[12189,1899,-6,-15,3'
+    ',-2,13,14,-5,5,-5,-2],[12120,1905,5,-3,-4,16,-1,-13],[12139,1940,-1,-7,15,-6,-1,9,-13,4],[12191,'
+    '2036,12,11,-9,-2,-3,-9],[12180,2075,-1,-5,4,0,4,14,-7,-9],[14785,-549,-6,0,-1,-14,9,-12,16,-8,5,'
+    '18,-23,16],[14713,-519,-12,-7,0,-5,11,-13,10,6,-1,13,-8,6],[14590,-460,0,-13,12,0,2,16,-4,3,-10,'
+    '-6],[14779,-231,-5,-1,10,-2,4,6,-4,3,-5,-6],[14740,-203,-33,7,-41,-1,-6,-5,1,-8,-8,-5,4,-6,18,6,'
+    '46,-3,13,11,10,1,0,5,-4,-2],[15468,-505,-5,4,-9,-10,9,-33,7,6,3,16,-5,17],[15264,-304,-10,-6,11,'
+    '-12,-1,18],[15197,-285,0,-5,12,-10,1,5,-13,10],[15200,-274,-5,3,-2,-12,8,2,-1,7],[14963,-136,-5,'
+    '1,-3,-12,12,-11,9,-1,-3,16,-10,7],[15043,-247,-20,9,-27,-9,21,-19,7,-2,20,2,-1,19],[15112,-1002,'
+    '-34,31,12,-26,5,-3,1,-9,27,-10,7,23,-4,4,-14,-10],[15032,-926,-11,5,-8,-5,-2,-10,22,-16,4,12,-5,'
+    '14],[15085,-966,-1,-4,5,3,-1,16,-9,9,-35,6,-1,-7,8,-11,-7,-8,41,-4],[15114,-857,-2,15,-12,-10,8,'
+    '-5,-3,-16,7,-7,2,23],[15285,-902,-4,5,-18,1,-11,-5,35,-21,10,1,3,10,-15,9],[15080,-1055,-1,-5,9,'
+    '-4,2,7,-10,2],[15410,-1131,2,-6,-10,2,4,-7,21,0,1,6,-18,5],[15370,-1153,-50,21,3,-10,9,-5,-3,-5,'
+    '7,2,2,-6,17,-7,21,4,-6,6],[14354,-848,5,0,-1,9,-26,2,22,-11],[14344,-852,-23,10,4,-7,36,-19,-17,'
+    '16],[13628,-106,-39,33,-51,8,5,-12,22,-11,10,6,9,-30,8,-6,19,-4,20,5,7,8,-10,3],[13672,-173,-33,'
+    '1,-19,7,-73,3,2,-5,74,-22,39,2,27,7,-17,7],[13496,-103,-7,9,-8,-10,11,-9,5,1,3,9,-4,0],[13435,-2'
+    '04,0,-10,7,9,-7,1],[13880,-817,-12,-3,-12,-11,3,-6,31,-2,-10,22],[13346,-420,-14,9,1,-6,29,-13,-'
+    '16,10],[13043,-180,-11,11,-58,-18,15,-12,24,-7,29,9,-4,7,5,10],[13103,-92,-13,3,-23,-7,7,-21,11,'
+    '-15,15,0,7,35,-4,5],[13081,-77,0,-4,-33,-2,-8,-9,43,6,8,8,-10,1],[13062,-42,-15,-7,16,-4,5,6,-6,'
+    '5],[13128,-15,-47,15,-38,-10,-7,3,-7,-3,-5,-11,26,-6,5,-10,14,7,6,-14,15,2,0,8,-14,5,-14,20,6,1,'
+    '33,-28,9,3,16,-4,8,8,-6,14],[12931,5,6,-12,18,-12,-24,24],[12860,260,-13,-3,-14,-10,-11,-17,8,-2'
+    '7,25,7,7,12,7,25,-9,13],[12743,14,-3,-12,5,-6,-2,18],[12742,64,2,9,-6,1,-1,-11,5,1],[12728,-39,-'
+    '3,7,4,4,-16,0,-1,-24,13,2,3,11],[12726,-62,-5,0,-5,-14,13,-4,-3,18],[12780,-69,-14,0,-6,8,8,14,-'
+    '11,15,-4,1,-7,-10,-13,7,-3,-16,17,-14,-1,-17,16,4,14,-11,12,7,-8,12],[12791,-144,-26,11,-6,-2,-1'
+    '3,-10,-7,-19,17,-9,53,3,6,4,0,6,-24,16],[13474,-620,-3,25,4,7,0,17,-10,13,-3,14,-11,0,-2,-9,-15,'
+    '-18,-13,0,13,-12,-4,-18,-15,-1,0,-4,29,-27,20,-4,10,17],[13452,-651,2,7,-37,26,-6,-1,1,-24,7,-3,'
+    '-8,-1,-5,-30,3,-6,11,-8,12,6,20,34],[13301,-562,-7,-6,-9,-31,8,9,4,16,15,16,5,23,-6,4,-10,-31],['
+    '13274,-566,-11,5,5,-30,7,-4,6,10,-7,19],[12867,-352,-8,3,3,-10,9,-1,1,5,-5,3],[12845,-351,-6,-13'
+    ',17,5,-11,8],[12826,-351,-24,-9,-9,-8,0,-6,5,-3,17,9,-1,-5,11,2,8,19,-7,1],[12305,-516,-7,-3,-1,'
+    '5,5,31,10,11,8,-10,0,5,-2,22,-11,16,-12,-5,-10,-18,-8,-59,-18,-28,6,-17,8,3,8,-4,16,26,7,-1,15,9'
+    ',1,6,-15,11],[12274,-468,-4,6,-33,-15,-4,-8,7,-22,-7,-7,-2,-24,6,0,2,4,17,-5,6,5,-1,20,15,21,-2,'
+    '25],[12204,-516,-13,9,-10,-19,17,-20,6,2,0,28],[12297,-403,2,-12,9,-8,6,0,10,12,-3,11,-19,2,-5,-'
+    '5],[12598,-217,-2,19,-10,-10,12,-34,6,-5,3,10,-9,20],[12602,-179,-50,-1,-13,-4,4,-10,53,2,37,10,'
+    '-31,3],[12519,-171,-13,-3,-40,10,-18,0,-10,-5,-5,-17,9,-15,22,3,19,9,18,-5,30,6,1,7,-12,3,-1,7],'
+    '[12378,-188,2,-11,7,-1,-9,12],[12343,-124,-9,-1,-10,-14,-3,22,-30,-1,-8,-10,-2,-15,5,-12,3,-4,9,'
+    '8,17,21,3,-19,-6,-7,5,-6,7,4,3,14,10,-7,8,1,10,16,-12,10],[12307,-185,1,-5,7,8,-1,5,-7,-8],[1218'
+    '0,-42,-5,1,-9,-12,22,3,3,5,-5,4,-6,-1],[12687,448,-11,7,-4,-21,9,-8,-10,-24,11,1,10,26,-5,19],[1'
+    '2664,404,8,-21,2,9,-10,12],[12680,378,6,1,-6,7,0,-8],[12559,357,-12,16,4,-27,12,-5,3,3,-7,13],[1'
+    '2539,281,-3,-6,4,-12,5,13,-6,5],[12048,-578,-4,-40,5,-28,6,49,-7,19],[13192,-710,-17,-2,22,-13,-'
+    '5,15],[13102,-809,-24,-26,40,22,-16,4],[13170,-714,-14,0,-2,-8,-28,-25,-17,-40,2,-13,22,0,5,13,2'
+    '4,24,7,19,-5,17,10,7,-4,6],[12966,-779,-5,-1,-2,-12,12,-12,7,-1,6,10,-3,13,-15,3],[12863,-707,-1'
+    '0,-6,9,-8,5,10,-4,4],[12800,-814,-21,2,3,-7,20,-7,10,9,-12,3],[12737,-751,-1,-14,11,7,1,5,-11,2]'
+    ',[12673,-766,-12,9,-40,-14,-23,5,-14,-16,-4,-16,24,9,43,-6,11,14,23,7,-1,7,-7,1],[12551,-828,7,-'
+    '3,7,17,-14,-14],[12340,-1017,-7,-17,9,4,-1,7,9,4,-4,5,-6,-3],[12334,-1049,-28,-21,-21,-6,-2,-14,'
+    '12,-1,26,10,21,16,-5,18,-3,-2],[12180,-1051,-10,-5,18,-3,10,6,2,8,-13,1,-7,-7],[12475,-816,-15,-'
+    '4,-2,6,-7,0,-8,-4,-4,-7,4,-5,-7,-9,8,-5,66,9,2,15,-37,4],[12424,-820,-13,-16,-10,4,-8,-13,9,1,5,'
+    '-11,8,2,14,20,1,10,-6,3],[12378,-819,-18,-10,-21,1,9,-4,-25,-21,18,-6,8,6,6,-4,8,15,7,0,8,12,14,'
+    '3,-14,8],[12322,-824,-19,-10,-1,-6,28,0,4,13,-12,3],[11947,-846,-2,3,-7,-16,1,-15,3,-1,14,20,-1,'
+    '7,-8,2],[11904,-816,-1,-8,10,4,-3,6,-6,-2],[11548,-872,10,-8,3,3,-5,10,-8,-5],[11541,-684,-17,-2'
+    ',-2,-9,8,-4,25,5,-14,10],[11259,-580,1,-4,10,-1,3,10,-8,2,-6,-7],[11771,426,-5,-1,-3,-13,11,-12,'
+    '18,5,-4,14,-17,7],[11755,343,1,-10,9,-8,3,16,-13,2],[11633,-354,6,-10,4,24,-10,-14],[11628,-353,'
+    '-1,28,-15,-9,-6,-12,-4,-24,6,-12,-2,-19,3,-4,21,18,-2,34],[10888,-154,-8,-3,4,-9,11,4,1,6,-8,2],'
+    '[10970,-101,-22,2,-5,-25,3,-4,29,13,-5,14],[10879,289,5,-4,5,6,0,9,-10,-11],[10839,399,-14,23,-2'
+    '5,-18,4,-15,20,-8,-14,-11,8,-5,14,4,7,15,0,15],[10621,313,7,-4,-1,13,-7,-2,1,-7],[10573,304,-4,2'
+    ',3,-20,9,4,3,8,-11,6],[10164,213,-23,-11,-1,-12,10,-17,10,-1,12,7,4,21,-12,13],[10228,140,-5,-5,'
+    '3,-20,12,-19,5,3,1,24,-16,17],[10249,146,-2,5,-45,10,6,-11,19,-5,23,-12,-1,13],[10278,96,-23,17,'
+    '-10,-24,56,-18,-1,15,-22,10],[10307,101,-28,16,-6,-1,-3,-11,19,-5,20,-15,8,2,-10,14],[10324,70,-'
+    '5,0,-5,-15,14,-1,2,7,-6,9],[10338,113,-6,-6,11,-8,-5,14],[10339,87,-5,-9,9,-13,7,7,-11,15],[1037'
+    '5,89,-1,-6,9,-6,-8,12],[10402,118,-9,-11,3,-6,11,-2,7,18,-5,-3,-7,4],[10459,114,0,8,-23,-4,-11,-'
+    '8,0,-9,19,4,-1,-9,7,-11,8,-2,8,22,-7,9],[10417,90,-5,4,-2,-4,8,-10,6,3,-7,7],[10454,22,-4,1,10,-'
+    '13,10,-7,-16,19],[10484,-14,-3,-5,-27,21,-9,-21,12,-6,13,4,21,-11,10,4,-17,14],[10436,-40,-6,1,-'
+    '4,-7,10,-20,5,8,10,-2,8,13,-12,14,-11,-7],[10361,-23,-6,0,-9,-13,15,-2,13,3,2,3,-4,4,-11,5],[108'
+    '22,-270,-15,10,-23,7,-17,-4,-11,-35,8,-20,-3,-9,21,5,4,7,8,-4,4,-9,8,-1,11,9,12,31,-7,13],[10743'
+    ',-293,7,8,-8,1,1,-9],[10680,-290,-5,-6,12,-7,4,10,-11,3],[10512,-661,7,-5,6,2,1,12,-14,-9],[9779'
+    ',115,-9,3,-22,29,-12,7,-12,-12,-16,1,22,-24,11,-24,19,-12,8,-23,14,-4,6,7,5,34,-14,18],[10237,-5'
+    '37,-17,8,-9,-3,18,-16,8,0,4,8,-4,3],[10046,-312,-1,12,-20,22,-5,-1,0,-20,13,-12,2,-12,12,-10,-4,'
+    '15,3,6],[10001,-251,-4,-8,2,-18,2,-5,12,0,7,14,-19,17],[9973,-218,-11,16,-5,-1,-3,-13,7,-10,24,-'
+    '11,-12,19],[9913,-144,-20,49,-6,3,-19,-5,-8,-23,27,-46,20,-12,20,4,0,11,-14,19],[9842,-2,-10,2,1'
+    '1,-23,-12,-30,9,-5,6,5,8,27,-12,24],[9729,220,-18,2,22,-17,-4,15],[9642,252,-52,37,-9,3,-9,-9,9,'
+    '-17,21,-6,32,-23,12,-1,-4,16],[9524,591,4,-11,6,-2,2,10,-12,3],[11138,258,0,13,-5,6,-3,-3,1,-30,'
+    '8,-2,-1,16],[11706,726,2,-14,16,6,2,17,-11,-1,-9,-8],[3158,4630,-7,7,5,-11,14,-5,45,-6,-57,15],['
+    '2241,5886,6,-15,7,-2,12,2,11,11,7,-4,17,5,-10,16,-18,3,-8,7,-19,-12,-40,-3,35,-8],[2317,5868,-11'
+    ',-7,28,-6,-1,10,-16,3],[3586,6508,-4,10,-29,-3,3,-6,22,-11,6,2,2,8],[4263,6678,-17,-1,22,-8,3,1,'
+    '-8,8],[2679,7872,-20,9,-18,-3,5,-6,27,-7,28,5,-22,2],[2905,7891,-20,6,-34,0,-62,-12,15,-2,45,6,8'
+    '2,-4,34,7,-60,-1],[5032,8017,-7,5,-37,1,-32,-7,41,-10,35,11],[5124,7999,1,6,-31,4,-85,-11,36,-6,'
+    '98,0,-19,7],[3148,8011,105,1,110,10,-53,1,-162,-12],[5746,8154,-37,0,-93,-24,-69,1,25,-12,47,3,3'
+    '2,-4,31,6,63,-10,32,3,25,8,-16,12,70,5,-70,9,-14,5,-26,-2],[5463,8111,-21,-12,-5,-9,-32,-3,2,-6,'
+    '60,-7,45,1,42,-5,17,-6,61,-1,137,16,-122,21,-100,2,-84,9],[5075,8105,20,6,-7,4,-29,2,-22,-5,15,-'
+    '7,23,0],[5805,8112,-39,-9,-45,-1,20,-10,34,-3,19,-10,35,-3,57,2,7,5,-3,7,-28,14,-57,8],[6288,816'
+    '1,65,-1,25,5,-7,4,-143,2,-17,-3,77,-7],[5936,8176,5,7,-15,2,-113,-2,-15,-3,-7,-8,145,4],[1852,80'
+    '25,22,5,-22,5,-23,1,-13,-7,36,-4],[1193,7837,-51,18,-16,-1,-1,7,-17,8,7,3,-19,13,-40,5,7,-15,49,'
+    '-29,47,-7,38,-17,15,1,-19,14],[1886,7451,-6,-2,30,-14,17,11,-9,6,-32,-1],[5314,7124,-7,0,-29,16,'
+    '-5,0,0,-4,-22,3,-27,-6,5,-6,26,-2,19,-7,28,-21,10,1,-7,5,16,13,-7,8],[7441,7313,-21,-2,-10,-9,54'
+    ',-16,6,5,-5,6,9,6,22,3,-55,7],[7605,7355,-48,-1,-23,-11,49,3,22,9],[7625,7356,-17,-4,15,-4,53,-3'
+    ',-51,11],[7775,7263,-37,-6,-51,-25,76,-3,74,19,-9,7,-53,8],[7941,7298,-25,11,-53,-24,25,-10,62,-'
+    '3,4,20,-13,6],[8238,7415,-5,-2,15,-5,23,1,-10,6,-23,0],[8315,7415,-33,-6,59,-5,21,5,-47,6],[8454'
+    ',7449,-15,-4,4,-2,28,-3,16,12,-33,-3],[8665,7498,-32,-4,-7,-5,13,-4,54,-2,19,11,-12,5,-35,-1],[8'
+    '202,7551,-11,-1,2,-9,-22,4,-21,-8,15,-8,21,3,12,-7,7,9,17,1,-5,17,-15,-1],[9627,7631,-68,-6,-21,'
+    '4,-7,-8,99,-9,5,9,24,1,2,4,-34,5],[9731,7669,12,-10,16,1,-21,11,-7,-2],[9585,7710,-58,-8,94,-3,3'
+    '5,16,-3,6,-68,-11],[8962,7731,-34,-1,-14,-7,37,-4,16,6,-5,6],[7647,7964,-10,-2,-22,4,-8,-3,8,-5,'
+    '49,-4,1,-5,94,1,-112,14],[7922,8096,-24,-11,12,-4,124,6,9,6,-62,5,-59,-2],[9148,8118,-141,3,-17,'
+    '-4,8,-6,124,-5,35,8,-9,4],[10658,7817,-16,-3,92,-4,14,-4,22,7,-19,6,-93,-2],[10668,7826,4,3,-8,5'
+    ',-18,0,-11,-7,-29,-1,-4,-4,25,-1,41,5],[10737,7735,-10,-6,3,-5,38,3,-9,6,-22,2],[11215,7655,38,-'
+    '10,13,6,-27,13,-42,-1,18,-8],[12008,7316,-44,-4,15,-7,22,-1,25,5,-18,7],[12443,7394,-9,-1,3,-6,1'
+    '7,-2,11,4,-22,5],[13617,7561,-27,8,-20,16,-12,-14,1,-13,-14,-19,50,2,7,3,-5,5,1,3,19,9],[14941,7'
+    '678,-69,-3,-32,-10,75,1,26,12],[13604,7409,-65,16,1,-5,72,-31,14,9,-22,11],[13728,7158,-22,-5,21'
+    ',-7,19,2,25,-6,25,9,-14,8,-54,-1],[16057,7092,-12,1,-1,-8,28,-3,-15,10],[16836,7002,-30,-5,-27,-'
+    '13,56,-18,57,-9,28,1,10,15,12,5,1,5,-6,5,-101,14],[16457,5922,-81,-20,2,-9,-5,-13,-30,-25,4,-4,4'
+    '9,23,32,10,34,5,4,8,-9,25],[16771,5477,-20,9,-7,0,5,-7,59,-28,-20,18,-17,8],[16658,5491,-33,26,-'
+    '2,7,5,7,-35,4,-18,-6,24,-10,24,-25,42,-25,0,15,-7,7],[15638,5086,-21,-13,16,-9,8,2,7,9,1,9,-11,2'
+    '],[15610,5077,-22,-9,-20,-28,-46,-10,2,-21,16,-5,12,11,27,5,13,10,18,26,0,21],[15413,4890,-13,-1'
+    '4,4,-2,16,12,3,3,-10,1],[15564,5082,0,9,-17,0,8,-10,9,1],[15298,4773,7,-2,5,5,-2,5,-10,-8],[1518'
+    '6,4687,-14,-2,3,-6,7,0,47,35,-12,-3,-31,-24],[14996,4602,-16,-14,-13,-4,-22,-25,24,5,51,29,3,8,3'
+    '2,20,-20,0,-39,-19],[14881,4551,-20,-3,-29,-20,-26,-2,-14,12,-5,-8,2,-7,-64,-37,-10,-9,-1,-11,-2'
+    '1,-15,-3,-11,31,15,10,13,25,16,10,14,25,1,35,23,34,10,19,0,5,4,-3,15],[15067,5916,-20,-13,12,-1,'
+    '14,8,-6,6],[13794,5509,-36,11,-30,-31,-5,-10,23,8,20,-22,6,1,24,13,14,20,11,4,-27,6],[13708,5509'
+    ',-37,-13,35,-3,12,17,-10,-1],[14662,4381,-1,-7,7,-2,22,8,-8,6,-20,-5],[14636,4442,-25,8,-36,-43,'
+    '-29,-20,-2,-13,12,-8,3,19,18,9,14,16,20,15,41,12,5,7,-21,-2],[12417,2445,-9,-1,6,-9,9,1,9,21,-15'
+    ',-12],[12375,2435,-7,-6,15,-2,6,1,4,8,-16,5,-2,-6],[12531,2485,-3,2,-1,-14,17,1,-13,11],[12825,2'
+    '688,-15,-21,-5,-3,-14,5,-2,-6,6,-4,-22,-16,-8,-34,15,6,-1,11,11,7,-3,11,26,11,18,17,2,9,-8,7],[1'
+    '2895,2791,-7,-7,2,-11,6,-3,6,7,-7,14],[12960,2848,-44,-23,21,-12,9,14,25,16,-2,9,-9,-4],[12926,2'
+    '818,-7,1,4,-9,10,-2,-7,10],[13050,3047,-11,-8,6,-13,17,0,5,11,-17,10],[13095,3067,-8,-28,9,1,10,'
+    '24,0,19,-11,-16],[12884,3276,-17,2,-1,-15,9,-4,14,6,-5,11],[13001,3252,-3,-17,4,-6,-6,-5,4,-5,20'
+    ',15,-3,20,-16,-2],[13024,3246,14,-4,8,10,-9,1,-13,-7],[13321,3629,-2,-6,5,-5,13,2,-7,14,-9,-5],['
+    '13851,3826,-1,6,-4,-3,-21,-21,0,-9,7,-2,-4,-12,-5,-2,11,-1,16,8,8,17,-13,1,6,18],[13943,4220,0,-'
+    '12,5,0,8,16,-13,-4],[14097,4547,6,-20,4,6,-1,12,-9,2],[14125,4523,-11,-2,1,-6,15,-3,3,3,-8,8],[1'
+    '3978,3308,4,-3,5,4,-9,4,0,-5],[13937,3478,0,-6,8,-4,-2,10,-6,0],[13483,3447,-16,-18,6,-8,9,-1,11'
+    ',9,-2,11,9,14,-17,-7],[12912,3307,-1,6,-11,-18,5,-12,13,16,-6,8],[12946,3333,-9,-15,12,4,8,14,-1'
+    '1,-3],[12972,3386,-5,-12,6,-3,7,4,-2,8,-6,3],[12921,3432,0,-24,7,4,6,16,-13,4],[12945,3469,-12,-'
+    '8,-6,-24,10,-6,1,11,10,12,-3,15],[13258,3412,-4,5,-8,-8,9,-1,3,4],[13236,3385,7,7,-22,3,0,-8,15,'
+    '-2],[11834,2447,-5,1,1,-4,13,-3,2,5,-4,6,-7,-5],[11808,2450,1,-5,6,-1,3,6,-8,5,-2,-5],[12872,350'
+    '1,-23,-14,16,-13,9,6,-2,21],[12783,3487,4,-14,7,4,4,-7,7,1,-1,17,-12,4,-9,-5],[12774,3463,5,-5,0'
+    ',10,-5,-5],[12676,3355,-42,-9,-17,-15,11,-11,43,7,16,7,6,10,-3,8,-14,3],[12634,3454,-9,2,-14,-16'
+    ',6,-4,17,7,4,7,-4,4],[12652,3774,-11,8,-4,-5,9,-16,6,-1,0,14],[12158,3164,-12,12,-25,5,13,-17,18'
+    ',-9,26,-9,8,3,-28,15],[12228,3007,-31,7,5,-13,26,-7,4,9,-4,4],[12212,2978,-8,-4,13,-8,-5,12],[12'
+    '240,2995,-7,-2,6,-8,1,10],[11980,2562,-8,2,-2,-5,0,-16,5,-2,8,7,1,11,-4,3],[11052,2108,-10,-2,-3'
+    ',3,-13,-6,24,-6,2,11],[10748,2127,-8,-18,6,0,14,13,-12,5],[10748,2095,-8,-5,12,3,3,10,-7,-8],[10'
+    '704,2084,-9,3,-4,-5,8,-8,5,2,0,8],[10680,2093,-3,-7,8,-6,-5,13],[10657,870,8,0,1,7,-9,-7],[10403'
+    ',1043,-18,-6,10,-13,7,-21,6,31,-5,9],[10299,1129,6,0,-1,10,-5,-10],[10253,1161,6,-4,2,11,-4,1,-4'
+    ',-8],[10232,1214,-5,-2,3,-14,13,-2,-11,18],[10382,145,-11,-3,-6,-9,17,-6,15,6,3,4,-18,8],[10418,'
+    '287,-5,-10,4,-5,5,1,-4,14],[10025,547,-5,-2,-1,-17,7,-1,8,14,-9,6],[9985,647,-10,-6,-10,1,9,-16,'
+    '18,10,-7,11],[9965,671,-4,-11,3,-8,6,5,-5,14],[9998,979,8,-11,-2,11,-6,0],[9995,958,1,-16,9,4,3,'
+    '7,-1,6,-12,-1],[9858,792,2,14,-7,5,5,-19],[9840,796,3,13,-11,8,-6,-24,4,-15,10,5,0,13],[9825,904'
+    ',6,1,-1,9,-5,-10],[9386,721,-4,3,-16,-10,0,-12,5,-2,12,-25,10,22,-7,24],[9365,738,-5,-6,4,-6,9,1'
+    '0,-4,5,-4,-3],[9310,835,-4,-8,11,-6,-7,14],[9338,802,-7,-6,6,-8,7,0,-6,14],[9351,816,2,5,-4,1,-3'
+    ',-5,3,-15,5,4,-3,10],[9271,920,3,-7,7,4,-2,7,-8,-4],[9251,1090,-16,-15,2,-20,10,-3,10,18,-6,20],'
+    '[9269,1146,-5,5,-4,-12,9,-1,0,8],[9302,1204,-6,-4,10,-10,-4,14],[9268,1294,1,-14,4,15,-5,-1],[93'
+    '02,1334,6,6,-2,15,-14,-6,-6,-13,-3,-36,-9,-22,-2,-24,0,-18,7,-13,-11,-4,-7,-24,-8,-8,17,-36,10,3'
+    '6,-5,12,13,24,-2,21,7,1,6,9,-2,31,-8,9,18,28,-5,12],[9853,1109,-5,-11,4,-2,1,13],[9821,1095,-4,3'
+    ',-9,-9,8,1,11,-16,2,4,-8,17],[9822,1005,-8,-8,-2,-9,16,13,1,4,-7,0],[9824,1164,-3,-18,10,26,-1,6'
+    ',-6,-14],[9853,1201,-8,5,2,-16,14,6,-8,5],[9801,1186,1,-16,6,-6,-7,22],[9838,1179,5,-22,10,-3,-1'
+    ',26,-14,-1],[9814,1215,-2,13,-5,1,-3,-6,10,-8],[9805,1239,-11,-4,6,-7,5,11],[9840,1265,-9,3,0,-3'
+    '4,7,1,8,12,1,10,-7,8],[9827,1320,-1,-19,5,-8,1,17,-5,10],[9758,1649,-11,-3,1,-15,6,-7,4,1,0,24],'
+    '[9904,755,6,-8,-5,17,-1,-9],[9473,1582,5,-3,5,14,-10,-11],[9449,1608,-10,-9,2,-14,21,29,-2,7,-11'
+    ',-13],[9374,1887,-25,0,18,-19,7,19],[9349,1989,-8,6,1,-7,9,-13,-2,14],[9291,2009,0,-9,11,-17,-11'
+    ',26],[9387,1948,-16,8,-7,-6,18,-20,11,7,2,6,-8,5],[9185,2193,-1,-18,4,13,-3,5],[9191,2172,-5,-1,'
+    '3,-21,6,1,1,10,-5,11],[9108,2252,-4,-41,11,7,3,10,-10,24],[9141,2248,6,-10,9,0,-10,24,-5,-14],[9'
+    '058,2304,-4,-3,2,-3,10,-6,-8,12],[9068,2279,-8,7,-10,-2,6,-22,9,-8,3,-21,-16,-26,26,2,5,7,4,32,-'
+    '13,16,-6,15],[7997,963,-11,10,5,-11,6,1],[7990,898,-4,9,-11,3,15,-12],[-834,7114,-18,-11,-58,-18'
+    ',15,-1,31,10,64,10,0,14,-34,-4],[-15495,1964,-4,9,-8,2,-2,13,-11,11,-63,29,-4,-2,-2,-9,7,-16,-23'
+    ',-26,16,-37,1,-31,25,-11,9,15,23,15,26,6,20,13,5,7,-15,12],[-15692,2118,-33,5,-4,-12,43,-5,15,10'
+    ',-21,2],[-15610,2084,-18,11,-18,-4,-13,12,-7,-1,-4,-7,8,-13,14,-2,7,-19,30,3,10,7,2,5,-11,8],[-1'
+    '6022,2190,-2,-6,4,-4,12,11,3,9,-5,2,-12,-12],[-15783,2147,-13,23,-16,-10,-15,-1,16,-27,13,0,-4,5'
+    ',4,1,2,-5,6,1,10,-7,16,4,-8,15,-11,1],[-15958,2222,-15,-8,-6,-10,18,-13,15,-3,12,9,4,18,-5,7,-23'
+    ',0],[-15694,2093,-11,-2,8,-15,6,-2,10,9,-13,10],[17918,5147,-27,15,-26,2,63,-27,17,0,-27,10],[17'
+    '963,5203,-13,-5,5,-9,18,2,5,6,-15,6],[17756,5211,-4,-9,-26,-14,7,-4,26,11,8,15,-11,1],[17366,525'
+    '0,-26,-10,32,-4,6,14,-12,0],[17344,5285,-34,15,-42,1,-19,-7,23,-5,6,-9,16,-5,14,6,36,4],[-17239,'
+    '6040,-35,6,-12,5,-6,10,-13,-4,-2,-8,43,-16,41,-3,-16,10],[-17039,5720,13,-6,14,10,-27,-4],[-1604'
+    '9,5535,1,-4,14,-5,1,8,-16,1],[-16058,5531,3,7,-12,-7,-3,9,-9,-2,-6,-7,2,-14,34,1,-9,13],[-16243,'
+    '5493,11,-9,9,9,-3,5,-17,-5],[-16282,5449,9,-9,18,0,-27,9],[-15946,5506,4,-8,6,-1,-3,7,-7,2],[-15'
+    '990,5522,3,4,-5,1,-6,-7,-19,-8,2,-8,-8,-12,38,22,1,4,-6,4],[-15952,5515,-5,7,-8,-15,12,-1,1,9],['
+    '-16998,5285,0,-4,26,-2,3,6,-6,3,-23,-3],[-17068,5270,-15,-10,1,-4,21,5,3,6,-10,3],[-16576,5415,-'
+    '21,6,-14,-7,5,-9,15,0,22,5,-7,5],[-16544,5421,-11,7,-10,-3,5,-12,16,8],[-16780,5348,-19,8,-30,-6'
+    ',-11,-9,2,-13,-31,-5,-9,-8,-2,-11,-29,-21,58,21,24,20,40,15,7,9],[-16652,5361,21,9,-24,3,32,20,-'
+    '14,7,-20,-15,-6,15,-35,-4,-11,-5,-2,-10,37,-10,-7,-6,-21,5,-12,-17,-67,-21,14,-6,15,2,37,13,38,7'
+    ',25,13],[-16623,5378,2,-6,11,11,-13,-5],[-17247,5239,-15,-12,31,6,-16,6],[-17336,5210,-30,4,-13,'
+    '-4,-20,2,15,-7,66,1,16,3,-34,1],[-17417,5242,-27,-10,18,-5,-5,-5,-99,-20,62,2,56,10,-6,6,13,5,3,'
+    '8,-15,9],[-17619,5189,-1,-6,11,-4,8,2,-18,8],[-17629,5179,-9,7,-3,-2,6,-11,6,6],[-17659,5183,4,1'
+    '1,-15,5,-4,-15,-13,-5,-9,-19,12,8,7,-5,32,11,1,8,-15,1],[-17605,5197,6,8,-17,5,-2,-7,13,-6],[-17'
+    '721,5184,-46,-14,49,0,12,20,-7,3,-8,-9],[-17764,5183,-16,1,-15,8,-24,-4,20,-12,-9,-7,15,-7,16,16'
+    ',13,5],[7359,-5303,-34,5,22,-20,37,7,-25,8],[6922,-4907,17,12,-2,6,-20,1,5,-19],[5174,-4633,-8,-'
+    '4,4,-6,13,-1,-9,11],[3759,-4691,2,-4,20,-1,8,6,-21,8,-9,-9],[2791,3635,-19,-18,3,-26,9,2,13,12,1'
+    '2,2,-2,6,16,24,0,6,-32,-8],[2716,3563,6,19,-6,-3,-9,-19,7,-19,9,7,-7,15],[2786,3664,-7,-3,5,-7,2'
+    ',10],[2704,3700,-15,9,5,-7,-2,-7,12,5],[2706,3684,-11,-11,40,14,-8,4,-21,-7],[2536,3707,10,-14,9'
+    ',4,4,18,-6,5,-17,-13],[2528,3714,-13,-3,-4,-8,9,-4,8,8,0,7],[2541,3644,-4,-8,7,-2,4,5,-7,5],[253'
+    '6,3666,5,6,-11,7,-4,-3,10,-10],[2698,3778,-24,3,-16,-9,26,-8,22,7,-2,6,-6,1],[2621,3764,-12,-1,-'
+    '11,-10,22,4,15,10,-14,-3],[2594,3689,-20,-10,12,0,20,11,-6,4,-6,-5],[2634,3658,-7,2,6,-9,13,8,-9'
+    ',5,-3,-6],[2428,3760,1,-7,11,12,-8,3,-4,-8],[2440,3738,-2,-7,10,10,-5,7,-6,-6,3,-4],[2443,3671,-'
+    '7,3,-3,-8,20,2,1,8,-11,-5],[2494,3749,-3,2,0,-12,3,10],[2495,3786,1,4,-10,1,-7,8,-9,-3,1,-6,25,-'
+    '21,3,7,-4,10],[2516,3755,6,-1,4,6,-3,3,-23,5,16,-13],[2468,3696,2,-4,6,3,-4,7,-4,-6],[2601,3860,'
+    '-16,-3,0,-6,14,-16,-12,-8,13,-11,16,14,0,24,-15,6],[2653,3917,-14,10,2,6,-6,5,-44,-9,-7,-9,23,-1'
+    '0,11,9,9,1,-16,-12,5,-5,23,-6,16,2,-6,8,9,-4,-5,14],[2374,3908,4,3,-19,10,8,-11,7,-2],[2397,3927'
+    ',-13,-12,13,12],[2458,3888,-2,6,-7,4,-3,-9,11,-6,-3,-4,13,2,-9,7],[2557,4052,-12,-4,12,-8,12,3,-'
+    '12,9],[2537,4002,-8,-6,-6,5,-17,-1,0,-15,13,-2,6,6,1,-7,10,-1,9,22,-8,-1],[2462,4079,-10,-14,13,'
+    '-7,12,4,0,11,-5,6,-10,0],[2574,4020,-7,-6,7,-3,23,3,1,4,-6,6,-18,-4],[-1607,1120,-17,-9,5,-7,12,'
+    '4,0,12],[-1642,1980,-6,-9,4,-10,10,26,-8,-7],[-1669,3276,-24,8,-12,-2,-14,5,-5,-6,7,-9,15,-6,18,'
+    '-1,15,11],[-1596,1110,0,-4,6,2,-4,11,-2,-9],[-1633,2838,21,15,0,5,-20,-2,-24,-16,-35,-6,25,-33,1'
+    '2,2,12,12,9,23],[-1354,2914,-25,-8,-7,-19,8,-2,30,16,6,19,-4,4,-8,-10],[-1403,2862,-20,-40,-26,-'
+    '12,16,-4,13,11,27,8,10,44,-3,5,-9,0,-8,-12],[-1262,764,-23,-2,-10,-5,34,-10,7,-6,3,17,-11,6],[-1'
+    '540,2815,-28,0,-13,-16,0,-10,15,-13,10,-1,12,6,5,6,-1,28],[-1572,1130,-5,-12,4,-1,6,9,-5,4],[-15'
+    '54,1162,-8,-9,6,-2,8,6,0,6,-6,-1],[-2498,1709,-5,9,-8,1,-23,-10,3,-15,14,1,19,14],[-2499,1691,-1'
+    '0,-8,7,-3,13,2,-5,10,-5,-1],[-1732,2812,9,-11,13,7,-3,8,-8,4,-11,-8],[-1595,1143,5,4,-2,12,-4,1,'
+    '-6,-12,7,-5],[-1610,1177,6,-1,5,12,-16,0,5,-11],[-1804,2777,-12,-1,18,-11,9,16,-3,4,-12,-8],[-22'
+    '69,1617,-6,5,-17,2,-4,-19,14,-6,11,5,2,13],[-2433,1502,-6,2,-11,-6,1,-11,10,-5,8,4,-2,16],[-1793'
+    ',2884,-7,-8,14,-27,10,8,3,15,-7,13,-13,-1],[-2427,1664,-12,2,7,-17,8,11,21,-3,-6,5,-18,2],[-2290'
+    ',1673,0,11,-9,-3,7,-20,2,12],[-2321,1532,-4,-14,4,-5,9,4,-2,15,-7,0],[-2354,1514,-21,19,-4,-25,8'
+    ',-12,21,-4,6,9,-10,13],[4448,-1208,-7,-1,-3,-8,-16,0,28,-19,3,14,-5,14],[4370,-1226,-7,1,3,-9,20'
+    ',-3,-16,11],[4513,-1271,-4,6,-5,-5,8,-28,6,0,4,23,-9,4],[4338,-1161,1,20,-9,4,-4,-6,-3,-32,22,-1'
+    '6,4,5,-11,25],[3985,-773,-25,-21,4,-4,18,8,8,17,1,8,-6,-8],[4098,-211,-2,-6,3,1,15,9,-5,3,-11,-7'
+    '],[3949,-617,-6,5,-12,40,-12,-21,-1,-24,6,-11,7,0,7,-8,4,1,6,-10,9,6,-8,22],[5774,-2010,-8,11,-8'
+    ',-1,-19,-23,-6,-22,5,-5,27,2,13,15,1,12,-5,11],[5566,-2091,-21,4,-14,-3,-8,-16,13,-21,20,-9,24,2'
+    ',4,20,-18,23],[4835,-1331,-4,11,-12,-6,2,-13,13,-1,1,9],[4986,-1693,-4,-16,20,39,-16,-23],[-578,'
+    '-1596,0,-4,9,0,3,9,-12,-5],[3975,-544,10,18,2,35,-20,-2,3,-18,-5,-26,10,-7],[5548,-469,6,-10,0,1'
+    '0,-8,13,-8,-5,10,-8],[876,375,-8,-1,-10,-26,-12,-3,-3,-12,4,-7,23,-4,6,8,19,41,-4,5,-15,-1],[663'
+    ',40,-15,-12,2,-16,6,-7,19,19,0,9,-6,7,-6,0],[741,170,-8,-10,6,-6,6,9,-4,7],[723,453,-9,-13,16,2,'
+    '3,7,-10,4],[-4422,-2308,-14,-9,4,-4,22,4,-12,9],[-4850,-2622,-4,5,-13,-12,7,-12,10,19],[-4854,-2'
+    '757,-1,-24,6,4,11,32,-3,5,-5,-4,-8,-13],[-4523,-2383,-7,10,-15,-17,19,-4,3,11],[1125,3482,-13,-1'
+    '4,16,7,-3,7],[1092,3389,-17,0,-3,-15,14,-5,13,6,4,6,-11,8],[-441,5419,7,8,-4,12,-4,2,-28,-19,-9,'
+    '-15,18,-1,20,13],[-657,5666,-9,-8,18,9,-9,-1],[-510,5557,-15,15,-10,-3,-4,-7,6,-14,10,-3,12,0,1,'
+    '12],[-584,5652,-11,1,-15,12,-19,-4,-2,-6,17,-6,-4,-13,-15,-4,15,-3,40,5,2,15,-8,3],[-613,5593,-2'
+    '8,-8,-8,-15,19,8,3,-11,-4,-6,22,5,3,6,-7,21],[-594,5605,-3,-6,6,-2,-16,-8,3,-8,7,0,24,31,-21,-7]'
+    ',[-109,6072,-8,-12,10,-10,2,15,6,4,-10,3],[-124,6049,-5,-2,-1,14,-11,-1,-16,-11,12,-2,8,-14,-29,'
+    '-5,2,-4,14,-2,2,-5,16,2,3,-4,-7,-24,6,-3,10,13,15,43,-11,-2,-8,7],[-83,6068,6,13,-15,0,0,-11,9,-'
+    '2],[-327,5891,-12,0,2,-7,9,-6,12,1,-11,12],[-432,5342,-25,-3,2,-13,18,-13,32,18,-10,-1,-17,12],['
+    '-254,5930,-12,-7,23,4,2,3,-13,0],[-304,5882,10,-8,4,9,-14,-1],[-282,5898,-25,2,5,8,-23,6,-6,-1,-'
+    '4,-11,2,-5,9,3,4,-7,21,1,13,-5,10,7,-6,2],[-666,6186,-22,4,21,-13,5,4,-4,5],[-670,6150,-4,7,-19,'
+    '6,4,-10,12,-8,9,-4,-2,9],[-738,6207,20,-3,11,3,-17,8,-18,-1,4,-7],[-701,6209,28,-14,-11,17,18,-3'
+    ',3,14,-33,9,-21,-3,16,-20],[-296,5927,10,-2,4,-9,9,3,0,4,-25,12,-7,-3,9,-5],[-645,6219,4,7,-14,1'
+    '0,-1,-14,11,-3],[-685,5783,45,21,-4,5,-11,0,22,10,13,17,-2,13,-56,-19,5,-11,-28,4,-8,-5,1,-10,9,'
+    '-3,-7,-5,20,-8,-22,-11,12,-6,11,8],[-643,5702,8,-7,9,4,-6,6,-11,-3],[-636,5724,9,-6,24,2,4,-16,3'
+    '2,19,-4,4,-43,4,-3,28,-14,8,-5,0,-2,-7,-24,-4,4,-5,-12,-1,-6,-6,8,-8,24,-3,8,-9],[-721,5768,-26,'
+    '-3,-4,-5,33,-7,9,10,-12,5],[-730,5738,-11,0,-1,-15,4,-10,9,-2,4,2,-5,25],[-1014,5401,-13,-3,21,-'
+    '2,11,-8,-1,11,-18,2],[-752,5701,2,-6,10,3,-12,3],[2191,6039,4,1,-12,7,-1,-9,17,-4,-8,5],[1955,60'
+    '24,-1,-10,13,2,-4,9,-8,-1],[2007,6019,12,0,7,7,-37,15,-10,-6,8,-5,-2,-8,-6,-1,-1,8,-11,-6,8,-13,'
+    '5,-2,23,1,4,10],[2137,6326,-14,-4,1,6,-16,0,17,-13,17,5,0,5,-5,1],[1913,5798,-9,-7,5,-5,24,10,-2'
+    '0,2],[1696,5725,-23,-35,-10,-2,-22,-31,2,-33,10,5,25,52,27,40,0,7,7,4,-9,3,-7,-10],[1477,5530,-9'
+    ',-20,37,-10,9,9,-1,5,-36,16],[1360,5443,-2,3,8,10,-17,6,-7,8,-8,0,-16,-16,-2,-14,3,-7,17,-8,12,9'
+    ',23,-6,0,10,-11,5],[1231,5504,-4,2,-13,-10,-2,-5,6,-2,18,7,19,1,-24,7],[1252,5561,3,-5,12,4,-5,8'
+    ',-10,-7],[1166,5483,-12,0,-28,12,-20,-1,-2,-17,42,-14,31,5,-3,13,-8,2],[1035,5491,-15,5,14,-10,1'
+    '6,0,-15,5],[978,5507,3,-16,25,-2,-6,10,-22,8],[1074,5496,-12,-11,7,-10,4,0,22,41,-21,-20],[1053,'
+    '5578,6,-1,7,11,-11,11,-2,-21],[1108,5453,-7,-6,27,-5,-5,8,-15,3],[1093,5731,-6,-5,14,-3,16,9,-24'
+    ',-1],[845,5506,-4,0,-11,-15,-2,-14,7,8,28,4,-25,1,7,16],[-139,4605,2,-8,16,-15,3,8,-21,15],[-131'
+    ',5077,-25,-10,25,-8,11,1,13,9,-24,8],[474,5309,-3,-5,8,-4,10,7,0,11,-15,-9],[1036,4282,-25,-3,2,'
+    '-5,21,2,8,-5,1,11,-3,4,-4,-4],[837,3912,-1,-8,6,-7,6,10,-11,5],[834,4110,-7,0,-6,-10,4,-1,9,11],'
+    '[406,4008,-21,-2,-1,-8,45,-14,3,8,-9,11,-17,5],[142,3874,-1,-7,18,0,-15,10,-2,-3],[135,3908,-13,'
+    '-18,4,-2,15,-2,21,18,-6,8,-21,-4],[-3126,3950,-2,-11,10,-3,4,12,-6,4,-6,-2],[-2713,3879,-26,-2,9'
+    ',-11,20,-3,6,11,-9,5],[-2831,3874,22,-12,31,-6,-53,18],[-2870,3864,-14,-4,10,-8,10,0,3,3,-9,9],['
+    '-2840,3855,-15,-3,10,-11,39,0,-34,14],[-2559,3783,-19,8,-7,-2,2,-6,10,-7,29,-4,19,2,6,2,1,8,-41,'
+    '-1],[1445,3596,-10,2,0,-11,18,-5,4,3,-12,11],[1523,4406,-16,10,16,-10],[1474,4507,-17,15,-13,-12'
+    ',25,-14,12,2,-7,9],[1486,4471,-11,13,-8,-2,1,-5,18,-6],[1491,4449,25,-18,8,4,-50,35,17,-21],[149'
+    '5,4412,-8,5,2,-4,25,-22,6,-1,-25,22],[1537,4391,7,-1,-7,7,-10,4,10,-10],[1447,4473,0,24,-14,19,-'
+    '4,-2,5,-12,-3,-12,11,-23,6,-5,-1,11],[1739,4280,35,-10,-35,10],[2079,3814,-17,13,-6,20,-4,-14,-8'
+    ',3,-9,-14,0,-4,10,5,12,-13,19,-3,3,7],[2084,3784,-8,1,-7,8,-7,-7,20,-20,9,7,8,-2,-15,13],[2065,3'
+    '860,6,4,-2,20,-6,-2,-7,-16,-1,-8,10,2],[2070,3845,-8,3,3,-7,6,-9,5,1,-6,12],[1996,3947,-11,20,8,'
+    '10,-9,5,-19,-5,23,-31,22,-8,-2,5,-12,4],[2351,3790,4,3,-3,6,-10,-6,9,-3],[2295,3638,-4,-16,13,-7'
+    ',6,10,-15,13],[395,5174,-25,-3,25,-8,13,2,-13,9],[-5135,6985,4,-18,14,-15,16,3,10,21,23,9,-41,7,'
+    '-26,-7],[-3705,6572,-17,-2,-2,-9,5,-8,16,0,4,5,4,8,-10,6],[-5363,7103,14,3,5,6,0,7,-14,11,-12,-2'
+    ',-26,-15,33,-10],[-5552,7257,50,22,-1,3,-96,-4,-22,-6,7,-5,27,-1,35,-9],[-5197,7098,-14,-1,-4,-7'
+    ',3,-3,51,0,-36,11],[-4639,6091,-40,-15,24,-2,17,-8,11,12,6,16,-18,-3],[-12612,4937,-9,1,-2,-8,17'
+    ',-4,-6,11],[-12251,4742,0,-6,11,1,-7,12,-4,-7],[-12252,4769,-4,1,-2,-8,8,-4,-2,11],[-12292,4871,'
+    '-7,-8,10,-4,-1,7,6,-3,7,2,-15,6],[-12287,4855,-6,-7,9,-6,-3,13],[-12311,4861,-6,-2,3,-8,15,-4,-1'
+    '2,14],[-12250,4808,-2,-5,-8,17,-10,3,16,6,-9,9,-12,-14,13,-9,6,-16,15,-7,4,2,0,5,-13,9],[-12449,'
+    '4967,35,-16,-28,22,-23,3,16,-9],[-12338,4888,0,3,-31,19,15,-15,16,-7],[-12347,4887,-11,6,10,-20,'
+    '7,3,-6,11],[-12498,5003,7,5,-8,14,-4,-9,5,-10],[-12674,4984,-9,3,-10,-3,3,-6,-5,-4,14,-10,17,-3,'
+    '-1,14,-9,9],[-12513,5032,-13,10,-10,-11,16,-27,13,18,-6,10],[-11851,3296,-5,7,-3,-2,12,-17,12,-1'
+    ',-16,13],[-11831,2913,0,5,-6,1,-3,-8,11,-21,5,4,-1,10,-6,9],[-12025,3401,14,-11,13,7,-9,6,-18,-2'
+    '],[-11968,3403,-24,4,3,-8,8,-2,25,4,-1,4,-11,-2],[-11847,3336,2,-4,15,-1,-9,11,-16,6,-1,-4,9,-8]'
+    ',[-7139,4147,3,10,-3,-10],[-7425,3953,14,22,-14,-22],[-7419,4061,-5,-9,5,0,11,7,1,6,-12,-4],[-64'
+    '77,3231,-8,-5,12,3,6,9,-10,-7],[-7067,4145,-16,-9,4,-3,28,5,-11,8,-5,-1],[-7135,4147,11,2,1,16,-'
+    '12,-18],[-7006,4133,-17,-4,25,-2,-6,13,-2,-7],[-7578,3519,-20,-7,20,7],[-7565,3584,0,7,-7,4,7,-1'
+    '1],[-7523,3807,-15,-20,18,20,10,23,-13,-23],[-7550,3577,2,-20,-6,-29,-14,-7,17,7,5,28,-4,21],[-7'
+    '644,3476,-6,-12,29,30,-23,-18],[-9652,2833,-28,-18,39,19,1,4,-12,-5],[-9730,2752,-8,-28,32,58,-2'
+    '4,-30],[-9509,2914,32,20,-6,0,-26,-20],[-9739,2720,-1,-38,22,-71,-17,69,-4,40],[-8505,2964,-7,-1'
+    ',11,-2,27,12,-31,-9],[-8146,3073,4,24,-6,-7,2,-17],[-8918,3017,-16,-11,12,-2,4,13],[-9180,2960,-'
+    '8,4,-13,-3,18,-12,7,5,-4,6],[-8883,2993,-3,-15,5,15,-6,13,4,-13],[-7753,2394,-9,28,-6,-10,-8,4,1'
+    '0,7,-4,6,-30,-7,15,-18,8,-29,20,-1,4,20],[-7777,2208,-15,1,2,-5,19,-12,8,13,-14,3],[-7803,2229,-'
+    '12,14,-12,-1,9,-10,15,-3],[-7828,2246,-7,8,-35,-1,15,-7,27,0],[-7751,2685,30,-36,-4,-33,-15,-14,'
+    '15,-12,6,6,2,28,13,9,-3,20,-19,11,-1,5,-26,21,-33,4,-8,-4,43,-5],[-7424,2272,14,-5,7,4,-28,13,1,'
+    '-8,6,-4],[-7443,2407,-2,6,-8,-2,-2,-14,4,-1,8,11],[-7366,2094,50,4,10,14,5,18,-5,1,-18,-16,-28,4'
+    ',-16,-9,2,-16],[-7391,2257,-3,-9,-34,-30,31,18,13,18,-4,14,3,5,-10,-1,-3,-8,7,-7],[-7634,2533,-1'
+    '4,4,-23,19,-7,-13,16,0,25,-12,21,-19,-5,-30,-11,0,15,-17,4,49,-21,19],[-7595,2365,-6,2,-3,-7,38,'
+    '-15,-29,20],[-7513,2327,-1,-7,-8,-3,25,-10,12,-20,0,13,-21,15,-16,40,-10,12,1,-8,18,-32],[-7553,'
+    '2445,-12,23,-6,2,-3,-5,33,-38,-9,-13,20,1,-23,30],[-7788,2213,4,2,-16,15,-4,-10,16,-7],[-8220,26'
+    '55,6,-10,10,0,-8,1,-8,9],[-7837,2454,18,-7,4,2,11,-20,30,21,0,21,-23,29,-1,8,-18,12,-5,-1,5,-17,'
+    '-2,-10,-12,-17,6,-10,-8,-6,-2,5,-10,-1,7,-9],[-8156,2469,-7,-10,10,2,-3,8],[-8026,2738,9,-18,-2,'
+    '8,-25,57,18,-47],[-8268,2182,-8,9,-23,3,-9,-15,11,-20,-8,-4,-13,4,11,-12,11,-3,31,8,9,5,-12,25],'
+    '[-8209,2649,-3,18,-5,3,8,-21],[-7938,2268,-25,13,11,-10,17,-7,-3,4],[-7823,2664,30,2,-1,8,-43,-4'
+    ',-23,10,-3,-14,-8,-6,-9,-2,-19,11,25,-19,51,14],[-8026,2535,-9,-5,0,-7,-23,-28,20,19,12,21],[-87'
+    '85,1814,-5,1,-10,-24,5,1,10,22],[-8790,1743,-3,-15,14,24,-4,3,-7,-12],[-9182,1868,14,0,14,8,-5,2'
+    ',-23,-10],[-8224,933,-2,10,-6,-1,8,-9],[-8128,1936,-6,-3,-8,4,2,-9,29,3,-2,4,-15,1],[-8693,2055,'
+    '-9,-17,3,-11,23,28,-17,0],[-6271,1735,-8,5,-5,-6,18,-12,-5,13],[-6091,1409,-16,-22,1,-9,11,-6,5,'
+    '10,-1,27],[-6093,1469,0,7,-10,7,-10,5,-8,-3,7,-20,13,-5,-8,-7,3,-6,22,-3,-3,17,-6,8],[-6092,1084'
+    ',-45,-4,-28,-8,17,-12,-2,-33,-13,-3,-28,-17,74,1,16,5,4,19,-7,16,1,19,11,17],[-6837,1230,12,-27,'
+    '3,20,-15,7],[-6071,1128,-9,-7,-1,-4,5,1,21,8,2,7,-18,-5],[-6218,1681,-4,-11,7,-2,-3,13],[-5959,1'
+    '332,-6,-2,1,-15,12,-9,9,9,-16,17],[-6401,1107,-2,-7,-8,1,-14,7,-15,-10,48,-9,10,11,-3,13,-4,4,-1'
+    '2,-10],[-6316,1817,18,9,-18,-9],[-6166,1224,-12,-23,15,4,2,17,-5,2],[-6176,1755,1,11,-10,5,1,-11'
+    ',8,-5],[-6125,1601,-7,-6,1,-6,11,3,-5,9],[-6186,1701,11,-1,6,10,-13,7,-7,-7,3,-9],[-6125,1537,-7'
+    ',22,-14,4,-2,-10,10,-30,10,2,3,12],[-6117,1626,-19,10,-5,11,-6,4,-4,-3,-1,-25,35,3],[-6164,1633,'
+    '-11,3,-4,-6,3,-24,9,-10,11,9,1,22,-9,6],[-6113,1320,-1,16,-4,0,-9,-7,-1,-8,8,-7,7,6],[-7298,2237'
+    ',20,-8,3,4,-38,13,-3,-8,18,-1],[-6883,1216,-18,7,-7,11,-8,4,1,-8,15,-16,20,-9,5,1,-8,10],[-7172,'
+    '2179,5,-4,0,8,-18,1,2,-5,11,0],[-7292,2151,-7,5,-7,-4,1,-6,13,5],[-7196,2186,8,-2,-5,11,-8,0,5,-'
+    '9],[-7219,2177,4,3,-18,5,-1,-9,15,1],[-16108,5867,-5,0,6,-10,15,1,20,22,-27,-6,-9,-7],[-15316,57'
+    '09,25,6,-38,4,-8,-14,7,-5,14,9],[-15196,6050,-11,-14,8,1,10,10,-7,3],[-15252,5848,13,6,2,7,-9,1,'
+    '-18,-8,12,-6],[-15324,5785,-11,8,-17,3,23,-13,5,2],[-15574,5583,14,-4,3,3,0,10,-17,-9],[-15452,5'
+    '660,-21,-10,-4,-8,26,10,7,5,-8,3],[-15422,5661,-11,-7,21,0,1,6,-11,1],[-14637,6042,-19,6,-14,-8,'
+    '10,-13,47,12,1,3,-25,0],[-14528,6034,13,-3,5,8,-18,-5],[-14454,5988,-7,-7,4,1,33,20,-11,-2,-19,-'
+    '12],[-14702,6033,-16,3,-16,-17,-43,-25,-10,-11,13,-2,24,8,18,19,33,17,3,4,-6,4],[-14791,6009,-17'
+    ',6,-15,-4,-4,-6,20,-2,16,6],[-14784,6035,-5,-5,2,-7,11,-4,10,16,-3,5,3,5,-3,4,-7,-5,-3,2,-5,-11]'
+    ',[-14793,6083,-3,7,-8,2,-6,0,-2,-8,19,-1],[-13268,5473,6,16,-15,4,-7,-5,-26,33,-20,12,-13,-3,1,-'
+    '9,17,-3,13,-21,23,-21,18,-8,3,5],[-13386,5658,12,7,-4,8,-5,5,-9,0,-13,12,-22,2,-10,-8,-1,-12,10,'
+    '-10,-1,-4,21,-12,-12,-5,-5,-21,6,-12,24,5,7,16,2,29],[-13363,5554,-11,-4,10,-9,-1,-14,37,23,-7,6'
+    ',-28,-2],[-13143,5500,-3,-7,5,-4,18,1,-1,5,-16,26,-17,5,-2,-23,5,2,11,-5],[-13291,5664,-4,-7,7,-'
+    '6,31,7,-9,10,-18,11,-7,-15],[-13238,5650,-22,-26,-10,-4,1,-7,3,-5,21,-2,8,-12,24,0,6,30,-25,25,-'
+    '6,1],[-13294,5644,-10,-10,15,-8,11,-1,13,6,1,13,-30,0],[-13431,5823,-21,10,-14,-4,20,-8,15,2],[-'
+    '12922,5280,-4,0,1,-8,28,-26,3,14,-28,20],[-13092,5461,-3,-13,20,12,-17,1],[-13111,5214,1,-13,7,-'
+    '5,2,14,-10,4],[-13032,5405,-17,2,-21,-12,0,-6,6,-5,0,8,5,2,21,-10,14,12,-8,9],[-13004,5348,-41,1'
+    '5,-7,-9,65,-38,12,8,-29,24],[-12793,5161,-10,10,-12,-8,6,-12,11,-5,6,1,-1,14],[-12830,5255,5,23,'
+    '-11,0,-8,-8,3,-23,-4,-8,11,4,4,12],[-12947,5318,-4,0,3,-8,17,-11,-16,19],[-12917,5312,-1,14,-6,7'
+    ',-8,-19,15,-2],[-13929,6960,16,-6,25,5,-26,6,-15,-5],[-6100,887,14,8,1,5,-7,7,-15,-12,1,-10,6,2]'
+    ',[-8022,-275,-5,-25,12,-1,6,16,18,12,-17,6,-14,-8],[-5125,-54,-17,-3,-13,-8,-13,-21,0,-23,-12,-1'
+    '1,-14,-25,30,11,36,32,12,35,-9,13],[-7913,825,2,-4,4,4,-3,5,-3,-5],[-7899,129,2,-4,6,0,1,11,-9,-'
+    '7],[-7818,265,-3,-4,7,-9,2,8,-6,5],[-6079,918,5,2,-4,2,-13,-4,-3,-7,15,7],[-4448,-272,-9,-6,-3,-'
+    '26,10,10,2,22],[-3867,-1288,-1,-9,-11,-9,1,-6,18,13,-7,11],[-3901,-1342,7,-11,3,13,-10,-2],[-449'
+    '8,-127,-4,-10,5,-2,9,7,-1,4,-9,1],[-5013,23,-14,0,-8,-10,1,-9,23,-1,11,-6,16,4,14,21,-18,8,-25,-'
+    '7],[-5049,213,-2,-10,5,-12,16,3,-4,20,-15,-1],[-5065,-13,-2,7,-17,1,-16,-6,-4,-12,11,-10,28,20],'
+    '[-4971,-14,27,3,6,5,-2,12,-10,2,-21,-6,-12,-11,12,-5],[-5034,38,-1,20,-7,-2,-3,-23,-16,-13,-1,-1'
+    '5,18,-6,1,15,10,12,-1,12],[-5026,36,11,3,11,13,-2,12,-19,-5,-1,-23],[-9027,-48,-20,-4,-7,-16,15,'
+    '-9,13,3,7,8,0,12,-8,6],[-8942,-72,-18,-19,6,-4,12,4,13,12,3,6,-3,4,-13,-3],[-8171,749,4,3,-8,10,'
+    '-6,-3,-4,-14,8,-8,17,-4,-11,16],[-9140,-32,-6,6,-19,-2,0,-11,12,-9,10,2,3,14],[-9048,-122,-4,-8,'
+    '10,-4,4,5,-10,7],[-9096,-60,-2,18,-20,20,-3,18,-10,13,-5,4,-13,-2,-10,-12,16,-1,6,-27,12,-8,13,-'
+    '19,-2,-6,-32,-18,-2,-12,11,-10,24,0,22,8,11,19,-16,15],[-9067,-19,-11,3,-9,-11,6,-6,19,-3,7,8,-1'
+    '2,9],[-10939,-2707,-4,-10,21,7,-17,3],[-10652,2165,-12,5,3,-14,8,-3,1,12],[-11099,1886,-7,-8,9,-'
+    '6,6,2,-8,12],[-11070,2505,16,-16,-6,15,-9,5,-1,-4],[-10989,2434,1,-14,7,-5,-8,19],[-11320,2930,-'
+    '17,4,-5,15,-17,8,1,-16,32,-31,10,-5,-4,25],[-11479,3175,6,-5,4,2,-8,7,-2,-4],[-11523,2837,-4,-3,'
+    '1,-12,-9,-12,17,-6,3,13,-8,20],[-11186,2454,-15,-1,30,-18,1,4,-16,15],[-11109,2608,-9,-4,-4,-20,'
+    '8,16,5,-2,0,10],[-11220,2901,-9,23,-13,-4,-5,-3,-4,-32,23,-8,8,24],[-11216,2480,-4,9,7,33,-3,7,-'
+    '14,-50,12,-6,10,-20,-8,27],[16689,-4524,13,-6,-4,12,-9,-6],[12433,1071,-4,-11,9,3,-5,8],[12523,1'
+    '012,-10,4,3,-10,13,-13,-6,19],[12291,743,-4,-3,-5,3,-2,-11,14,4,-3,7],[12578,713,-7,6,-3,-12,9,-'
+    '16,1,22],[12597,976,-5,-14,3,-5,4,11,-2,8],[12456,1164,-5,5,-15,-2,12,-18,13,0,-5,15],[12479,116'
+    '8,-6,4,1,-6,10,-12,1,5,-6,9],[13480,-639,2,-4,7,11,-9,-7],[13463,-671,3,-6,8,15,-11,-9],[12783,-'
+    '300,11,-2,5,8,-16,-6],[12755,-325,-6,-4,14,-7,-8,11],[12402,-590,-4,2,-1,-6,7,-8,-2,12],[12355,-'
+    '533,7,-4,1,10,-7,2,-1,-8],[12063,-702,1,-10,13,0,1,6,-15,4],[12301,-845,-12,-14,6,-1,8,11,12,1,-'
+    '14,3],[11755,-815,-7,-9,1,-11,4,-2,14,18,0,4,-12,0],[7006,6660,2,10,-58,5,-3,-3,18,-15,19,-8,22,'
+    '3,5,5,-5,3],[9685,7620,20,10,-21,4,-10,-13,11,-1],[10007,7970,-11,-1,-4,-9,38,7,-23,3],[16152,69'
+    '63,-41,-16,-3,-6,8,-8,-2,-22,32,-11,-4,-10,10,7,-13,14,-4,26,26,13,1,9,-10,4],[12971,3172,-2,-8,'
+    '3,2,7,13,-8,-7],[12639,3657,-7,4,2,-14,6,-4,-1,14],[12489,3960,-4,-9,6,3,2,7,-4,-1],[12121,2820,'
+    '-8,-6,0,-8,12,3,-4,11],[11346,2290,-6,0,3,-4,13,-10,-10,14],[11278,2177,-7,-7,6,-12,9,17,-8,2],['
+    '11256,2167,-4,-5,12,2,1,7,-9,-4],[11400,2221,4,12,-20,-9,16,-3],[10708,1039,0,-5,11,11,-11,-6],['
+    '10322,1078,6,-10,4,4,-10,6],[851,5476,-11,-5,15,-2,2,6,-6,1],[675,5363,-11,-5,9,0,7,5,-5,0],[-62'
+    '62,6602,17,-7,7,-12,-23,-11,-5,-8,-51,2,-29,19,4,-14,-23,-4,31,-5,-6,-50,-21,-19,-29,18,-16,1,-9'
+    ',-5,-20,10,8,23,-20,-15,-9,-13,-55,34,-29,30,2,6,20,12,33,8,18,17,22,13,-21,-3,-34,-21,-42,-9,-4'
+    '1,1,-6,2,3,7,20,11,-40,-7,-42,15,-31,28,-20,7,2,-8,-11,-2,-23,4,-1,-5,13,-9,0,-11,-4,-1,-65,16,1'
+    '8,-20,52,-24,-17,-10,-48,4,-63,28,-29,-5,28,-3,25,-9,-4,-14,7,-7,32,-10,-8,-15,1,-6,37,8,17,-5,1'
+    '0,-11,18,-4,-22,-9,27,-11,10,-16,14,-1,13,-25,6,18,42,-15,-8,-7,9,-6,27,17,17,-4,26,-14,8,2,16,-'
+    '10,-26,-13,35,1,11,-7,-14,-14,-37,-1,23,-6,20,-14,-2,-6,49,0,-1,-7,-11,-4,22,-2,17,-19,-15,-3,6,'
+    '-22,-1,-20,-15,-1,-27,35,-26,16,10,-15,9,-28,-7,-7,40,-34,-20,-4,-29,5,11,-23,0,-5,-6,-2,-46,24,'
+    '-17,6,-9,-2,-39,20,-1,-12,-18,4,-24,23,1,-18,-6,-1,-32,25,-24,2,-63,39,15,-24,2,-7,-4,0,-73,31,-'
+    '37,2,-5,-5,12,-10,65,-43,46,-8,-6,-8,37,-10,39,-21,34,-10,36,-30,30,-9,-5,-7,-10,-4,7,-19,-20,-4'
+    ',-118,28,-110,11,-59,16,-47,35,-64,-1,-87,24,16,12,-30,-8,-25,9,-49,29,38,2,23,14,-13,1,-33,13,-'
+    '45,1,12,16,-33,-7,-18,20,-77,38,18,18,-64,0,-4,-11,-11,-5,-7,19,-33,3,-22,19,-24,-6,28,-21,-5,-6'
+    ',-38,-4,-42,8,-23,-2,-5,-13,-35,-1,-74,-14,-93,13,-38,25,-2,13,13,23,18,9,52,13,-10,16,13,9,85,-'
+    '8,65,-14,31,-17,2,-5,-9,-10,14,-7,9,17,-44,29,63,-2,19,10,49,-1,25,11,25,4,44,-3,-20,28,-53,24,-'
+    '12,9,-2,7,114,50,25,6,8,15,16,15,43,10,14,12,-13,9,-38,47,-33,30,-27,16,5,9,-36,-7,-18,7,-6,7,10'
+    ',19,-7,8,-27,0,15,-12,-2,-3,-43,3,-23,13,-5,10,-21,1,17,9,-21,5,23,9,-13,2,-36,-16,-31,4,-10,-6,'
+    '-61,-16,-36,-3,-3,6,6,25,18,4,29,-2,23,3,19,10,2,5,-10,9,-71,17,-6,5,0,7,29,7,-28,2,-23,-11,-35,'
+    '7,-2,3,25,11,-16,6,-57,1,-18,39,-51,-1,-34,12,-45,25,-28,-12,-6,-8,48,-11,16,-19,-5,-9,-27,-8,-4'
+    '3,-4,-115,16,-89,6,-9,-2,45,-11,28,-13,8,-8,-8,-4,-64,21,-73,-10,-86,17,-71,-5,-157,15,-35,-7,-5'
+    '4,11,-18,20,10,12,-30,-8,-42,2,-5,-1,11,-7,-56,-1,-28,-7,-50,19,-45,8,-36,24,-25,30,76,-1,86,-11'
+    ',70,7,-73,20,-121,8,-61,13,-16,7,-18,46,10,10,27,11,-20,9,-1,12,5,10,46,33,13,31,25,14,22,6,5,9,'
+    '99,32,131,13,130,-4,16,-9,-105,-41,-63,-44,-4,-11,35,-30,-2,-34,12,-22,18,-13,102,-42,-39,-12,-1'
+    '06,-19,-12,-3,4,-2,91,16,64,-1,-5,-8,18,-6,8,9,12,35,1,15,-4,4,-64,7,-26,17,-31,12,36,11,23,13,3'
+    '0,-1,74,-18,-56,27,22,7,-72,4,-28,18,-3,12,3,10,23,13,113,-15,-1,4,-111,21,-7,6,43,23,60,12,64,-'
+    '4,-12,11,106,19,64,2,59,-4,27,-10,19,-29,55,-19,1,-19,32,-18,-96,-44,47,15,15,-1,-9,-11,-24,-13,'
+    '25,-11,-23,-3,-1,-16,75,30,30,-3,-23,15,7,6,21,6,25,-14,26,8,32,-12,-1,-23,42,-16,-27,22,4,17,12'
+    ',8,27,-7,31,0,39,-10,21,0,-2,4,-75,14,-19,11,2,7,11,6,60,12,86,0,70,-15,49,0,51,-14,15,-16,-35,-'
+    '23,-15,-3,-38,-29,49,26,53,12,52,-3,17,-9,-11,-14,-57,-11,-31,-2,50,-3,-13,-11,-4,-7,3,-9,-20,-1'
+    '8,4,-1,24,12,16,24,11,7,68,12,10,-5,-49,-32,49,19,53,-31,-13,20,3,6,38,14,126,-16,38,-16,7,-8,-3'
+    ',-4,-28,-13,-44,-2,-69,-26,32,0,30,18,27,4,37,-7,18,0,36,13,16,-6,3,-15,-12,-11,-26,-12,-57,-10,'
+    '-30,-14,16,-3,30,15,15,-5,-15,-37,45,45,42,16,48,9,79,-5,84,-19,9,-11,-12,-7,-36,-10,-60,-6,-62,'
+    '-21,26,1,32,11,70,4,6,-5,-29,-17,27,-4,25,12,26,5,-10,7,21,13,26,-3,54,-28,15,-20,-5,-7,-80,4,-3'
+    '5,-13,-47,-2,-41,-11,74,7,60,-12,67,0,52,-15,4,-12,-12,-4,-68,2,-46,8,-26,-5,-21,3,-63,-13,62,7,'
+    '59,-10,8,-3,0,-11,-13,-15,-44,6,-41,-3,-61,6,47,-11,66,-6,6,-2,0,-6,21,-10,28,3,46,-8,46,-1,-29,'
+    '-13,20,-11,-9,-15,19,6,7,-10,5,8,-2,10,42,7,-6,-24,-14,-14,-12,-4,9,-3,50,24,-3,-11,11,-4,16,7,1'
+    '9,-2,-3,-20,14,-10,-4,16,2,5,36,15,14,0,8,-4,-19,-10,-4,-7,5,-3,38,5,48,-22,14,3,17,-8,-23,-7,7,'
+    '-15,-69,0,32,-5,2,-4,52,0,2,6,23,6,55,-14,-12,-7,-10,-15,-44,-20,74,13,58,-4,26,14,15,-3,62,-33,'
+    '4,-8,-22,-5,-37,12,-22,-4,47,-14,8,-13,-39,-6,-41,10,-18,0,14,-9,-12,-9,54,-19,-63,-2],[-6872,81'
+    '26,181,23,28,13,93,3,47,9,79,0,226,30,91,24,6,6,-27,13,-22,2,-78,3,-77,-7,16,12,-55,14,17,6,-3,2'
+    ',-48,4,-52,-5,-40,12,-21,-1,-19,-9,-43,4,-167,-17,-107,-2,163,17,42,11,-307,9,-48,10,-90,-2,-55,'
+    '-8,48,-12,-104,20,-83,-2,-52,-8,-11,-5,0,-5,78,-18,-61,5,-114,24,-133,4,-138,-4,21,-9,127,-28,7,'
+    '-3,-44,-7,-41,13,-120,23,-253,1,32,-9,108,-14,-133,3,-93,7,-17,-4,37,-15,-5,-2,-72,7,-54,-1,44,-'
+    '11,-59,-6,-18,-3,0,-3,98,-21,134,-16,50,-10,16,-8,-68,13,-239,27,-21,-5,42,-11,-30,-1,-38,6,-58,'
+    '19,-131,12,-89,-16,-83,-7,158,-24,-61,-3,-98,10,-20,-2,-19,-7,-38,9,-66,5,-51,-4,-81,-14,-156,-9'
+    ',-48,-9,-23,-6,-3,-4,39,-7,66,9,81,-3,-73,-17,-6,-3,31,-3,182,16,88,-3,-102,-3,-105,-17,46,-8,-7'
+    '4,-8,-3,-5,36,-9,234,5,188,21,46,0,-154,-25,-91,-5,-102,1,-76,-6,-9,-3,20,-8,135,-17,38,1,155,37'
+    ',249,11,-6,-5,-190,-11,-119,-26,-16,-7,-2,-3,9,-3,138,-8,93,2,82,17,118,6,-66,-19,51,-2,136,9,12'
+    '5,19,21,7,15,13,20,8,47,3,76,18,108,10,-140,-26,-34,-13,-9,-9,186,-9,-153,-8,-124,-13,-42,-12,-9'
+    '3,-8,-201,-13,31,-15,167,-48,89,-2,-36,-6,-121,8,-99,30,-104,24,-259,9,-19,-6,-11,-14,12,-10,7,-'
+    '17,39,-13,76,-6,107,-43,62,-18,-80,7,-19,-5,16,-7,197,-10,69,8,-40,-12,-84,-2,-28,-7,-173,14,-18'
+    '1,-14,-14,-11,-54,-24,0,-14,-6,-10,64,-5,48,7,51,14,-30,-26,63,3,57,20,24,22,-13,-29,36,1,33,-7,'
+    '-40,2,-93,-27,26,-17,0,-20,43,-6,37,6,71,-3,35,9,73,34,10,3,-6,-10,-24,-16,-71,-29,-113,-8,-85,1'
+    '0,-80,35,-63,8,-74,-5,-26,-6,-7,-6,15,-12,35,-21,41,-6,37,-15,-159,-8,-110,-27,-7,-34,102,-7,-6,'
+    '23,11,12,2,-19,8,-17,90,-2,1,20,14,-14,67,-7,23,20,33,-15,98,-13,86,6,6,32,33,-23,166,2,2,4,-5,6'
+    ',-27,15,50,-9,31,-14,55,2,20,-4,14,-6,0,-4,-17,-16,20,-4,129,14,123,26,30,18,-2,10,-29,13,-50,-1'
+    '0,-43,6,-10,4,4,11,-6,7,-16,4,-72,-5,-45,9,-45,3,-72,-6,-22,9,54,1,24,6,-38,16,109,-22,66,-1,142'
+    ',7,41,15,3,10,-3,23,7,10,104,-2,100,6,10,2,32,21,36,11,-30,7,-93,11,154,3,33,8,12,10,-67,14,-70,'
+    '3,-46,12,-56,1,-106,-8,-70,14,118,-2,149,6,68,-8,70,1,5,18,-61,-3,-51,4,-130,27,140,-10,214,9,16'
+    ',10,-27,16,-107,6,-12,2,27,3,94,-4,101,-14,105,7,28,9,-25,6,60,9,19,9,-31,3,-74,-5,-44,5,180,11,'
+    '5,5,-50,26,57,-14,59,-2,92,30,380,76,5,5,-96,0,-258,-23,-40,0],[-12068,6957,-85,21,-143,4,-12,-4'
+    ',-13,-24,-32,-15,-81,-3,-14,7,36,26,-29,8,-6,15,3,19,-12,4,-43,-12,22,-4,-31,-17,-12,1,-2,-10,-1'
+    '4,-10,19,-15,0,-5,-22,-8,-13,0,-39,7,-34,13,-43,23,-25,28,-30,24,-76,27,-14,-5,-4,-10,18,-6,-5,-'
+    '3,7,-4,29,-3,-60,-15,-11,-15,-46,-21,-20,-5,-11,10,22,8,4,9,-21,-9,-101,-16,-40,-15,-45,-36,-2,1'
+    '5,-7,9,-10,0,-16,-9,2,6,-4,2,-45,-1,-3,-3,3,-3,-13,-8,-80,-21,-5,-7,3,-9,21,-4,-18,-7,-59,4,-2,-'
+    '3,18,-7,-6,-1,-15,3,-7,7,60,37,49,10,39,22,111,12,118,35,11,11,-14,8,-26,-10,-73,4,-26,-8,-21,-1'
+    '4,-30,1,-72,-22,-33,4,-8,-4,17,-4,-52,-3,-24,-20,-101,-18,29,26,-20,5,-16,11,-17,1,-9,-11,4,-9,-'
+    '68,-1,-9,-4,-6,-12,-40,0,-22,-20,33,-8,-34,-4,3,-6,46,-9,17,-16,-86,20,-32,2],[-13644,6890,-82,6'
+    ',-61,13,-82,23,-49,20,-80,10,-143,3,-29,12,-60,10,-41,16,-51,9,-120,-8,-20,-6,-58,3,-62,15,-189,'
+    '6,-16,8,-27,6,-34,-4,-21,10,-58,8,-60,1,-40,-8,-39,8,-56,-9,-72,3,17,11,-40,0,-30,9,3,8,21,8,-7,'
+    '4,-93,8,-69,-5,-28,-8,-59,9,12,10,-27,9,-23,2,-41,-21,-39,-5,-18,9,35,7,22,12,-7,6,-82,11,-10,5,'
+    '17,6,-7,1,-31,-9,-54,-28,-59,-18,-109,-6,-25,-5,-9,3,15,8,-12,2,-37,-9,-40,-16,12,0,21,-10,36,-1'
+    ',-42,-2,-6,-22,-4,5,-19,0,9,12,-10,2,15,10,-16,2,-88,-29,-107,-14,31,10,-12,7,-107,-57,-14,-15,-'
+    '7,-22,-38,-22,-61,-21,-89,-8,-117,1,3,-9,-20,-37,-19,-7,-8,1,10,5,-24,-6,55,-8,28,-12,57,-11,126'
+    ',-44,19,-13,22,-28,19,-10,95,-8,17,8,2,-8,67,0,10,-4,-26,-18,2,-10,29,-11,17,-4,54,12,22,-7,28,1'
+    ',13,-10,0,-9,-42,-5,-51,13,-43,-4,-32,10,-14,11,3,11,-11,2,-12,12,-11,3,-25,-6,7,-8,7,-7,28,-5,3'
+    '0,-20,-3,-8,9,-4,29,4,42,-8,9,-14,-8,5,-9,-2,-26,6,-36,-23,-11,-1,-66,1,-30,5,-81,-2,-33,14,14,7'
+    ',-1,9,12,15,-11,5,25,-1,-9,5,-73,-3,-132,-27,-6,-7,28,-8,-7,-4,-77,1,-35,-9,-32,-17,-34,-2,-17,-'
+    '10,-33,-8,-2,7,-16,-9,10,-9,59,-15,124,-13,-29,-4,-8,-10,-40,1,38,-21,13,-2,1,-10,-7,-3,0,-7,15,'
+    '-10,19,-5,116,-13,22,8,7,-2,39,7,59,1,57,-17,9,10,-25,9,10,4,32,-13,7,-15,10,1,38,23,46,13,11,8,'
+    '29,-3,34,14,27,-17,2,-8,-9,-10,-26,-6,-22,1,-8,-10,27,-3,23,-15,21,-43,-5,-9,-27,-17,-41,-9,-46,'
+    '-2,-14,8,-17,0,-34,-26,-33,-16,-34,-6,-21,6,-24,-9,12,11,-32,12,-47,-3,-12,-9,15,-10,-30,-1,-12,'
+    '-10,-5,-12,6,-18,20,9,-10,-10,-15,-3,8,-8,-24,3,-19,-6,-52,-37,-2,-14,12,-9,-47,-7,27,-10,-36,-5'
+    ',2,-10,6,-4,24,3,5,-5,-11,-9,5,-6,17,-4,12,-20,19,1,-1,10,12,6,-7,-7,6,-3,15,2,-1,-6,6,-4,21,2,-'
+    '31,-14,7,-4,112,-7,24,11,16,-7,-32,-5,49,-9,-11,-10,-20,-7,-16,16,-11,2,-37,-18,10,13,-5,5,-49,1'
+    '2,-9,-2,-12,-13,-33,-20,32,-4,-3,-9,26,-10,14,-1,19,-15,34,-16,-1,-9,23,-9,23,-1,46,5,49,14,16,0'
+    ',7,14,-3,7,-15,7,21,12,33,30,18,1,-18,-9,-28,-33,18,-10,41,-59,-4,-16,-15,-15,4,-13,9,-7,25,3,-1'
+    '5,-9,7,-23,-42,-15,38,-3,40,6,11,13,43,7,46,18,21,-14,23,-9,25,9,72,-51,16,4,2,8,-9,20,8,18,-3,7'
+    ',13,-4,17,14,9,2,34,-11,-35,2,-7,-15,20,-21,11,-3,105,27,33,25,-23,-36,7,-3,-26,-10,-29,-22,3,-1'
+    '7,30,-6,-37,-5,-5,-9,-9,-37,13,-14,11,-3,-39,2,-47,-23,-34,-26,-2,-25,-21,3,-3,6,-36,-19,-51,-13'
+    ',-51,-25,-24,-30,23,-15,2,-5,-42,6,-5,-2,1,-8,-5,-2,-21,14,11,5,0,5,-29,-4,-3,3,4,3,-4,1,-48,-11'
+    ',-46,-19,-75,-52,-20,-1,-17,-7,-6,-28,21,8,1,14,12,-1,13,-10,20,5,5,4,-1,21,13,-4,9,-10,-5,-3,7,'
+    '-3,32,9,33,25,9,17,13,6,16,-1,16,-7,-21,0,-7,-8,2,-8,28,1,28,12,13,-3,14,7,13,-1,13,10,60,20,9,-'
+    '2,2,-19,9,7,5,11,73,18,20,19,5,-1,2,-10,4,1,20,12,-11,10,-16,1,14,13,48,8,-15,3,5,4,16,6,29,-2,1'
+    '4,16,30,4,36,18,15,0,23,19,-8,13,4,3,20,9,18,0,6,9,22,3,19,16,44,15,14,14,43,4,1,6,32,4,4,13,-8,'
+    '1,20,7,7,12,16,10,42,16,11,13,-9,8,-76,20,9,20,34,15,14,11,-4,3,24,9,4,-1,1,-7,27,5,7,8,-19,5,45'
+    ',8,10,8,3,4,-3,9,-36,17,29,-6,19,3,28,14,-5,4,4,8,27,15,25,7,-3,11,19,12,31,6,67,26,14,-4,49,2,1'
+    '6,13,19,8,30,1,-41,-14,-16,-13,-15,-6,46,-18,45,-5,6,-6,-55,7,-48,-2,-33,9,-92,-30,5,-25,-9,-20,'
+    '-33,-28,-12,-21,9,-8,31,-5,40,12,-35,-25,-48,-13,-7,-12,21,-8,57,5,-1,6,25,-5,25,18,7,13,41,1,23'
+    ',12,-4,9,23,-3,-1,11,8,6,11,-15,20,34,13,-11,15,3,37,-8,32,4,10,13,13,5,2,22,22,9,-16,10,-52,-9,'
+    '13,8,21,1,4,10,-30,15,22,2,13,18,-19,-2,6,5,29,2,30,14,-26,-25,12,-8,23,2,9,8,21,-8,16,9,33,0,29'
+    ',13,30,-2,-32,-6,-4,-15,25,-9,-18,-8,7,-3,25,5,7,-2,3,-7,48,-1,-23,-17,65,-10,56,29,-13,-14,-8,-'
+    '19,26,-12,45,-7,10,-7,-6,-6,120,8,128,-13,22,5,4,10,12,-12,-12,-10,57,-15,42,-4,50,10,40,21,9,-1'
+    ',19,-12,25,-5,-23,-2,-7,-21,-4,27,-18,7,-7,-10,7,-15,-10,-9,-19,-6,3,-2,89,-29,37,-7,-3,-5,19,-3'
+    ',32,-15,49,-36,93,-34,15,9,38,3,2,9,-16,15,-26,2,7,8,-20,11,-27,7,-18,-1,11,6,-5,9,43,-8,12,-9,2'
+    '2,-8,11,5,-3,23,13,-18,19,3,-21,-8,18,-24,-4,-18,33,1,12,-3,15,-12,21,-1,3,9,-33,75,-11,11,10,1,'
+    '-8,10,7,1,5,10,3,-18,20,-40,14,-7,5,-12,16,-20,57,-22,33,29,-17,-23,2,-22,31,-23,6,0,10,8,37,-4,'
+    '-32,0,-3,-5,2,-5,40,-21,-43,13,-10,-6,11,-9,10,-21,-3,-17,65,-11,2,-16,31,-13,1,-12,12,-2,18,-21'
+    ',16,-4,13,-14,34,-3,-29,-5,-17,-23,-20,-18,9,-18,17,-2,15,22,-3,7,5,4,75,21,-11,-9,1,-4,21,-22,6'
+    ',-38,11,-4,-23,-8,-7,-8,20,-35,31,-6,19,6,15,14,-2,11,18,24,-11,35,12,24,-6,-20,10,-33,-10,-25,4'
+    ',-5,21,26,4,24,10,-12,14,2,-33,-30,-33,-43,-13,-7,-8,-24,14,-15,21,-9,45,5,-41,-10,-5,-15,-25,-2'
+    '6,27,-14,16,-3,9,-14,26,-16,10,10,20,7,5,22,25,20,7,-1,19,9,17,-6,-18,-5,-5,-6,8,-20,17,-7,30,0,'
+    '26,-15,2,-6,-20,15,-23,4,-18,-4,-37,14,6,14,-17,-1,-9,-5,-6,-11,9,-16,43,-13,13,-10,7,-26,8,-5,3'
+    '2,8,-8,-10,-14,-45,23,17,10,2,-11,-10,1,-13,-32,-16,17,-16,9,-21,27,46,31,11,45,29,6,7,0,12,6,-1'
+    '2,-24,-18,0,-8,6,-9,19,-6,23,-25,-30,23,-17,2,-6,9,-20,-4,-36,-17,-6,-20,13,0,-13,-17,1,-15,18,-'
+    '19,23,20,10,3,65,-1,-73,-9,-27,-27,-2,-19,35,-20,30,-8,43,5,11,14,4,-10,-4,-9,15,-3,-15,-12,1,-4'
+    ',61,2,-55,-11,5,-6,31,-3,32,1,13,-4,10,18,1,-12,5,-3,27,-2,15,3,12,16,1,14,7,6,0,-23,-20,-22,36,'
+    '-46,29,-18,27,1,17,10,0,8,10,10,-8,11,7,-1,10,-8,-12,-11,3,-24,11,-8,18,2,-24,-9,-10,13,-7,2,-6,'
+    '-8,10,-13,42,-13,19,6,2,12,13,10,-9,-34,26,-2,14,8,-7,-11,-28,-3,3,-11,12,-2,-4,-7,4,-8,12,9,13,'
+    '-4,14,-24,14,-3,5,-25,-16,-2,0,-4,12,-4,13,-12,-11,-6,3,-10,10,-5,-3,10,18,-17,-16,-23,5,-41,-19'
+    ',-9,-9,-14,-7,-3,-33,3,11,15,9,5,6,-12,6,10,13,-3,2,17,-12,15,7,1,-2,7,11,8,-1,15,-6,1,-2,-9,-44'
+    ',-36,-2,-8,15,1,-22,-5,9,19,23,24,4,-5,12,14,-12,26,-19,-7,-19,8,-13,-3,-69,5,-73,21,5,-41,28,-3'
+    '1,24,-71,3,9,27,-8,-27,-10,4,-12,18,-8,-6,-23,-9,18,-3,-33,61,-1,24,-12,-18,0,-12,7,-15,-4,-32,4'
+    ',4,-8,2,-56,-13,-80,1,-35,-5,-10,-5,-64,-14,-28,9,1,-15,-8,-19,-53,13,-23,-1,-20,6,-26,15,-14,-3'
+    ',-19,8,-7,9,-26,-6,-49,-9,-27,-3,4,-3,-3,-9,-22,1,-12,4,-12,21,-16,28,-31,5,-27,-4,-14,10,-26,2,'
+    '-20,41,-37,17,-9,7,-14,14,-11,3,-8,-10,11,-2,-24,7,7,41,-23,5,1,-1,27,9,3,24,-7,12,5,50,-6,-78,-'
+    '5,-8,-5,32,-48,-23,11,-7,7,-1,13,-7,1,-6,-3,1,-23,9,-17,2,-16,23,-22,28,-5,7,-9,2,-12,-13,-16,4,'
+    '-24,22,-18,38,-47,38,-25,4,-22,20,-9,2,-54,16,-11,87,-5,34,-16,3,-10,10,-5,31,-9,32,0,12,-16,-2,'
+    '-12,33,-2,61,-42,15,-20,8,-44,6,3,4,-4,8,-31,15,-14,6,-20,23,-15,0,-9,-10,-3,5,-3,1,-14,33,-36,3'
+    ',-23,24,-17,6,-39,18,-11,1,-34,6,-2,8,-18,50,-33,23,-8,79,-74,10,-18,-4,-21,-18,-29,11,-1,-2,-9,'
+    '11,-15,-7,-1,-16,11,0,9,-27,-9,-47,6,5,-10,45,-31,9,-21,34,-11,11,-12,16,-2,24,-25,17,8,16,-1,11'
+    ',16,4,-23,10,-14,36,-26,28,-11,21,-30,10,-34,-6,-53,6,-20,22,-17,5,-13,12,2,26,-23,38,-22,41,-37'
+    ',27,-14,18,-26,9,-33,8,-12,19,3,32,24,8,32,-9,12,-17,6,-3,14,-10,14,-21,23,-24,17,-7,-3,3,-12,-7'
+    ',-9,-29,24,-7,25,4,28,-20,27,-14,39,-12,4,-14,22,-4,34,-24,58,-23,17,-2,-12,12,-18,-5,-1,-11,11,'
+    '-2,16,-13,13,1,11,-19,11,-14,33,-40,31,-14,59,-22,9,-12,29,-11,1,-6,14,-12,-2,-5,17,-21,27,-42,3'
+    '6,-19,10,-26,33,0,35,-13,45,-12,20,3,38,6,11,-5,15,-9,10,78,-39,15,2,5,10,19,-7,13,-9,1,-12,57,-'
+    '17,1,-9,-8,-4,1,-26,29,-49,8,-31,33,-45,3,-19,16,-8,6,-25,22,-20,26,-35,21,-9,35,-41,20,-8,16,3,'
+    '23,-6,-9,-21,14,-33,20,-16,34,-8,5,-20,14,-18,27,1,20,-18,6,-17,10,-11,-8,6,-23,-28,5,-30,8,-10,'
+    '10,-4,12,3,19,11,-8,-14,-10,-4,4,-7,24,6,9,-16,65,-31,1,-3,-10,-2,-14,6,26,-30,7,-17,13,-7,31,-5'
+    ',2,-12,-4,-1,-23,11,82,-59,54,-68,61,-57,14,-30,0,-34,22,-37,22,-13,-3,-37,-27,-31,18,-6,8,-8,-1'
+    ',-9,-12,-7,-16,-1,-13,-11,19,-41,54,-67,103,-48,47,-50,74,-27,48,-10,30,0,32,-31,75,-45,83,-28,3'
+    '3,-20,93,-19,24,-23,38,-9,39,-24,57,-6,37,-18,30,-8,30,4,75,28,33,21,33,3,-22,7,12,14,11,-6,0,-7'
+    ',17,6,3,-3,-9,-9,2,-3,19,-1,47,-17,-43,21,6,5,45,-23,111,-91,55,-57,44,-34,44,-24,23,-6,67,-3,51'
+    ',-22,17,-12,52,-8,41,-20,36,-10,-18,10,51,-12,16,1,9,1,11,11,1,11,32,-5,-1,-8,9,-14,8,-5,-1,-13,'
+    '-8,-3,-17,12,-8,-7,0,-7,82,-65,38,-51,51,-41,21,-24,0,-10,-16,-9,24,-15,1,-11,-17,-24,-2,-11,5,-'
+    '16,18,-23,31,-9,20,-23,3,2,2,7,17,15,-7,11,-20,9,-8,9,0,13,53,-34,7,-11,-2,-14,8,-8,36,-11,48,-3'
+    '1,10,-11,3,-24,-12,-19,13,-13,31,-7,-1,10,-17,20,18,-5,13,-7,4,-24,24,-28,1,18,19,7,32,-5,12,4,2'
+    ',-8,6,-4,19,3,24,-8,23,-42,23,-9,7,4,4,18,10,5,16,-62,5,-6,41,5,15,16,18,0,10,7,-7,17,-38,41,0,1'
+    '3,9,8,24,6,38,25,-7,4,13,21,25,16,35,-1,13,-7,45,-30,10,-27,4,4,-3,11,14,-6,4,-5,12,10,9,-17,25,'
+    '-20,-29,15,-9,11,-14,-14,3,-11,-4,-5,-13,-3,4,-16,21,-36,37,-40,27,-45,9,0,7,-11,-3,-30,-7,1,0,-'
+    '11,22,-40,-7,-10,-21,-14,13,-12,3,-10,3,-48,5,-12,-6,-32,-17,-19,11,4,-2,-19,7,-12,8,12,2,-17,9,'
+    '-3,9,5,-28,-56,-6,-1,-14,-26,-13,-4,2,-16,-14,-16,-6,1,-20,-22,-35,-3,-17,-12,-4,-30,8,-14,-3,-1'
+    '5,-21,8,-17,-10,-7,-13,17,-16,3,-16,-7,-9,-57,-15,-14,-9,-13,1,-35,-20,6,-37,-2,-25,-8,-17,-35,-'
+    '36,10,-21,10,-4,-18,3,-9,-26,-29,-12,-6,-11,10,-30,-4,-25,8,-30,-1,-15,-19,-11,12,-16,16,-5,23,-'
+    '23,17,-8,27,36,-2,-21,10,1,5,13,-1,27,5,8,2,-29,9,-22,-19,-51,-11,-14,-47,-27,-30,-23,-43,-50,-1'
+    '1,-44,23,-36,-6,-14,23,-31,6,-16,-5,-20,-6,-2,-10,5,-7,-7,2,-18,33,-22,70,-37,12,-12,37,-53,24,-'
+    '54,37,-37,25,-41,10,-35,21,-40,26,-72,45,-75,11,-45,32,-24,9,-13,7,-40,32,-29,33,-63,28,-39,4,-1'
+    '5,-8,-28,-12,-6,8,-9,1,-18,11,-10,25,-40,40,-27,43,-51,73,-42,22,-8,42,-29,33,-10,61,-31,32,-10,'
+    '36,-29,58,-29,13,-13,6,-26,40,-25,58,-47,8,-87,13,-54,-5,-92,11,-52,0,-24,-24,-136,-12,-18,-11,-'
+    '3,-3,-20,0,-11,20,-20,-12,-32,-6,-75,12,-61,-4,-13,-14,-17,-8,-23,7,-21,-1,-34,-25,-86,-3,-40,-1'
+    '6,-22,-10,-57,-12,-29,-21,-26,3,-27,16,-24,1,-21,-8,-49,-27,-19,-4,-30,5,-54,13,-64,2,-40,9,-18,'
+    '-3,-27,-14,-31,-15,-13,4,-33,6,-9,-2,-13,-17,-17,-17,-35,-6,-45,-16,-48,-17,-14,-23,-35,3,-17,-1'
+    '9,-22,-9,-41,-14,-25,-11,-5,-10,-48,-15,-5,-23,3,-6,-15,6,-14,-6,-11,0,-11,20,-34,-6,-47,29,-71,'
+    '-2,-20,-16,-37,-26,-17,-11,-51,-20,-50,1,-15,16,-40,19,-6,-12,-16,12,-3,38,-1,29,27,14,-3,14,-12'
+    ',13,-3,11,4,11,15,-4,-15,-13,-7,-17,-2,-16,-17,8,-8,24,1,9,-41,-2,-4,-20,23,-14,-6,-2,-4,16,-21,'
+    '-14,0,-8,-16,9,-37,-12,-1,-6,-16,-14,-11,-2,-14,10,-17,-7,-23,-15,-4,-5,-27,61,-27,-2,-15,-6,-14'
+    ',-34,-19,-28,-6,-4,-12,-4,-14,21,-2,30,-19,-34,10,-28,-13,-18,0,-5,-15,2,-7,17,-8,0,-12,-7,-40,-'
+    '19,-27,-9,0,-1,4,14,15,10,31,2,21,-5,5,-14,-4,-9,-30,-12,-7,-30,0,31,9,6,7,-4,11,10,11,14,39,-14'
+    ',5,-16,-10,4,-18,-8,-9,-30,-7,-30,2,-31,-5,0,-13,15,-16,-74,-45,-5,-10,0,-7,7,-8,21,-7,4,7,-6,11'
+    ',-12,2,3,3,39,10,17,9,-7,-12,4,-11,50,-15,4,3,2,9,14,-2,16,-18,-6,-11,5,-10,-24,-15,-8,-10,35,-1'
+    '6,-11,-9,-29,11,-12,-13,4,-6,23,-7,3,-11,12,-3,29,4,9,6,13,21,11,-33,11,-12,11,-4,1,-3,-15,-2,-3'
+    '2,16,-73,4,0,-27,11,-19,13,-3,17,6,16,-5,-17,-1,-16,-11,-4,-19,1,-61,15,-10,19,47,10,1,-9,-7,-7,'
+    '-34,20,-9,5,-9,-26,5,-19,-4,-3,-18,15,-13,16,-2,5,-6,-6,-3,-31,5,-30,-22,20,-16,48,-16,-24,2,-1,'
+    '-12,22,-22,9,5,14,24,10,5,-4,-8,7,-8,-12,-5,-8,-14,1,-10,-33,12,-23,33,-27,13,-14,-11,13,-15,-4,'
+    '-4,-40,-2,28,-38,87,-21,4,-6,-3,-29,-14,4,-13,-10,23,-10,8,2,14,-4,10,-6,13,-18,14,-3,45,21,33,6'
+    ',2,6,-7,4,-51,20,-4,2,3,3,41,-12,22,-14,5,-5,0,-9,-13,-10,0,-6,10,-16,0,-9,-11,-11,-8,1,14,16,-1'
+    '3,21,-10,4,-46,-21,-27,1,-15,7,-2,-12,-13,-3,-43,13,-4,-2,15,-26,11,-2,3,-24,10,-5,32,0,21,9,14,'
+    '-2,6,6,0,7,6,0,5,-5,-17,-17,-41,-13,31,-21,22,-2,10,5,0,13,22,18,2,13,7,4,21,-2,6,-7,21,11,42,-2'
+    ',30,-7,-8,-5,-21,-2,-32,3,-33,-16,-18,-1,-5,7,-5,-1,-16,-11,-3,-25,-13,-12,32,-18,18,-4,6,17,21,'
+    '16,89,37,16,-5,7,-4,0,-4,-13,-14,-45,-20,-5,-25,-10,-4,6,12,-2,11,-9,6,-37,-2,-10,-10,3,-12,21,-'
+    '16,48,-17,39,-8,30,10,5,21,-3,20,16,41,2,19,24,10,94,21,17,19,21,6,80,-15,5,5,-58,63,-50,10,41,3'
+    ',3,10,-4,15,-13,31,-16,-4,21,17,6,28,15,20,52,22,-18,15,-38,1,32,6,-1,19,18,-23,23,-12,35,12,13,'
+    '12,12,52,-2,9,21,30,44,32,64,29,58,40,-12,11,-24,-3,-6,3,34,13,11,13,4,23,-11,18,-15,7,-78,8,-73'
+    ',57,-8,17,-1,22,34,47,32,32,35,8,40,22,55,-5,4,13,-10,8,5,14,29,18,9,20,-4,12,7,11,-6,26,5,22,41'
+    ',38,41,13,11,9,-31,6,-40,15,6,9,16,4,16,10,16,2,17,-6,19,-29,10,-2,34,7,7,11,2,29,-3,13,-17,17,-'
+    '43,-11,-2,-3,19,-2,-4,-13,-32,-3,-15,1,3,17,-8,-1,-37,16,-7,13,4,40,-13,46,2,23,6,7,20,7,7,-2,-5'
+    ',-5,47,-11,61,-23,15,-1,66,5,56,22,10,8,5,14,-14,21,-4,10,3,16,11,30,16,7,5,37,-10,8,13,1,-25,13'
+    ',-4,9,4,16,-7,14,4,5,14,-1,12,-11,22,-4,74,-3,128,15,82,17,83,23,63,35,4,18,11,17,31,29,36,49,6,'
+    '22,-5,35,-3,4,-19,0,-14,5,-18,16,-12,24,3,18,19,21,-1,15,-13,17,-25,17,-73,34,-19,22,-6,16,14,11'
+    ',-16,53,13,55,17,3,8,12,-3,49,11,-50,-13,-16,-14,-5,-8,-54,4,-19,57,-57,66,3,31,-23,40,-10,7,-8,'
+    '20,-5,52,13,30,-3,13,-9,34,-3,63,26,10,0,38,29,5,13,21,23,11,24,50,38,27,26,31,70,21,27,-6,28,7,'
+    '20,9,9,6,22,46,28,5,19,8,6,2,18,8,-8,-1,16,13,23,-12,12,-2,21,12,-18,14,-5,2,-11,9,0,28,13,9,-1,'
+    '-2,-19,-14,1,3,-27,-8,-11,-17,-9,-4,-19,-18,-3,-1,-22,-10,-14,-18,-8,-23,-21,-21,-10,-17,4,2,-28'
+    ',24,21,65,42,23,22,62,83,27,63,28,44,48,49,47,29,0,14,11,13,7,23,-2,52,9,36,-13,50,3,29,-10,14,1'
+    '3,9,4,24,-3,6,-7,0,1,4,12,2,15,22,-11,8,-18,3,-4,12,9,-7,16,0,5,4,-3,9,6,4,21,-4,-5,-9,4,-2,27,2'
+    '5,2,10,-8,3,85,55,27,25,90,44,31,4,20,-4,4,11,9,9,11,2,27,20,28,4,10,7,-10,6,-1,10,4,5,49,5,28,1'
+    '0,19,-10,-29,-5,7,-4,68,11,3,5,-5,14,9,7,6,1,2,-5,-1,-13,12,-7,92,2,10,16,-5,5,1,16,27,27,71,31,'
+    '-5,49,10,27,16,33,19,13,20,21,10,28,10,8,6,24,14,23,22,17,8,29,-4,64,9,39,16,26,34,29,-5,52,32,1'
+    '32,-18,121,12,62,-3,3,-4,-10,-4,6,1,28,5,14,-4,6,-6,-3,6,22,19,22,1,12,7,12,-9,12,11,4,5,13,17,-'
+    '14,2,-20,10,-1,16,13,55,74,22,45,6,15,-3,11,8,14,4,3,-4,-18,4,2,14,19,0,12,9,2,15,23,17,15,37,19'
+    ',51,63,4,8,-4,8,13,-1,16,16,44,61,19,52,14,44,-5,22,7,46,-18,90,-11,20,-14,62,-15,32,-16,12,-43,'
+    '8,-61,-5,-36,16,-22,3,-13,20,-33,12,-42,37,-43,50,-21,7,-32,26,-95,53,-51,6,-85,-14,-16,2,-40,17'
+    ',-12,-6,-25,2,-69,32,-44,9,-8,-12,-27,-2,-13,-8,-7,2,-26,-23,-4,6,12,15,0,11,-12,2,-8,-7,-13,-40'
+    ',-28,-26,13,63,7,16,14,4,-6,20,-14,-6,-8,-14,-10,10,10,4,12,18,-11,30,-13,-5,6,7,-7,1,-29,25,-10'
+    ',-4,-15,-21,-13,36,-18,1,-33,16,-7,9,-17,0,-1,7,-40,6,-19,19,-32,3,-14,10,-17,0,2,-12,-14,10,-13'
+    ',-5,-12,6,-15,-11,-7,6,-9,-3,-20,-22,1,-8,-14,-11,4,-8,-7,-9,1,-7,12,-9,-10,-4,-1,-9,-14,12,-11,'
+    '0,-28,-34,-22,-9,-25,-58,-18,-16,9,14,24,79,-41,-20,-28,10,-40,-19,-29,26,1,12,-11,15,-5,26,-8,1'
+    '1,8,8,-5,10,-41,-28,-65,-37,-25,-5,-11,8,-35,1,43,19,21,-4,4,3,6,19,20,16,2,26,30,37,12,30,18,6,'
+    '13,16,21,9,47,62,39,32,2,26,-8,24,-23,13,-27,4,-15,27,-10,3,3,8,-31,87,-9,59,-14,42,-11,13,-13,9'
+    ',-9,0,-10,-25,-2,17,-16,41,-5,-1,-5,-19,-7,-9,4,16,-10,21,-16,14,-10,-9,3,17,-16,8,-45,41,-55,13'
+    ',-40,22,-7,-1,-7,-9,-10,-27,-7,-5,11,25,0,20,-31,10,-47,8,-100,-3,-8,-7,1,-19,-4,10,-30,9,-73,10'
+    ',-9,-5,-12,-41,1,36,-6,29,-11,9,-20,6,-7,12,-37,34,-32,9,-11,-3,-16,-22,-2,-18,-8,-6,6,11,3,34,1'
+    '0,20,0,29,-33,41,-39,33,-47,29,-17,1,-14,16,-19,9,-17,1,-14,-8,-32,4,-24,-10,-15,0,-11,-8,-32,19'
+    ',37,0,23,55,18,11,5,10,-22,20,-30,7,-28,26,-4,-7,-14,-1,3,-18,-17,24,-17,11,-8,0,1,-16,-7,6,-10,'
+    '-10,-23,42,-5,2,0,-10,-14,-6,8,14,-3,9,-15,13,0,9,-7,2,53,2,15,8,31,5,4,6,-36,-4,-46,5,-80,-11,-'
+    '80,0,5,-10,9,4,30,-2,13,-6,-10,-5,-36,1,-66,-36,-28,-3,-72,19,-24,21,-2,10,-14,6,-74,-2,-88,-14,'
+    '-27,2,-16,20,-2,12,5,7,-13,28,-43,27,-40,9,-40,-4,-13,20,-10,37,-14,13,-20,-8,-9,-21,10,-27,37,5'
+    ',5,-13,-3,-7,-9,-3,-21,8,-13,-15,-59,-16,-44,-21,-21,-4,1,-12,-8,-6,5,-25,10,-27,13,-12,18,-31,3'
+    ',-12,-4,-36,-15,-19,-38,-11,-12,8,-2,21,-22,21,-13,27,15,29,30,33,7,22,-14,33,9,2,-20,18,-11,22,'
+    '-1,16,55,19,27,29,-2,11,-10,18,-34,9,-11,-1,-26,-18,-17,-5,-14,-30,-44,-18,-59,-41,-37,-3,-46,5,'
+    '-26,-55,-12,9,3,7,16,7,-12,-1,-39,12,-41,-33,-20,-17,-10,-28,-16,-19,15,10,2,-3,-6,-8,1,-14,-9,-'
+    '26,8,-19,-4,-9,-27,-2,-12,-6,-11,-10,-14,-28,-64,-42,10,-11,5,-15,3,-31,-5,-7,-11,1,-1,9,6,6,-41'
+    ',40,-8,15,-36,25,-13,18,-25,17,-42,17,-43,2,-18,11,-47,6,-55,-39,-42,-13,-29,-19,-22,-8,-29,-3,-'
+    '20,5,-16,19,-18,12,11,-18,-30,-3,-16,10,5,16,-15,2,-3,22,-24,19,-17,5,-57,65,-27,56,-9,5,-12,20,'
+    '-4,17,13,27,9,7,-5,18,-13,4,6,7,0,13,9,-4,3,27,-10,21,12,11,4,10,-4,-25,3,-6,9,1,-6,91,8,42,8,26'
+    ',22,34,-11,41,-11,8,7,7,6,-9,12,18,-13,9,-8,16,-28,13,15,-15,-9,5,-17,-5,-17,17,-17,1,2,11,11,1,'
+    '19,-8,-48,38,-26,5,9,-4,-13,-3,-9,8,-32,11,-19,-7,-32,-2,-51,12,5,-7,-42,-17,-55,-2,-38,7,-20,-4'
+    ',-13,12,-8,0,-17,-3,-26,-18,-46,25,5,-10,-6,-9,-29,13,1,13,18,23,14,4,25,34,5,33,-3,35,9,21,-7,9'
+    ',18,62,-4,12,-22,1,15,28,0,8,17,12,-1,-36,8,-4,8,-17,8,9,30,93,-5,3,-11,-6,0,9,18,9,6,14,-23,-3,'
+    '-4,9,10,14,15,8,-3,24,5,13,56,66,9,26,-5,27,-31,20,-26,-7,20,0,3,-4,-9,-6,-88,17,-45,-8,-30,-13,'
+    '-94,-14,-36,-15,-17,-11,-11,-30,-3,-76,-20,-22,-5,-38,-22,-20,-48,-26,-1,-6,11,7,-3,-9,9,-9,0,-1'
+    '0,-25,-16,-27,1,-11,6,-3,3,6,8,-9,8,-47,-4,-27,-7,-6,-9,-11,-5,-25,-5,-42,1,-64,-23,-27,-3,-9,0,'
+    '-25,34,-21,6,-17,13,-38,2,-14,5,12,-8,-5,0,-19,6,-11,10,15,-4,-13,9,-7,15,-31,29,-17,53,-73,85,-'
+    '32,76,-13,12,-11,43,16,-27,21,-19,-5,-21,2,-9,10,29,-27,25,-18,30,-10,51,11,32,1,82,7,63,16,62,3'
+    '5,74,2,28,-7,4,-23,42,-11,48,7,15,-1,12,-20,5,-8,17,25,-15,8,2,15,34,-14,17,26,4,10,11,4,10,-11,'
+    '-3,-2,8,23,8,4,-6,5,3,7,23,9,-8,26,12,-10,3,-12,22,6,1,13,-13,8,7,36,-3,-22,-14,38,15,58,32,12,1'
+    '2,1,9,25,20,-10,16,-3,17,13,-2,6,7,9,0,2,-9,-6,-11,25,0,-23,-17,66,29,21,2,-6,12,11,17,7,-3,-4,-'
+    '10,-7,-4,5,-8,14,4,51,1,51,-18,41,-4,18,3,2,3,-8,8,25,14,7,-9,15,0,16,-19,18,-5,8,5,1,-10,9,-14,'
+    '-9,1,-5,-4,54,-16,7,2,9,12,21,3,8,-4,9,-16,11,8,5,16,0,9,-11,11,28,-8,9,-13,17,-3,18,-11,9,-12,-'
+    '3,-9,14,10,8,-6,14,12,0,6,-16,14,-33,8,-21,20,4,5,12,3,-3,3,6,4,18,5,-5,23,-9,1,-14,-16,-11,3,-8'
+    ',8,15,11,-7,5,-25,-11,-19,-3,-10,4,-13,7,18,24,18,-3,10,-8,36,-10,15,5,12,13,41,7,22,-6,55,1,13,'
+    '32,9,-13,0,-11,13,-16,-22,-6,39,3,17,13,-3,-10,20,5,11,20,10,-4,7,7,1,-14,-21,-9,52,6,23,10,19,-'
+    '1,14,-8,-33,-1,66,-23,3,0,2,7,14,5,-6,-10,4,-7,-6,0,33,-24,4,-12,-10,8,0,-7,9,-9,52,9,25,13,17,1'
+    ',7,15,27,4,35,-17,40,-48,52,-40,12,-16,-1,-40,-18,-64,10,-14,13,7,1,9,-8,9,4,2,12,-10,7,2,4,-4,-'
+    '2,-9,-21,-25,-7,-2,42,-63,11,-3,0,10,17,2,-6,-7,3,-34,7,0,14,14,-13,-20,9,-5,6,-29,9,-17,36,-15,'
+    '25,-46,17,-11,-3,-4,-17,9,-3,-8,6,-9,37,2,26,7,11,10,7,29,14,26,3,-5,8,98,-8,27,-10,13,-52,117,-'
+    '9,38,7,-3,0,-10,8,-5,-4,-12,4,-12,8,18,0,-34,15,-28,-12,37,6,22,-38,56,-35,74,-27,101,6,33,2,7,8'
+    ',-3,7,9,-9,9,9,2,11,16,-8,1,9,7,-3,9,13,9,-4,9,19,6,7,17,16,11,-11,14,0,9,9,-11,6,6,7,-11,9,6,2,'
+    '7,-16,9,27,-1,42,17,5,6,-4,8,13,-2,19,12,2,9,31,14,5,5,-5,13,5,8,-1,-9,5,-7,5,17,30,31,43,20,40,'
+    '-1,6,26,2,-23,7,21,11,13,37,25,-3,20,5,-11,6,-2,17,11,40,0,29,13,8,10,-10,5,-28,-5,-23,9,-10,12,'
+    '29,-16,15,8,12,20,-46,19,-7,7,30,-10,11,2,5,8,9,-13,32,-5,40,30,1,19,-9,12,-13,-6,-2,-18,-8,-3,1'
+    ',28,-66,-1,0,27,5,-15,12,-6,8,1,10,10,15,-1,-4,7,12,-4,0,13,33,-17,-17,36,4,19,22,-56,20,-28,-23'
+    ',41,-24,68,-24,4,-25,-5,-1,6,-13,9,-4,12,-58,16,24,-1,38,-10,3,-8,20,-15,12,6,-5,10,-28,17,-15,1'
+    '9,31,-24,6,3,-1,9,14,-3,-1,14,-10,3,6,4,-24,10,-56,50,17,-7,45,-42,15,0,8,21,-29,20,-36,11,-14,1'
+    '6,-18,-2,-8,6,5,20,21,18,2,11,1,-11,-20,-24,-1,-13,23,4,11,-16,2,10,10,-13,32,-9,11,-8,-7,18,-23'
+    ',18,-3,9,-1,7,11,-17,18,-7,-11,16,-4,21,5,21,-7,12,9,-4,4,10,-14,14,15,-5,9,18,5,-8,3,12,3,-6,12'
+    ',5,4,13,10,3,-1,-9,10,1,-13,-10,12,-3,-19,-1,-17,-18,2,-13,9,6,-1,-4,-5,-9,-12,2,-2,-10,9,3,7,-9'
+    ',-13,-3,-4,-11,6,6,7,-1,19,-13,-24,-3,-3,-11,3,-5,21,-16,19,8,-7,-19,13,-8,-5,-12,19,-2,-23,-33,'
+    '-9,-22,-2,-14,7,-11,12,28,22,13,-1,7,25,44,12,17,7,2,4,15,5,0,0,-4,3,6,-3,15,-12,1,6,4,4,15,-10,'
+    '4,-12,15,-8,12,-2,19,-16,20,-2,16,13,14,29,11,10,9,-8,-11,-27,-8,-10,-19,0,-11,38,-28,24,-6,-5,-'
+    '20,3,-1,13,6,21,32,15,7,2,16,8,-1,7,7,16,37,4,1,-2,-20,11,61,-3,5,-24,1,-2,7,33,38,1,23,-5,11,9,'
+    '-8,1,-11,-12,-31,41,27,66,27,44,-1,96,10,8,7,1,18,7,7,-3,10,12,-12,12,7,-5,-11,3,-15,20,6,27,16,'
+    '3,0,1,-18,26,10,45,5,-3,28,-13,12,-13,-1,13,-4,11,-20,-30,-10,-13,3,-8,4,-4,14,-11,5,4,5,-12,19,'
+    '-31,10,22,22,22,7,-1,5,-12,0,-9,16,10,24,9,6,12,22,32,28,-7,4,9,10,21,9,0,-7,10,3,6,-5,1,14,7,-6'
+    ',8,14,3,-11,6,10,4,-8,18,10,11,-1,16,11,11,25,0,8,20,14,-3,-12,8,-1,-10,-10,28,-8,8,25,8,-6,9,6,'
+    '13,-1,9,-12,10,8,5,-1,7,13,19,-2,9,8,20,6,17,-2,20,15,-12,6,3,10,-4,18,20,-2,5,-8,36,7,7,-4,30,1'
+    '3,3,3,-7,8,15,8,-8,-10,23,-10,98,41,12,1,19,17,-4,14,15,-14,17,3,-25,-21,-27,-15,-8,-11,4,-2,12,'
+    '-3,15,9,123,-5,-72,-14,-9,-7,4,-13,-10,9,-11,3,2,17,-12,3,4,-3,-4,-5,-45,-14,-76,-36,-7,-6,23,6,'
+    '-12,-8,-30,-6,-17,-12,-6,-6,21,14,7,-1,-23,-20,-9,-23,6,-33,9,-7,6,7,9,-1,15,-24,26,-4,5,4,9,-1,'
+    '1,12,10,6,14,0,23,14,48,43,10,3,-6,11,5,11,12,4,7,-10,10,15,18,-13,21,-3,7,6,-6,14,29,-4,203,60,'
+    '18,-1,7,6,-8,6,-35,2,18,7,-7,13,-14,12,-29,-3,-10,5,-8,16,-52,-25,-27,3,5,9,-41,4,-18,-3,-22,12,'
+    '-19,-1,-36,16,23,9,-9,6,-62,7,-2,7,-9,5,-8,31,-9,3,-9,19,8,17,-21,3,-15,-4,-13,5,41,27,6,20,15,1'
+    '5,-17,8,-18,-1,5,6,-61,-18,-24,24,-51,15,-34,-4,25,10,37,-2,15,9,45,-16,22,-1,44,18,19,16,28,6,1'
+    '0,13,0,14,-26,15,30,-3,-5,11,-31,18,-27,9,-68,8,-66,-6,-42,-8,-164,-50,-75,-35,-48,-31,-60,-59,-'
+    '45,-35,-74,-27,-64,-13,-60,-28,-23,-17,-43,-17,-31,-38,-9,-20,-20,-3,-29,-16,-66,-24,35,21,39,14'
+    ',-3,8,-32,10,28,-3,33,21,23,3,33,33,13,5,4,9,30,8,42,20,6,7,32,13,12,-2,49,13,15,12,41,22,26,28,'
+    '46,32,21,36,-9,7,-63,18,-34,2,-18,9,64,-9,53,-16,18,-1,30,19,14,18,30,26,26,11,13,12,32,9,-6,5,9'
+    '1,15,11,10,3,15,29,39,44,22,37,-1,17,9,20,-3,49,6,110,-5,32,4,61,-7,10,5,42,1,80,-7,20,-13,91,15'
+    ',73,0,19,7,7,10,21,7,44,29,66,52,42,1,32,12,31,4,48,-1,96,47,32,21,1,10,-32,15,23,-3,7,7,-4,4,-5'
+    '7,7,52,10,-7,10,4,14,-6,12,9,21,-17,26,-14,12,-24,3,-11,15,-38,-3,-49,-27,-6,9,-13,5,39,18,-29,3'
+    '7,-77,7,-17,-6,4,-6,38,-2,-71,-11,-67,-34,-51,-14,-32,-19,-18,-4,8,7,-6,2,2,3,19,10,-30,16,26,-5'
+    ',8,13,24,10,32,0,58,20,29,2,19,18,22,6,7,6,45,4,14,5,16,15,-43,13,-10,5,-3,11,-24,-1,-2,-6,-18,-'
+    '4,-38,7,-22,31,-26,5,-58,-39,10,13,30,24,-25,2,-1,7,-6,4,-45,-7,-41,-18,17,14,9,17,17,11,-22,17,'
+    '7,13,-14,3,-8,-8,-3,8,-15,8,0,5,-9,2,-17,-10,-9,1,-10,9,-26,4,15,5,-6,17,-35,1,0,6,28,7,-51,6,-7'
+    ',3,27,8,-66,20,-10,7,20,3,-7,-6,31,-7,53,-5,16,3,-2,17,6,16,-30,17,-35,7,13,12,-7,5,-58,7,16,-1,'
+    '37,13,4,6,-6,10,9,9,-6,5,-35,6,-18,18,-33,-2,-44,-12,45,19,14,12,8,15,-15,2,-39,-8,1,3,-9,3,-33,'
+    '-14,15,12,52,22,-18,21,-23,-1,6,6,-9,10,6,4,-54,-4,-18,2,32,3,23,11,-12,14,-10,1,-14,-6,0,7,-17,'
+    '3,-2,3,22,10,-18,13,-13,18,-17,-8,6,11,-1,12,-10,9,-49,-5,35,16,-8,10,-32,6,-11,-8,-24,-34,1,-8,'
+    '13,-6,-26,5,-14,-4,-6,-13,8,-11,37,-15,-31,9,-13,-1,7,-16,-10,4,-10,-14,-9,0,9,-10,23,-5,-16,-5,'
+    '-18,1,2,-5,-14,1,-8,-7,7,-6,-19,-3,12,-25,-8,-14,-9,23,-15,11,-12,2,-36,-30,-30,-6,-55,-22,-11,-'
+    '22,-1,25,-7,16,-10,-13,-20,-13,17,16,-13,19,-9,-2,-7,-7,-11,-22,-12,-13,-63,-15,9,7,48,11,11,8,1'
+    '3,32,-15,26,-32,16,-57,-2,-52,-19,-36,7,28,10,9,10,13,-14,12,5,12,22,-4,9,11,12,-34,4,-1,15,11,1'
+    '9,-5,14,-10,10,-89,6,-3,5,69,-1,29,6,4,12,-11,13,-1,16,11,20,24,16,-7,16,-15,4,-9,-14,-28,-5,-11'
+    ',2,-6,14,-12,5,-44,-1,-70,10,-32,18,9,7,-20,3,23,13,-2,5,-23,7,-35,-10,18,9,-19,15,-28,9,-26,-8,'
+    '14,19,-6,9,-19,1,-83,34,-94,-26,-4,-3,6,-6,-39,14,-32,5,-45,-13,11,7,-14,7,-106,21,-49,4,-53,-14'
+    ',-23,-15,-1,-17,12,-28,51,-27,-23,-12,1,-21,-4,-7,-41,-34,31,-3,27,4,-19,-19,8,-6,21,-4,-18,-11,'
+    '23,-28,-14,-6,30,-7,-8,-9,4,-13,-16,-12,14,-10,-24,10,-14,0,0,-10,-13,-10,10,-10,-31,-18,-36,-30'
+    ',-7,-13,-1,-12,50,-25,46,-16,39,-22,27,-26,32,-58,4,-68,-7,-30,-16,-20,-41,-34,-61,-37,-70,-28,-'
+    '123,-34,11,-7,24,-34,21,-9,-9,-7,24,-10,-8,-7,13,-10,-9,-1,-7,-10,1,-6,20,-62,18,-18,-5,-10,3,-1'
+    '0,18,-17,3,-18,8,-5,-38,-30,-15,-19,25,-27,-13,-12,-4,-18,-14,26,-22,9,-4,7,-20,-5,-19,-22,-5,-1'
+    '6,3,-7,26,-20,10,-16,-49,41,-26,11,-38,3,-37,-19,41,27,-22,37,-31,21,-50,23,-36,2,22,10,4,5,-3,6'
+    ',-42,38,-24,15,-3,7,3,13,10,10,-3,35,5,21,-10,22,-18,20,0,12,20,45,-9,19,-8,7,-19,8,-29,1,-12,7,'
+    '-22,-2,-70,10,-61,-5,-54,3,-15,-7,-16,-14,15,27,-46,25,-180,42,-60,45,-75,34,-96,17,-80,24,-52,2'
+    ',-125,-27,6,8,-16,-1,-34,-12,19,12,18,28,-67,117,-8,24,-60,4,-34,-3,-9,-11,-12,-33,4,42,-13,3,-1'
+    '6,12,-9,0,-11,15,-18,5,9,2,8,18,0,68,14,47,-11,8,19,4,6,6,44,54,-1,16,19,4,-5,10,3,4,60,29,-18,8'
+    ',-9,9,25,-1,6,3,-8,7,28,3,5,3,-5,6,16,7,-30,14,34,-5,34,-14,-24,21,18,9,4,8,28,4,26,-5,7,5,-2,5,'
+    '-35,7,-7,6,2,5,33,4,58,-6,34,12,33,5,8,9,-1,24,-26,14,-36,7,-51,19,-45,-14,-18,0,31,13,-122,26,0'
+    ',-5,11,-6,-29,3,-10,7,6,10,-10,11,27,-12,109,-24,36,3,5,-1,0,-5,112,-18,21,8,23,-4,22,7,14,11,-1'
+    '6,18,31,-2,-9,12,-13,5,4,1,23,4,5,-8,14,-7,22,1,27,-7,-7,14,24,-10,31,0,65,23,11,16,61,43,25,23,'
+    '0,14,-36,6,-158,9,-95,43,-106,14,-8,-2,2,-7,-37,13,109,-3,43,-6,4,0,-9,6,19,1,101,-26,7,-7,70,-2'
+    '6,68,0,125,67,8,10,-4,7,-11,4,-58,13,-6,6,6,4,-5,5,3,1,111,5,16,-3,34,-21,47,-12,15,-3,19,11,42,'
+    '-8,7,3,-3,5,-39,39,-52,25,-37,-4,26,14,31,-6,27,-13,-10,-3,16,-7,21,-1,48,-36,22,2,35,16,31,4,44'
+    ',17,27,21,30,3,16,7,17,29,1,14,-77,43,-4,9,9,17,-21,-4,-33,30,34,6,30,-5,63,20,2,12,-12,7,-58,3,'
+    '64,26,-9,6,-32,6,-50,-1,2,5,-10,11,-44,8,25,4,13,11,-25,5,-105,1,-65,14,-70,-4,-51,4,8,-6,-5,-13'
+    ',8,-10,-1,-20,4,-12,53,-16,-6,-11,-16,-5,-3,-7,24,-7,-41,-3,-21,3,-20,-10,-5,-9,1,-13,-22,-38,-4'
+    '5,-27,-16,-32,-80,-30,-14,18,-70,41,-11,18,-4,34,11,5,13,-9,12,-1,16,6,0,15,-21,36,-102,46,-22,-'
+    '1,-39,-25,-11,-27,-10,-11,-2,-14,-27,-22,-8,0,-32,20,6,22,-3,13,6,6,-26,23,-50,18,18,3,17,-5,21,'
+    '16,26,3,-25,6,-77,1,27,9,-3,2,-18,1,-53,-12,-30,7,-10,7,-58,0,91,37,-53,6,19,14,46,-11,30,5,-20,'
+    '15,-29,-3,0,9,-31,24,-62,22,8,7,2,15,-7,19,-31,20,-50,18,1,10,-56,2,-17,9,-8,13,-33,-2,-31,-6,-6'
+    '7,-33,10,-6,36,-2,-15,-15,-17,-1,-33,8,-39,-17,3,-6,-10,-5,5,-6,-8,-26,29,-17,37,5,-10,-7,11,-7,'
+    '-24,1,-18,-5,-25,-18,0,-12,6,-9,53,-32,114,-22,19,7,36,-19,25,-1,37,7,12,-4,-1,-10,11,0,-32,-15,'
+    '-7,2,20,17,-63,-11,-1,-16,18,-3,-48,-21,-4,-11,12,-6,42,4,21,22,17,-11,4,-26,19,-1,-48,-15,-81,-'
+    '40,-12,-3,-27,4,-33,-6,-19,-28,19,-13,20,-35,-14,-31,-64,-1,2,-7,28,-18,-5,-7,-10,12,-53,31,65,-'
+    '8,35,4,0,15,-14,6,-22,-4,6,14,-42,-5,-5,11,-18,13,17,21,23,53,-47,-10,-9,-9,-19,-2,29,27,-20,-6,'
+    '-35,1,-29,19,-14,5,-52,2,2,-7,12,-6,-43,-7,-25,6,-18,-2,27,-23,-12,-1,31,-20,45,6,53,-12,7,-6,-2'
+    ',-7,-29,-11,-48,9,-70,36,-9,-3,2,-7,29,-16,-51,-8,-154,11,-109,-15,-33,6,-44,-1,-52,11,-63,27,-4'
+    '3,-8,-59,2,-17,9,1,8,-26,2,-5,6,-14,-1,-28,11,-16,31,-15,11,-47,9,-128,-23,-87,-8,-41,-31,40,-15'
+    ',59,2,5,3,-6,9,12,4,32,-3,45,9,24,-3,15,16,53,12,18,-5,-3,-6,-15,-9,-47,-12,-2,-12,-25,2,-25,-11'
+    ',-88,-7,7,-8,-3,-5,-20,-9,1,-12,30,-19,1,-13,7,-11,29,-17,-7,-5,19,-17,-34,6,-13,6,-12,-4,4,-22,'
+    '45,-34,-124,69,28,-4,23,5,8,6,-8,10,-36,14,-26,20,-11,-2,-13,-16,-10,7,-9,20,-59,4,-44,26,-92,-2'
+    '0,-20,3,-131,-14,-139,3,-124,11,-30,8,26,12,-2,6,6,5,28,7,8,7,67,0,14,13,-66,35,-119,24,-43,-2,1'
+    '8,-13,-117,7,-87,13,-77,22,-127,12,-54,19],[-8114,5321,-71,-2,-19,-14,20,-9,104,-23,9,6,-6,13,-3'
+    '7,29],[-7358,6802,-80,7,-33,-2,-4,-5,18,-19,46,-5,70,1,-3,18,-14,5],[-7779,6343,-14,5,-30,1,-31,'
+    '-7,28,-18,32,-13,28,5,13,7,-12,17,-14,3],[-8271,6294,-26,-7,-41,3,-36,-33,-16,-9,0,-8,14,-10,6,-'
+    '14,32,8,36,-3,45,19,46,25,16,23,-5,7,-13,3,-58,-4],[-7947,6238,-40,2,-15,-6,-24,-23,-1,-29,45,-2'
+    '3,15,5,35,39,5,16,-2,6,-18,13],[-10477,7741,-19,1,-11,13,-52,19,-48,-1,51,-38,34,-17,51,-6,22,4,'
+    '4,9,-5,6,-27,10],[-9313,7766,-17,8,-28,3,-165,-2,-25,4,-66,-8,-14,-8,29,-15,215,-3,30,2,20,16,21'
+    ',3],[-9952,7989,19,-5,3,-6,35,-6,11,2,7,11,-5,19,-33,8,-58,2,-35,-6,-5,-8,7,-10,54,-1],[-9017,77'
+    '59,-85,5,-13,-3,-4,-13,4,-9,16,-6,90,-12,34,8,6,9,-3,6,-45,15],[-9350,7514,-41,28,-52,17,-45,4,-'
+    '79,-10,-28,-9,-17,-8,0,-6,-6,-6,-20,-3,-22,-18,4,-4,17,1,12,-8,18,1,22,-10,58,-4,59,-15,72,0,43,'
+    '5,9,17,-9,19,5,9],[-11000,7869,-41,7,-47,-2,-83,-17,-115,-10,-43,-14,12,-5,104,9,61,-10,35,12,41'
+    ',-8,76,1],[-11000,7832,52,0,9,2,5,7,-2,8,-11,8,-53,12],[-11763,7597,12,13,-24,1,-88,-20,-76,-29,'
+    '78,-10,38,9,60,36],[-10483,7365,-49,12,-104,-5,-33,-5,-26,-16,77,-21,11,-10,73,-29,34,13,42,31,2'
+    ',19,-9,7,-18,4],[-9687,7269,-26,-6,-3,1,9,8,-1,4,-30,10,8,6,-3,2,-31,9,-30,1,-43,-11,-6,3,5,8,58'
+    ',25,53,10,4,3,-12,6,-28,2,47,9,16,8,-17,15,-50,7,-149,-16,-84,22,-23,-6,8,-5,24,1,-8,-5,-49,4,-4'
+    '8,-5,1,-10,34,-11,9,-13,-46,15,-34,-3,-20,-8,63,-21,52,8,54,-15,-51,6,-20,-7,1,-6,29,-4,14,-14,-'
+    '3,-5,-10,-1,-17,8,-8,-21,-79,-5,-65,34,-28,2,-30,-7,-21,-23,31,-19,43,-10,25,-18,22,-3,29,4,23,-'
+    '11,39,-6,86,-39,33,-20,18,-17,56,-9,46,14,-3,12,-23,21,14,8,4,-13,10,-6,60,-3,36,4,27,12,34,4,-1'
+    ',14,-15,8,18,15,-21,12,28,7,8,10,-1,6,-9,15,-33,-1],[-8067,6390,9,1,-3,6,-31,13,-10,-7,-32,5,-55'
+    ',-6,21,13,0,6,-11,22,-26,21,-62,14,-53,18,-29,17,-59,9,-19,15,-23,9,-11,-1,-23,-19,-8,0,-14,18,-'
+    '18,7,13,11,-7,13,-37,17,-26,-9,-26,-30,-12,-52,-18,-44,2,-19,10,-24,-68,-24,-26,-27,4,-4,23,-2,3'
+    '4,9,81,4,6,-4,21,-52,11,-2,76,19,32,28,29,7,29,15,15,25,28,8,23,2,5,-3,-1,-11,56,-9,9,-22,42,-5,'
+    '91,-20,79,34,-41,10],[-7568,6832,-68,0,-38,-9,-49,-38,-8,-14,9,-20,22,-24,31,-3,91,4,38,9,20,9,1'
+    '1,17,-4,34,7,11,-2,9,-7,6,-53,9],[-8074,7348,-8,-5,4,-10,16,-6,44,-5,13,-24,11,-12,44,-10,119,12'
+    ',47,2,144,-8,31,6,-22,12,2,8,-28,8,-19,15,-25,5,-20,14,-85,15,-131,-1,-125,13,-23,-5,-1,-13,12,-'
+    '11],[-9786,7574,-3,2,29,9,-5,13,13,16,-5,8,-17,12,5,8,-4,8,-98,19,-31,-8,13,-14,-28,-2,-50,17,-1'
+    '4,1,-58,-2,-44,-9,-6,-4,7,-4,84,-13,-43,-7,87,-9,-57,-3,13,-9,29,-7,-8,-3,-34,3,-95,29,-8,10,-20'
+    ',6,-52,3,-28,-16,61,-6,-33,-12,4,-6,39,-5,-8,-7,22,-13,32,1,-29,-4,-68,12,-20,0,-13,-7,2,-3,-55,'
+    '-18,26,-9,108,10,227,9,-57,-7,-52,-17,-43,-5,-2,-6,58,-10,-33,-6,25,-18,60,-3,30,7,76,-4,62,5,-1'
+    '3,9,1,5,23,-8,17,1,-3,6,-15,7,-3,16,23,9,31,-9,-7,13,0,12,-45,7],[-10490,7905,16,-6,-23,-13,7,-5'
+    ',75,18,27,-9,-31,-12,82,-4,-65,-11,43,-1,11,-3,-9,-5,-134,1,-9,-3,1,-5,23,-12,25,-6,56,-3,27,6,9'
+    '5,5,-4,-6,16,-6,55,3,99,-9,24,-10,7,-11,17,-9,63,-10,79,7,17,14,-13,12,-65,21,1,6,-8,5,17,5,10,7'
+    ',-3,2,-83,24,-69,-2,9,14,-66,14,-69,-7,-3,-8,-16,-5,-2,6,-13,3,8,6,0,7,-26,13,-80,12,-168,-3,-18'
+    ',-16,3,-13,64,2],[-9175,8105,-25,14,-41,9,-92,8,-85,-2,-5,-2,4,-8,78,-3,17,-5,-5,-6,-54,1,-69,-8'
+    ',-46,2,-29,-5,-24,-16,72,-9,19,-11,67,-8,-96,1,-34,12,-70,3,-20,-3,-2,-14,60,-18,-56,1,-28,-6,36'
+    ',-10,38,1,24,-9,115,5,-32,-5,-7,-9,-212,9,13,-12,5,-10,13,-7,60,-18,56,-2,90,9,-12,-7,-114,-14,-'
+    '7,-11,63,-13,99,11,17,-1,-17,-7,18,-3,111,16,34,-1,23,-7,95,0,-125,-9,-13,-9,-16,-3,-45,-2,-87,-'
+    '15,5,-6,21,-6,74,-9,-47,-3,36,-14,140,-7,-86,-5,-12,-3,17,-7,78,-15,129,-9,28,3,-8,7,-24,6,35,2,'
+    '77,-17,2,4,-10,8,-47,27,4,6,94,-40,28,-2,21,20,-13,19,16,2,43,-12,17,6,-2,8,-25,5,8,8,1,18,12,7,'
+    '22,4,-13,-12,3,-17,30,-7,54,19,12,10,24,1,143,23,25,7,-61,33,-36,-13,-17,13,-16,2,-96,-5,16,8,16'
+    ',23,-22,15,-72,6,29,9,-5,18,-45,6,-39,-1,-12,-3,3,-13,23,-3,18,-12,-66,6,-34,9,5,10,-5,5,7,3,-11'
+    ',7,-28,3,-34,-4,-78,9,-4,10,-59,16,-48,20],[-8759,7447,82,1,10,1,-6,7,92,-6,27,3,7,7,26,-8,12,1,'
+    '3,8,63,-10,81,6,21,8,7,11,-17,9,-1,5,42,-8,-2,-13,6,-6,32,-10,80,-6,71,10,95,1,7,17,6,5,-20,10,4'
+    '1,-7,54,9,-26,10,-48,-3,-24,4,87,23,-15,19,-63,4,17,7,-20,7,-68,1,-17,3,2,7,-12,2,-88,7,-109,-8,'
+    '-69,7,-67,-17,-137,-12,-10,-3,17,-6,-5,-4,-86,9,-45,13,-28,-14,-19,10,-47,-7,-44,15,-21,-4,5,-12'
+    ',-12,-5,-36,11,-37,1,39,13,6,6,-8,4,-42,5,-9,7,-46,13,-46,3,-57,8,-13,6,110,-6,90,3,17,5,-4,6,-2'
+    '14,16,-2,4,4,1,78,-5,8,4,-58,16,-43,3,-75,-7,-70,0,-53,-17,33,22,-1,8,-7,3,-53,13,-48,0,-135,15,'
+    '-112,-9,-5,-6,4,-2,37,-9,-50,-3,5,-4,88,-16,32,1,-39,-9,59,-13,18,-10,160,1,36,9,22,-1,90,-50,12'
+    ',-19,-34,-25,0,-11,6,-7,27,-11,-9,-7,21,-26,41,-13,42,-1,-3,6,3,3,25,8,-9,-10,42,-11,99,-6,36,9,'
+    '1,10,25,5,9,-10,17,11,15,3,19,-5,-20,-17,-2,-7,6,-3,91,-4],[-9660,7785,151,14,15,12,-39,12,44,12'
+    ',-3,4,-64,13,-64,1,-7,7,-21,7,-90,11,-95,-1,4,-8,23,-13,-26,-4,0,-4,25,-9,2,-6,23,-10,88,-8,-72,'
+    '-6,4,-4,60,-14,-4,-5,7,-5,39,4],[-11000,7809,-121,0,-109,-8,-89,-10,-9,-10,16,-18,-9,-5,5,-5,79,'
+    '-17,42,-2,175,18,8,10,-3,14,-57,2,-15,5,87,10],[-11000,7793,23,3,15,10,-38,3],[-11864,7642,-16,4'
+    ',1,5,32,4,6,11,11,8,42,7,10,-3,-19,-21,-5,-12,3,-4,50,-14,38,5,8,8,3,13,78,8,24,8,4,5,-31,16,44,'
+    '4,-52,20,85,18,-88,22,-48,-1,-21,-8,35,-7,-14,-4,-31,2,-27,-4,-59,6,-108,-7,-122,-41,-18,-11,-61'
+    ',-13,-46,-21,-86,-6,-48,-26,31,3,-2,-4,6,-4,-9,-7,24,-7,49,9,70,-5,19,4,12,14,9,2,44,-36,46,4,37'
+    ',12,-1,7,-19,7,10,4,-1,12,7,5,6,1,27,-18,17,-4,44,21,0,9],[-11000,7554,-116,3,-39,25,-51,1,19,11'
+    ',-83,26,-47,6,-65,-5,-24,9,-13,15,-58,6,-81,-7,-20,-8,-5,-6,3,-5,102,-8,-143,2,-38,-9,4,-8,-11,-'
+    '6,32,-8,135,2,-181,-13,-17,-2,-19,-11,13,-4,60,-1,129,9,-94,-19,-118,-3,-25,-10,-9,-9,10,-7,50,-'
+    '4,52,1,34,-13,41,-7,32,14,13,-1,26,-12,57,11,9,8,-15,11,34,-4,15,19,14,-5,41,4,-38,-16,-4,-5,5,-'
+    '10,13,-4,76,4,35,10,39,-8,59,4,53,9,6,-3,-5,-3,-59,-18,-117,-4,-147,-26,-7,-5,11,-7,43,-11,82,-9'
+    ',129,10,79,14,55,17,39,4],[-11000,7624,29,-3,28,-10,-2,-9,-42,-9,7,-7,86,-16,4,-8,-5,-8,-14,-3,-'
+    '91,3],[-11000,7648,-27,-6,-4,-5,6,-6,25,-7],[-11000,7485,50,3,67,18,20,-4,-12,-3,28,-4,65,5,67,-'
+    '7,106,16,23,10,18,31,16,13,4,12,-15,20,-77,11,-28,-4,-17,-7,3,-8,13,-5,-20,-4,-2,-10,-14,17,-17,'
+    '4,-32,1,-48,-10,30,20,-13,6,-54,1,1,5,26,11,-7,10,-32,11,-12,15,16,15,-36,8,-51,-6,-66,-28],[-91'
+    '09,7401,-54,2,-59,-6,-37,11,-82,10,-156,-14,-15,-5,-1,-11,23,-16,21,-5,-70,9,-24,-6,3,-82,35,-38'
+    ',8,-32,-2,-15,69,1,36,-4,10,3,17,22,31,17,3,8,-24,17,-44,9,87,4,95,-8,27,3,66,40,3,4,-12,5,30,6,'
+    '87,52,3,5,-11,4,-63,10],[-9559,6884,-26,11,-45,39,-58,17,-36,16,-17,-4,-6,4,8,3,-2,4,-38,12,-29,'
+    '-3,-19,-8,-2,-12,25,-17,-51,11,10,-9,-11,-2,11,-11,-5,-4,-41,-14,-55,-4,-10,-10,12,-11,19,-6,16,'
+    '0,3,6,16,1,12,-11,24,-2,22,4,8,-10,77,-20,46,0,41,-8,33,5,58,23,33,4,9,5,-10,6,-22,-5],[-11000,7'
+    '298,-66,3,-3,-7,14,-8,35,-10,-1,-10,-57,-13,-36,-16,-13,-1,2,9,-6,0,-37,-15,-22,6,29,8,25,13,11,'
+    '10,-2,4,-78,18,-70,10,-32,1,-22,-5,-20,-13,-1,-13,-8,-4,-94,-6,41,27,6,21,-16,23,-43,7,-262,-46,'
+    '-111,-38,-11,-10,27,-17,-38,-9,-35,-18,-5,-23,12,-7,29,-4,84,1,-14,-10,-27,-3,-8,-6,4,-3,47,-5,2'
+    '13,16,29,-6,-68,-2,-7,-5,16,-4,-192,-22,-46,-13,-11,-6,12,-8,67,-26,160,-4,223,10,165,-24,48,-14'
+    ',-101,-8,-195,8,-196,-13,-59,-8,-6,-5,10,-25,24,-15],[-11686,6965,32,-22,44,-9,94,-8,84,1,63,-7,'
+    '10,-24,-3,-12,7,-7,32,-23,21,-6,171,6,18,5,166,9,52,8,59,17,92,7,41,18,17,17,20,9,30,-6,2,-16,7,'
+    '-3,125,-11,-15,-12,6,-4,54,-5,22,6,88,-12,57,1,104,20,7,16,-8,6,-18,2,-2,8,9,7,-7,5,-40,2,-43,-1'
+    '4,-24,-14,8,17,-1,10,-41,17,10,5,44,-13,30,-1,9,7,-7,10,42,13,53,-15,17,15,14,-14,36,-3,4,4,3,15'
+    ',-13,24,-11,4,-41,-1,-12,14,-31,1,-106,37,-3,-4,8,-8,-8,-3,-50,12,-37,13,-22,17,-34,13,-5,7,20,2'
+    '5,-3,20,-42,32,-42,52,-9,21,-11,11,1,5,-20,14,-121,34,-12,1,-16,-9,-61,14,-31,2,-5,-7,14,-6,-26,'
+    '-4,-4,-7,31,-59,11,-8,12,-29,39,-26,-7,0,3,-7,-34,-10,-12,-9,-38,9,-56,83,-24,5,2,5,-15,8,-88,25'
+    '],[-12262,7446,-208,-11,51,-45,32,-7,7,-6,-23,-13,-8,-11,-31,-11,-17,-18,-21,-11,-2,-7,23,-5,3,-'
+    '7,-41,-10,-6,-20,4,-5,-39,-17,-25,-17,5,-7,-18,-4,-1,-9,-8,-7,55,-1,129,-29,33,-19,29,-27,29,-13'
+    ',26,1,68,17,41,17,28,-5,85,12,18,12,7,26,18,24,1,8,67,9,43,34,260,61,96,17,13,8,-7,8,-17,9,-132,'
+    '43,-56,13,-103,1,-58,-22,-3,15,-6,3,-26,0,-26,-9,17,12,-99,12,-77,18,-43,1,-87,-8],[-5624,4677,7'
+    ',-2,3,5,-10,-3],[-9474,7596,-16,-3,15,-16,45,2,-20,20,-24,-3],[-7964,5201,26,-6,11,14,-37,-8],[-'
+    '7867,5644,-13,-6,-11,-25,20,8,5,11,-1,12],[-7976,5581,30,9,28,31,4,-7,-13,-22,9,-3,27,43,-5,10,-'
+    '31,18,-12,-32,-15,-10,11,27,-3,9,-6,-21,-48,-40,10,-6,34,25,7,-1,-27,-30],[-7995,5683,6,-7,6,8,-'
+    '7,3,-5,-4],[-7978,5751,6,1,-1,8,-8,-4,0,-12,3,7],[-7969,5633,11,14,-43,-15,-8,-11,11,0,29,12],[-'
+    '8030,5967,-2,-4,3,-1,12,9,-13,-4],[-8005,5336,1,-6,10,-3,-3,8,-8,1],[-7995,5981,5,4,-14,2,-13,-1'
+    '1,22,5],[-7955,5673,-3,-9,10,5,-3,8,-6,3,2,-7],[-9694,7293,27,3,7,11,-26,12,-15,-3,-8,-6,0,-10,1'
+    '5,-7],[-9736,7453,7,5,-13,5,-33,-12,9,-4,30,6],[-9897,7381,82,8,49,18,-4,4,-36,-1,-129,-17,-5,-2'
+    ',1,-3,42,-7],[-9018,6936,-5,8,-26,-7,16,-12,15,11],[-9060,6937,-14,-1,-3,-7,20,-8,8,1,-11,15],[-'
+    '7439,6270,-24,1,38,-9,26,2,-40,6],[-7480,6846,-27,22,-22,1,-11,-14,44,-21,12,3,4,9],[-7861,6077,'
+    '-6,-5,14,1,29,9,-37,-5],[-7915,6834,-2,-11,11,-5,23,9,-12,8,-20,-1],[-7665,6350,-48,18,-23,-9,58'
+    ',-21,10,1,3,11],[-6447,6254,-35,2,-1,-6,-13,-4,12,-5,29,-2,13,10,-5,5],[-6263,6718,-24,-12,6,-3,'
+    '33,10,6,6,-21,-1],[-6809,6059,-25,-23,-3,-11,14,-1,39,15,-1,10,-24,10],[-7037,6267,-7,6,-23,8,-5'
+    '5,6,23,-8,30,-22,40,-1,0,6,-8,5],[-6479,6141,9,6,3,12,-12,7,-34,3,-30,-4,4,-9,51,-20,9,5],[-6775'
+    ',6963,-16,5,-31,-6,28,-9,19,10],[-7955,6963,19,8,-7,8,-16,2,-38,-7,-15,0,-9,6,-21,0,-5,-6,-26,0,'
+    '-6,-5,34,-4,47,-14,-7,12,50,0],[-7858,6964,-27,-16,5,0,33,2,50,14,-6,7,-17,3,-10,-7,-28,-3],[-77'
+    '71,6395,14,8,-40,-4,26,-4],[-8306,6620,11,7,-29,6,18,-13],[-7885,6892,62,39,-10,8,-27,-2,-9,-4,3'
+    ',-7,-14,-2,-10,-10,-34,-9,-17,-13,5,-6,51,6],[-7699,6941,-33,1,-6,-15,16,-13,22,0,33,23,-32,4],['
+    '-6517,6180,24,-7,8,5,-28,16,-11,-4,7,-10],[-8698,7001,25,-3,21,4,-9,9,-50,4,-21,-7,13,-6,21,-1],'
+    '[-8437,6601,23,-9,2,-15,42,-1,-10,-5,1,-4,14,-1,4,4,28,-7,10,7,-50,10,-4,3,7,9,-42,16,-29,5,-6,-'
+    '4,10,-8],[-8670,6831,-26,-21,11,-9,-6,-11,2,-6,29,-10,20,15,-2,29,-15,11,-13,2],[-8515,6602,-2,-'
+    '8,10,-20,29,-17,11,1,7,5,-9,16,-23,21,-23,2],[-9308,6194,-12,-2,16,-8,5,5,-9,5],[-10258,7578,16,'
+    '9,41,7,-48,16,-9,18,-52,3,-125,-13,-6,-7,17,-6,44,-1,-19,-11,22,-4,57,7,16,-4,-27,-16,73,2],[-10'
+    '027,7673,-62,1,-72,-14,38,-2,96,15],[-10347,7633,44,10,-69,17,-30,-2,5,3,-2,5,-22,1,-39,-9,24,-2'
+    '5,89,0],[-10311,7825,-16,-8,15,-4,33,9,-10,5,-22,-2],[-10208,7769,108,5,-32,11,-94,4,-21,-2,1,-1'
+    '0,38,-8],[-8995,7684,-46,-3,-15,-6,40,-23,39,-3,4,3,-7,4,-2,7,12,11,-25,10],[-9643,7561,-55,-10,'
+    '-4,-4,16,-10,40,12,30,-1,20,7,-41,10,-6,-4],[-9551,7464,-34,-6,54,-7,3,3,-23,10],[-11390,7792,-3'
+    '8,8,-5,8,-70,-11,42,-20,32,-5,67,9,-10,8,-18,3],[-12104,7590,1,-5,-21,-10,29,4,6,14,-15,-3],[-11'
+    '371,7671,22,7,-3,5,-37,6,-53,-1,-42,-9,113,-8],[-10375,7525,-5,10,-12,4,-43,4,-30,-8,-24,-20,26,'
+    '-9,51,-2,46,10,2,5,-11,6],[-5267,4762,-4,13,-7,2,-17,-22,-17,-9,-5,5,2,22,28,36,-5,6,-36,-15,-32'
+    ',-34,-17,-1,-7,8,-2,7,22,21,-23,1,30,7,1,8,-5,4,28,15,19,4,12,17,-4,9,-49,-18,-9,3,-47,-12,32,14'
+    ',8,13,-26,5,12,10,-31,-2,26,10,33,25,0,12,-5,6,-34,12,-36,-2,-13,-9,-2,20,-3,0,-48,-26,-5,4,-15,'
+    '-7,-6,-4,-1,-8,-10,-4,15,33,-3,10,-5,0,0,-10,-6,-4,-4,12,-30,-6,-14,9,-27,-7,20,13,2,9,-27,-5,10'
+    ',8,46,19,8,9,-26,-2,-17,6,-23,-8,4,12,-6,5,-64,-50,-3,16,10,11,2,13,25,26,3,11,25,20,9,18,24,15,'
+    '7,12,-2,16,-18,1,-3,13,45,6,12,15,-6,6,-18,-4,4,-5,-3,-4,-18,4,-3,5,-13,1,-59,-21,-13,-9,-8,-14,'
+    '-21,-12,3,-7,-4,-8,-25,-16,12,-9,-15,0,-10,-10,-50,-81,14,-21,-7,-2,-16,7,-19,-15,2,-13,21,-3,-1'
+    '2,-15,11,-9,-41,9,-9,-8,-23,-40,-19,5,7,10,-33,-19,0,-4,83,-1,-26,-10,-67,-41,-9,-11,10,-26,14,-'
+    '6,51,6,27,10,1,-5,156,-12,51,10,14,13,10,-3,16,6,-1,-23,-26,-9,27,3,28,-6,15,3,6,16,42,-4,17,4,-'
+    '9,-9,-32,-12,-30,-29,-43,-14,-3,-9,16,-6,47,4,18,14,5,12,23,22,21,2,18,14,-9,-17,7,2,30,46,20,-1'
+    '0,14,-32,-24,-35,-8,-21,7,-6,9,2,41,31,-2,-47,5,-5,25,9,15,-7,14,7,14,25,-2,13,23,33,1,19],[-556'
+    '0,5078,-3,-6,6,-1,10,9,-13,-2],[-5482,4951,8,0,20,11,-19,-6,-13,4,4,-9],[-5527,5200,-15,-10,13,3'
+    ',2,7],[-5398,4966,-16,9,-6,-6,-8,2,-1,-11,31,6],[-5631,4695,2,12,-7,3,-3,-3,6,-13,-5,-12,3,-2,9,'
+    '6,-5,9],[-5417,4761,-16,-20,10,3,8,13,2,8,-4,-4],[-10029,6896,-12,7,-19,-2,-2,-23,12,1,10,-7,15,'
+    '6,7,12,-11,6],[-10015,6913,-9,-9,22,-9,3,6,-5,8,-11,4],[-10032,7058,4,1,-15,6,-25,0,3,-9,11,-3,2'
+    '2,-4,0,9],[-9599,6939,10,-4,8,10,0,11,5,0,6,-2,3,-10,-6,-9,23,0,10,7,2,9,-22,9,-20,3,-14,-6,-5,-'
+    '18],[-10110,6954,-21,4,-5,-4,15,-6,-8,-4,4,-5,25,7,-10,8],[-10201,6883,-30,-15,42,-10,16,7,-3,12'
+    ',-25,6],[-10460,6856,-45,0,8,-7,37,-9,16,5,-16,11],[-10797,6733,8,11,-10,7,0,11,-6,4,-8,-3,-2,-2'
+    '0,18,-10],[-10897,6798,-21,-1,26,-9,3,2,-8,8],[-10794,6686,11,6,2,8,-28,1,15,-15],[-10947,6810,-'
+    '3,-5,18,-6,-2,6,-13,5],[-6105,5613,-11,-1,-3,-7,21,-3,2,6,-9,5],[-6194,5755,-7,1,3,-6,34,-8,-2,1'
+    '0,-19,6,-9,-3],[-6920,5915,-13,-3,-2,-16,13,1,6,9,-4,9],[2231,6023,0,4,11,3,-7,6,-17,1,-10,-8,18'
+    ',-12,10,0,-5,6],[2121,6060,9,-12,14,0,1,5,-18,11,-6,-4],[2176,6020,-6,-9,13,3,3,6,-10,0],[-6450,'
+    '6043,-15,8,-19,-1,3,-9,37,-11,3,7,-9,6],[12617,3483,-9,8,-7,-4,11,-16,5,2,0,10],[7249,-726,-5,3,'
+    '3,-8,-2,-9,-2,10,-8,4,8,-18,6,6,0,12],[-13953,-888,-8,1,-1,-8,11,3,-2,4],[15762,-873,-17,2,19,-8'
+    ',-2,6],[2057,6007,-17,-3,20,-2,-3,5],[2163,6017,-14,-4,14,-2,0,6],[2479,6509,-21,-5,0,-6,12,-2,3'
+    '0,8,-21,5],[2984,6991,-10,-12,3,-2,29,7,-22,7],[486,6119,-6,-11,16,0,1,7,-11,4],[810,6334,4,9,-7'
+    ',4,-27,-6,9,-6,21,-1],[847,6367,32,3,2,7,-8,3,-44,-11,18,-2],[1248,6598,-5,-8,8,0,27,9,-30,-1],['
+    '1262,6612,0,6,-9,3,-20,-17,25,3,4,5],[1987,7021,-27,6,18,-19,31,2,-22,11],[2261,7053,46,6,37,23,'
+    '-24,0,-24,-11,-97,-5,37,-15,25,2],[2082,7021,-33,-1,-8,-8,5,-4,27,-1,5,2,4,12],[2600,7098,13,2,2'
+    ',4,-20,6,-36,4,-27,-9,26,-9,42,2],[2355,7062,-30,-11,-23,-2,-10,-11,17,0,1,-8,6,-2,19,4,29,14,-9'
+    ',16],[2385,7071,-7,4,-12,-7,1,-8,16,-7,19,4,6,8,-23,6],[1393,6825,-39,0,-11,-9,-13,0,-10,-7,3,-9'
+    ',12,1,7,7,8,-3,53,14,9,6,-19,0],[1296,6802,-14,-20,28,14,2,9,-5,2,-11,-5],[1800,6950,-22,6,-16,-'
+    '2,-12,6,-5,-7,-22,-5,14,-4,-1,-6,-28,2,-8,-4,-3,-22,-16,-7,27,-2,0,-4,41,19,8,-4,38,4,-1,13,14,7'
+    ',-8,10],[1950,7005,-16,-4,-8,6,-5,18,-8,-1,-7,-7,-1,-13,-17,-3,-19,-12,-2,-11,-5,3,-27,-4,-12,-1'
+    '3,-17,-4,21,-6,51,4,3,6,20,12,32,6,26,15,2,5,-11,3],[1510,6844,-51,-4,-33,-14,0,-7,9,-1,28,2,30,'
+    '11,17,-2,18,8,16,-6,32,10,15,-2,28,15,33,9,3,9,-12,12,-15,3,-13,-3,-9,-16,-30,-12,17,17,-2,18,-1'
+    '0,11,30,20,2,5,-16,3,-49,-26,-4,-12,12,-5,-15,-25,-31,-18],[1510,6901,-6,-1,0,-11,-17,2,-7,-12,-'
+    '25,3,-18,-11,15,-8,22,5,15,-7,33,1,13,5,5,11,-30,23],[1113,6498,-32,-6,-7,-5,44,-3,7,7,-12,7],[4'
+    '96,6024,13,-5,0,12,-10,14,-6,-4,3,-17],[1197,6570,-17,-2,-3,-5,13,-3,10,8,-3,2],[-7918,7609,-52,'
+    '-21,16,-5,49,4,-1,12,21,12,-16,4,-17,-6],[-7209,7747,-35,-2,-5,-6,47,-7,35,1,24,6,-66,8],[-4640,'
+    '8269,-87,-3,-8,-6,4,-7,56,-18,126,-18,42,-10,21,1,8,16,3,16,-17,8,-148,21],[-1931,8212,-30,-4,2,'
+    '-9,56,-16,37,2,-15,10,-50,17],[-1804,7971,43,12,21,11,-7,9,-51,3,-57,-5,-45,-7,-14,-9,11,-8,37,-'
+    '5,62,-1],[-1911,7842,-20,-8,1,-15,17,-25,13,3,12,14,-7,10,1,21,-17,0],[-1866,7640,8,-36,-12,-2,-'
+    '39,41,3,26,18,1,15,-6,7,-24],[-1864,7539,-22,-7,-2,-12,-1,-13,22,-7,108,-1,20,5,-11,11,-26,-1,-1'
+    '3,6,-11,21,-45,-8,-19,6],[-1790,7786,-32,-19,27,-3,22,7,9,7,-4,8,-22,0],[-5121,6842,-25,-3,-17,-'
+    '12,-57,-5,-50,4,-8,5,-60,-1,34,31,44,10,30,-1,68,-17,49,7,18,8,14,14,-44,-8,17,39,78,4,-24,8,-54'
+    ',-4,19,20,9,25,8,7,37,7,-15,14,21,7,-51,-1,-31,6,-39,-7,-75,7,-77,24,-99,12,-52,28,36,12,137,-7,'
+    '39,-6,89,-25,65,-8,21,6,-27,3,-39,14,-2,10,8,16,-51,16,64,-4,11,3,-36,12,-68,0,-47,8,-48,-2,-11,'
+    '13,23,15,92,14,20,7,-43,-4,-46,4,-51,-13,-27,4,-4,6,23,7,11,10,-19,-2,-9,21,-27,16,-12,13,16,7,-'
+    '28,-4,14,-19,28,-15,5,-9,-32,-21,-24,-2,11,-13,-5,-7,-73,-9,-65,6,-25,12,-8,14,12,8,23,34,48,25,'
+    '-6,3,-42,-19,-26,-2,-8,4,2,8,34,5,-30,10,14,5,34,0,20,7,18,13,0,17,-13,10,-20,5,-22,-9,-38,8,-2,'
+    '10,33,9,7,13,-16,13,-29,-8,-14,12,-22,6,13,20,13,0,-9,14,-30,23,-26,5,-74,-5,52,9,7,6,-1,10,-7,5'
+    ',46,10,-61,16,-32,20,-62,15,-44,24,-32,7,-3,4,35,12,-27,18,-267,47,-155,9,-55,10,-55,-13,-12,-1,'
+    '-35,11,-60,-15,-46,-4,-51,11,-59,-10,-52,7,-9,-2,3,-4,38,-17,-16,-1,-149,12,-105,24,-11,7,62,16,'
+    '75,9,-156,9,-22,9,20,16,-75,-18,-17,1,-18,5,6,6,-29,5,-12,5,-1,4,29,11,26,1,94,4,68,-3,39,14,45,'
+    '4,120,-2,55,-8,-6,11,18,13,-4,4,-51,13,-87,-17,-45,1,-48,7,-35,-11,-38,-2,-63,8,-34,14,-22,1,43,'
+    '14,-62,-5,-54,2,-89,15,-63,19,-3,4,25,11,-14,6,3,4,28,10,75,12,74,2,94,14,98,8,7,2,-11,6,96,13,7'
+    '2,5,127,0,52,16,44,31,33,41,61,10,-26,4,-137,-12,-103,6,-22,4,-14,10,1,6,19,13,63,17,72,11,113,3'
+    '1,80,6,69,-17,-21,19,3,6,22,7,155,-8,28,15,6,12,-14,29,4,6,77,17,115,-4,266,-52,-24,10,-99,20,-9'
+    '7,26,-45,6,55,11,100,8,217,8,82,10,45,-2,61,-17,9,-10,-2,-32,4,-9,52,22,11,17,-17,8,-1,13,9,7,24'
+    ',0,189,-42,135,2,-85,20,-32,12,-23,14,-5,8,95,1,118,-6,224,-31,133,-27,56,-5,20,7,-11,25,9,16,31'
+    ',11,-9,10,-123,28,49,3,242,-4,77,-6,52,2,-1,5,-339,13,-138,-2,-34,9,31,11,76,-4,75,11,165,13,75,'
+    '-3,96,-13,94,23,143,-15,77,-18,12,5,11,11,-61,10,-21,7,0,4,21,4,47,0,35,9,92,-3,19,7,194,3,83,-4'
+    ',86,7,303,-4,415,-30,-619,-17,-4,-11,207,13,296,-4,188,9,65,-28,55,1,23,-7,117,-3,83,-11,17,-8,-'
+    '10,-5,-85,-17,-65,-6,-646,-16,-19,-3,-12,-8,8,-9,27,-2,170,11,269,-5,56,-12,30,-18,79,7,40,24,17'
+    '6,6,21,-14,-2,-23,-8,-10,-49,-25,-135,-42,-13,-8,0,-6,8,-1,29,13,74,11,120,26,87,28,39,8,41,0,7,'
+    '-13,69,-1,100,-10,23,3,111,35,67,6,121,-3,181,-13,100,-20,-10,-6,-70,-11,-90,-22,-132,-10,-4,-2,'
+    '26,-10,-1,-4,-26,-7,-69,-4,-35,-7,-78,0,-44,-8,17,-6,65,-8,1,-3,-56,-15,-52,-6,-106,-2,-136,9,-4'
+    '4,-12,-28,-13,-5,-7,2,-8,11,-9,72,-4,7,-5,-12,-19,-1,-14,26,-2,14,-8,2,-7,-73,-11,-17,-16,-16,-7'
+    ',-57,-4,-51,-14,18,-6,-1,-4,-23,-18,-21,-31,-35,-28,2,-8,15,-6,20,5,25,15,27,6,137,-19,19,-10,0,'
+    '-3,-17,-2,-69,12,-52,-7,22,-17,23,-8,93,-15,40,6,46,-2,10,-4,5,-9,-5,-21,-17,-14,-10,-2,-125,15,'
+    '-63,1,-45,-3,-2,-5,-65,-15,-72,10,-28,-11,23,-7,50,-4,12,-17,27,-13,60,3,79,-8,24,-10,-10,-12,45'
+    ',-24,11,-27,2,-19,-15,-12,-27,-2,-40,15,-28,0,-43,-15,-34,-3,-40,-11,-58,10,53,-16,71,11,20,-18,'
+    '-1,-8,-24,-16,18,-1,25,9,19,25,21,4,23,-4,44,-36,25,-7,6,-7,-4,-14,-10,-6,-28,-2,-61,2,3,-8,-90,'
+    '-9,-82,13,19,24,-22,9,6,-13,-5,-5,-36,-10,13,-8,-14,-15,35,-9,69,-1,93,-11,3,-3,-17,-33,-13,-3,-'
+    '91,-3,-64,-16,-16,0,-88,13,-53,14,-40,22,-29,-13,-23,-3,-84,25,74,-31,-1,-3,-52,-8,-36,-14,-39,-'
+    '4,-121,19,10,-7,63,-12,-19,-8,-83,-3,21,-7,16,6,44,-1,135,16,13,8,21,4,93,1,23,-1,66,-21,24,-2,1'
+    '5,-9,81,-16,3,-28,-6,-24,-21,-6,4,-12,-5,-10,-178,38,-29,19,-27,35,-36,-3,-27,-9,-140,-20,27,-5,'
+    '158,23,16,-32,-5,-7,-50,-12,8,-4,55,7,98,-28,109,-23,13,-14,41,-3,-54,-24,2,-12,6,-13,12,18,34,8'
+    ',21,-3,8,-27,0,-35,15,-33,-11,-6,-31,-3,-44,2,-6,40,-9,-5,-8,-32,-8,-5,-64,1,-46,11,-18,9,-26,27'
+    ',-4,13,-29,17,-133,35,-120,6,-7,-3,5,-7,127,-5,14,-11,3,-10,-7,-9,-42,-13,-56,-10,-168,4,41,-9,1'
+    ',-6,-9,-14,-35,-13,-65,-13,53,4,52,-8,140,6,11,-6,-7,-4,-62,-10,-36,-14,-7,-9,25,-4,35,21,87,5,6'
+    '3,10,78,-5,108,-16,139,-1,7,-2,-8,-8,-74,-13,-6,-2,8,-8,-4,-1,-82,-5,16,-11,-3,-4,-56,0,8,-11,-8'
+    ',-4,-57,-15,-32,-3,10,-9,-45,-12,-16,-16,-78,-21,-277,-38,-62,1,-33,-11,-52,5,11,-9,0,-4,-37,-6,'
+    '-44,7,-91,31,15,-18,-19,-5,21,-15,0,-7,-21,-11,-74,-22,-24,-22,-15,-6,-3,-12,-57,-53,-17,-10,-15'
+    ',0,-21,-20,-56,-18,-22,1,-46,18,24,-30,-75,-31,-1,13,-14,5,-14,-22,-26,-1,-13,9,-26,-8,-9,-13,-3'
+    '4,-7,-20,4,-5,8,20,15,-3,5,4,7,51,32,-53,9,-35,0,41,-13,-22,-12,-17,-24,-38,11,8,-9,22,-8,2,-13,'
+    '-44,-9,-153,-6,-2,-4,61,-18,-7,-5,-38,-19,-22,-5,-42,6,-41,-1,-1,-6,12,-17,31,5,48,-44,-30,-14,-'
+    '22,-1,1,-6,-9,-5,-80,8,55,-18,20,4,21,-3,-3,-20,10,-20,-22,-10,-1,-10,-27,-2,-1,-10,-9,-6,4,-8,-'
+    '28,-21,-45,1,-33,14,8,-9,46,-15,-1,-5,-27,-18,-15,-5,-88,3,27,-8,52,-7,-9,-10,4,-7,-12,-25,18,-1'
+    '4,3,-15,-14,-9,-34,-5,27,-4,-3,-6,-30,-56,-7,-29,-32,-25,-88,8,-2,-3,11,-5,53,-8,14,-11,4,-27,-2'
+    '0,-13,-30,1,-34,9,30,-17,-25,-4,-21,1,5,9,-31,-2,-7,11,22,17,5,6,-4,3,-31,-24,-8,-1,-77,18,1,17,'
+    '40,9,23,20,-34,-15,-30,-7,-67,18,-9,16,26,31,1,13,-7,-1,-7,-11,-57,-14,-29,-14,-35,-4,-24,6,-34,'
+    '-1,7,-10,-10,-1,-35,5,-6,4,3,5,44,14,-62,0,1,14,-5,5,-49,9,-13,24,-24,7,10,10,-12,6,-7,14,34,15,'
+    '21,4,-29,3,-23,-10,-27,-1,-4,2,-1,13,12,8,-77,24,6,11,0,10,-4,4,22,18,29,14,-30,-6,-30,-16,-11,1'
+    '2,-30,15,-67,55,-7,12,9,14,-10,11,121,16,8,4,-23,0,5,10,-63,-15,-51,-6,-13,11,31,25,17,10,40,0,-'
+    '2,8,36,5,13,-1,20,-19,15,-4,-11,25,-18,8,-22,-1,-44,43,24,-40,-17,-10,-33,-7,8,16,-12,-3,-10,-6,'
+    '-40,-42,-16,-6,-8,4,-9,16,0,26,-17,47,-19,6,-9,12,36,11,56,27,53,7,-63,-6,-63,-26,-20,0,-21,13,-'
+    '44,0,-3,18,12,21,-13,0,-15,7,133,46,17,11,37,11,30,15,-60,-18,-122,-50,-50,-6,-7,1,-2,26,21,24,3'
+    '1,10,7,8,65,5,-105,4,-25,7,-19,15,8,28,113,33,29,0,71,-10,22,2,74,-16,10,2,-56,16,0,4,28,5,-8,3,'
+    '-80,-7,-57,10,-64,-8,-44,-19,-32,-2,16,29,23,13,20,24,155,-16,39,28,4,6,-4,3],[18000,-1654,0,5],'
+    '[-18000,-1615,6,2,-6,-4],[-8596,1643,13,8,-13,-8],[2540,3742,6,5,-15,2,0,-8,9,1],[16694,-49,-3,-'
+    '3,3,-3,0,6],[16959,580,14,21,-8,-6,-6,-15],[17296,315,-7,-5,7,5],[17275,303,14,4,-14,-4],[17298,'
+    '190,4,-8,-4,8],[17304,180,-5,-9,6,3,-1,6],[17303,101,-4,2,8,-7,-8,-12,10,13,-6,4],[17445,-65,-7,'
+    '6,9,-5,4,-16,-3,-3,-3,18],[17477,-119,-5,6,6,-13,-1,7],[16868,734,15,-3,-15,3],[17176,697,-18,8,'
+    '18,-8],[17139,711,-15,-4,-20,9,19,-7,16,2],[-17814,-1424,-5,-2,3,-5,11,-1,-9,8],[-14081,-1786,3,'
+    '11,14,7,-16,-7,-5,-8,0,-4,4,1],[-13631,-1857,-2,5,-15,5,17,-10],[-13697,-1836,-10,9,10,-9],[-138'
+    '53,-2088,2,2,-4,9,2,-11],[-14067,-1842,-11,9,11,-9],[-14082,-1822,-15,16,15,-16],[-14253,-1611,5'
+    ',9,-5,-9],[-14339,-1667,-5,5,-11,0,16,-5],[-14357,-1663,-14,5,14,-5],[-14506,-1590,1,4,-11,10,10'
+    ',-14],[-14548,-1635,-13,27,0,-9,13,-18],[17304,134,13,4,-13,-4],[-16962,5662,-15,-1,14,-6,16,4,-'
+    '15,3],[-7285,2009,-11,-3,6,-3,28,-2,-23,8],[2448,3721,-6,-8,7,-2,5,6,-6,4],[14216,2671,-5,1,8,-1'
+    '0,-3,9],[13084,3754,-2,-6,10,0,-2,7,-6,-1],[-18000,-8435,161,1,66,-6,144,-2,42,-9,121,5,296,-8,3'
+    '03,-14,62,-5,56,-10,456,-7,647,-29,-18,11,-35,10,-46,7,96,2,-13,5,-695,31,-54,8,-103,4,-10,3,6,1'
+    ',141,5,-92,17,19,8,49,5,-7,7,-146,19,-226,-3,-137,34,-202,19,-288,36,-17,11,117,-13,125,7,340,-3'
+    '8,280,1,70,-7,47,-18,134,14,91,-19,228,3,48,-5,201,19,40,12,-56,4,-9,6,222,15,31,12,175,27,39,14'
+    ',-171,51,53,13,23,11,-95,19,-212,19,50,16,61,3,780,23,10,6,-113,12,-6,12,-92,9,-39,10,-6,6,14,14'
+    ',22,6,190,8,-11,14,30,2,5,5,-10,8,-24,5,-263,27,-104,22,4,5,-9,7,-138,0,-100,7,-69,9,-90,22,-36,'
+    '10,26,8,149,16,43,14,-105,7,-193,-1,-58,13,-44,12,-21,17,27,28,2,34,37,8,37,-15,33,-1,47,3,46,10'
+    ',140,-2,90,-10,30,-8,15,-11,174,-1,141,-30,59,-7,59,16,79,9,18,9,-58,12,-10,6,6,16,21,1,84,-20,8'
+    '0,5,54,-21,71,-2,8,3,-11,12,-8,1,-2,6,29,7,-45,13,34,12,-6,7,1,8,-7,5,-103,24,-56,7,-126,-5,-105'
+    ',12,76,10,57,17,46,-3,104,-19,93,-10,45,1,-94,31,6,8,33,13,88,1,89,15,65,17,124,7,82,-20,64,-6,-'
+    '35,20,75,10,78,24,207,13,97,-8,10,2,32,30,20,7,67,8,52,0,104,-16,175,8,185,-12,318,19,313,-7,235'
+    ',2,186,10,26,3,76,23,85,-1,74,-7,64,2,121,-4,11,3,32,47,17,9,111,-19,2,-7,-22,-7,-4,-14,30,-2,12'
+    ',-6,-57,-19,-8,-20,-12,-7,-1,-7,241,19,12,4,-21,18,9,7,-11,23,18,9,45,-1,65,-10,22,-8,8,-17,-7,-'
+    '17,-23,-13,-93,-29,10,-9,209,3,147,-13,118,-2,172,22,28,-4,46,4,26,-3,78,5,141,-3,8,-9,33,-15,26'
+    ',-5,151,11,78,-1,19,13,-65,11,-44,13,-51,1,-31,7,21,5,25,16,-11,14,-41,3,-35,-5,-37,5,-34,39,-13'
+    ',8,-105,14,-9,10,6,13,76,2,132,-13,94,4,24,7,64,4,-154,26,-247,6,-17,11,-30,36,27,10,75,-4,9,-7,'
+    '-21,-12,7,-4,73,-4,86,5,56,-6,45,4,160,-2,20,-1,36,-11,17,1,109,-17,115,8,65,-3,34,-6,54,9,88,6,'
+    '59,-2,132,-14,49,8,16,12,-3,14,26,2,22,10,48,-3,21,20,35,1,59,-11,0,-7,-37,-26,14,-11,102,4,36,-'
+    '16,25,-1,99,17,82,-31,77,-7,65,-14,74,-2,64,-13,87,12,15,11,-10,32,8,6,16,1,68,-17,-10,19,-17,14'
+    ',2,10,15,4,92,-15,56,-22,17,-20,38,-5,156,10,9,-11,-37,-25,8,-2,30,5,46,-2,100,17,70,-8,59,2,107'
+    ',25,148,10,43,9,70,-1,150,16,115,28,36,22,48,52,-12,19,-51,37,-7,25,3,22,-19,37,-20,27,-51,40,0,'
+    '21,-7,17,-24,21,57,8,77,-6,7,9,33,16,-5,13,-37,17,9,9,17,0,8,10,-7,10,8,12,25,21,-36,22,23,33,24'
+    ',13,-44,7,-42,-4,-5,9,10,33,19,4,14,12,13,0,7,-3,7,-20,-1,-8,6,-2,23,7,11,-8,3,5,-6,26,7,10,-7,1'
+    '4,3,5,19,10,36,-6,18,3,9,22,-10,6,1,5,15,15,45,2,-10,13,27,4,39,-7,10,6,-4,6,-10,3,0,12,18,-3,8,'
+    '7,-5,7,23,1,8,6,31,4,2,5,-25,6,-2,14,3,10,28,15,50,-4,20,-7,3,6,-9,14,35,10,24,1,-5,7,8,10,10,2,'
+    '6,-9,10,-2,36,12,25,3,13,5,10,12,32,12,19,16,-3,4,6,4,58,15,77,10,47,15,17,12,65,10,35,13,48,9,3'
+    '1,-3,15,-25,15,-6,-5,-6,-29,-1,-3,7,5,5,-5,4,-13,-1,-98,-27,-27,-16,-31,-27,-21,-4,25,-6,-2,-5,-'
+    '9,-1,12,-17,-10,-2,-16,9,-18,1,-23,9,-9,-1,-6,-8,4,-9,-8,-5,-8,2,-4,11,-19,2,-38,-12,-72,-43,-27'
+    ',-4,-37,3,-4,-4,16,-16,-8,-5,-29,5,-13,-8,-7,-6,10,-13,29,-11,-23,-2,-32,-25,2,-8,28,-19,17,-1,4'
+    '8,6,9,8,23,-1,13,7,29,-1,5,-5,-17,-13,-12,4,-15,-4,11,-8,-13,-15,-10,5,-2,8,-28,7,-10,-9,-15,-2,'
+    '-8,-18,-8,3,-4,10,-24,9,-56,-3,-7,-7,10,-5,3,-8,-4,-12,12,-6,0,-9,-9,0,-63,45,-33,2,-16,-4,10,-1'
+    '0,-11,-3,-32,-24,27,-11,6,-11,-29,-6,-65,12,-19,-21,3,-8,6,-2,-24,-9,17,-3,4,-7,-62,-2,-8,-11,10'
+    ',-22,-15,-13,-3,-9,13,-13,-17,-12,42,-1,34,8,5,-7,-62,-21,45,-7,-24,-17,8,-4,108,-15,-8,8,-1,11,'
+    '25,8,70,8,29,-2,-5,-5,-37,-1,-36,-9,-6,-4,2,-7,41,-11,-14,-14,2,-9,47,-29,40,-15,14,-10,4,-25,21'
+    ',-20,24,-9,3,-8,-8,-8,-21,5,-11,-5,-5,-8,38,-14,50,1,1,-8,-21,-11,-29,-5,-5,-7,8,-10,26,4,39,-1,'
+    '6,-13,29,-24,-4,-8,-96,-34,40,-2,35,12,13,-3,8,-7,5,-9,-9,-7,-90,-8,-32,-12,95,-9,36,6,23,-2,6,-'
+    '29,-7,-7,-55,-4,-1,-13,35,-10,22,5,19,-2,0,-16,15,-18,13,-1,10,8,14,0,5,-9,-6,-16,-10,-9,-44,7,-'
+    '34,-11,-18,-1,-35,14,-58,4,22,-10,15,-25,23,3,33,-7,20,-7,9,-10,-11,-16,-30,-9,-20,6,-29,-2,-15,'
+    '-11,52,-1,28,-8,-19,-9,-34,2,-27,-10,51,-4,55,9,8,-7,-31,-17,-36,-3,-87,7,1,-7,37,-27,-7,-8,-21,'
+    '-7,-23,-2,-20,5,-14,16,-36,6,-11,0,5,-17,-7,-6,-16,3,-56,-12,58,-3,17,-8,-111,-18,98,-6,4,-5,-10'
+    ',-5,-301,-56,-115,-10,-178,-24,-62,-17,-18,-13,-11,-2,-69,-7,-90,-1,-92,6,-116,-1,-139,12,-192,-'
+    '5,-10,-7,12,-13,92,-44,50,-13,36,-7,81,-1,173,-11,-3,-10,-61,-28,-55,-14,-77,-7,-579,43,-50,-9,-'
+    '48,-1,415,-58,-2,-13,-10,-10,-32,-9,-242,-7,-232,41,-117,43,9,-17,46,-25,-31,4,-17,-4,-5,-6,16,-'
+    '15,34,-16,160,-33,44,-20,6,-10,27,-10,36,-1,5,8,-1,11,34,5,365,-6,28,-6,11,-8,8,-16,-53,-27,-114'
+    ',-11,-196,1,148,-17,177,8,70,-29,22,-24,25,-18,16,-6,27,-3,87,7,91,-10,201,30,33,-1,13,-2,32,-21'
+    ',47,-10,59,-4,59,3,26,-3,5,-7,14,-6,257,-33,82,-6,240,-6,18,-6,-37,-4,-216,3,-92,-8,36,-6,107,0,'
+    '5,-8,-178,-3,-21,-5,29,-4,5,-6,-12,-13,20,-10,29,0,50,-9,439,17,-156,-27,-65,-6,27,-19,34,-10,21'
+    ',-16,21,-3,40,7,9,-5,2,-11,-39,-24,16,-6,191,-6,196,57,124,26,52,15,51,2,130,26,158,7,176,15,229'
+    ',9,100,-11,110,5,14,-9,7,-12,-15,-11,-25,-7,-7,-11,34,-6,114,7,137,17,111,51,51,16,34,19,58,20,6'
+    '9,4,167,29,156,-18,40,9,84,8,64,24,307,19,95,1,29,14,149,13,529,12,67,10,16,10,-89,9,-565,17,-26'
+    ',11,3,19,-14,14,-33,4,-234,-11,-121,12,-132,18,-72,16,-3,15,9,15,67,43,42,20,28,2,26,9,26,21,21,'
+    '9,147,29,55,-2,184,50,129,29,180,21,107,20,179,19,180,11,104,-2,65,9,29,10,100,-5,119,11,-22,4,-'
+    '23,15,23,19,30,8,30,27,48,32,14,5,87,1,76,-9,38,13,72,34,-4,9,-114,-10,-47,3,-6,5,28,5,6,6,-58,1'
+    '2,8,21,84,33,59,5,69,-7,16,2,16,10,-30,22,0,5,109,-6,46,16,125,22,54,51,-5,14,-32,-3,-82,18,-20,'
+    '22,42,10,27,-4,69,-23,14,1,31,25,49,17,-9,7,-21,4,-3,4,9,4,17,1,21,-10,66,-14,58,-50,73,3,21,9,4'
+    ',23,8,10,-3,10,-25,18,2,6,10,4,36,5,55,-5,90,13,25,-4,10,-11,-12,-11,-37,-18,-4,-18,167,0,74,-4,'
+    '110,5,60,-11,66,4,13,11,15,1,17,-8,6,-19,8,-9,22,-8,108,44,137,27,320,34,229,17,28,13,84,-11,30,'
+    '8,32,21,47,-9,61,-24,75,-18,73,-8,37,15,39,25,47,16,-7,5,-26,4,3,5,44,2,23,-18,52,-11,67,4,132,-'
+    '2,22,13,35,4,20,-5,13,-20,141,-14,11,2,20,23,58,8,19,-8,-17,-38,24,-23,14,-2,72,0,94,8,27,34,36,'
+    '24,26,-4,41,-18,3,-8,-17,-8,5,-6,70,-11,43,9,25,14,14,18,22,-1,22,-4,15,-9,0,-16,37,-19,121,-15,'
+    '53,2,241,44,55,17,54,11,138,7,124,23,19,9,18,29,-9,24,-33,31,7,20,14,9,34,9,35,2,72,-3,3,-9,-45,'
+    '-23,4,-8,79,1,15,-8,38,-32,9,-15,14,-4,123,4,52,-17,45,9,23,-1,35,-9,36,-24,39,-11,2,7,-5,9,85,5'
+    '8,15,46,36,17,60,8,54,21,105,16,41,23,14,2,141,14,33,6,29,13,21,4,37,-1,32,8,51,4,4,9,-12,5,0,8,'
+    '24,13,32,0,27,-9,20,0,5,-5,-17,-6,-11,-10,37,-16,47,7,25,-4,11,-9,0,-13,5,-7,18,6,10,14,-2,27,42'
+    ',17,17,12,-51,1,-24,18,36,10,42,0,76,-24,54,-1,6,4,-10,21,1,12,-21,7,-7,15,9,16,26,8,35,4,94,30,'
+    '179,16,162,-9,42,-13,65,-29,64,-10,19,-14,-20,-9,-17,-1,-53,11,-14,-3,30,-15,3,-8,-9,-11,-59,-23'
+    ',35,-6,61,19,87,6,111,-22,51,-25,62,8,61,1,83,-15,86,-4,52,-7,55,12,46,2,201,-21,146,-5,116,-12,'
+    '57,3,52,12,14,-2,10,-10,-6,-18,38,-42,-5,-8,-40,-20,2,-12,10,-7,-12,-9,10,-21,-26,-10,-46,-4,-3,'
+    '-10,8,-7,18,-4,5,-7,-11,-22,-34,-5,-56,8,-60,-25,-31,-18,39,-6,28,-9,62,1,46,8,14,0,9,-10,-6,-27'
+    ',-32,-34,-25,-14,-58,-21,-61,-61,-32,-64,-22,-31,-39,-18,7,-8,75,-9,65,21,5,17,-5,17,45,23,113,1'
+    '5,41,24,33,7,28,13,5,9,46,10,20,12,18,47,31,35,13,9,52,11,34,20,-2,16,8,14,50,25,36,2,26,9,63,-1'
+    '4,58,2,27,-3,22,4,18,12,7,15,22,9,25,0,83,28,35,4,28,10,20,18,47,26,7,24,17,11,31,10,298,49,25,0'
+    ',34,8,69,1,19,16,100,33,122,-5,41,11,63,1,123,25,172,-3,85,9,47,13,105,9,52,-10,48,4,102,-12,75,'
+    '19,70,-13,88,3,68,10,62,-11,54,14,46,-8,14,-12,51,2,152,29,44,26,-1,8,6,5,79,2,50,8,97,-13,31,1,'
+    '244,-42,78,-6,50,-11,12,-8,37,2,22,-13,108,-14,36,8,80,31,-3,21,32,23,54,12,165,16,61,-13,24,-13'
+    ',39,-30,28,-11,46,-2,23,-7,33,-21,-20,-19,-17,-7,-128,-18,-8,-16,12,-7,90,8,45,12,51,4,82,15,42,'
+    '-6,61,-2,40,5,57,-9,106,18,42,2,18,-1,-109,-22,-36,-12,21,-5,236,28,69,23,104,11,75,14,23,1,40,-'
+    '11,22,2,28,5,30,22,47,6,79,-14,21,-26,67,-29,43,2,46,-9,55,2,26,6,50,57,38,18,83,10,88,-5,49,7,5'
+    '5,-1,28,9,29,1,40,-7,34,-13,11,-20,68,15,38,20,84,-16,36,-15,34,10,45,-1,41,-6,52,-15,97,-1,66,-'
+    '15,100,-3,39,-8,68,2,36,-14,36,-6,76,13,28,0,13,-6,5,-15,21,0,23,7,20,-2,7,-10,-10,-14,-26,-20,-'
+    '11,-16,-21,-15,4,-7,21,-4,21,11,48,7,25,9,43,4,42,-3,85,-34,7,-16,-10,-15,29,-10,137,-10,188,3,6'
+    '0,8,13,-2,7,-38,15,-6,27,13,99,-4,53,-13,26,4,37,9,6,9,1,29,13,3,29,-10,79,-42,53,-18,97,-16,56,'
+    '0,43,-13,45,13,185,-34,35,-21,0,-11,8,-13,44,-11,39,-24,38,-51,21,-9,29,1,27,-13,9,2,1,5,-25,35,'
+    '-2,18,20,11,45,3,68,-32,65,-2,40,13,145,-14,78,-1,94,-15,23,-11,17,-17,20,-9,63,-9,136,-36,9,6,3'
+    ',13,16,2,42,-45,-18,-10,-46,2,-19,-17,-8,-28,31,3,3,-11,-8,-9,-16,-3,-133,22,-29,0,39,-17,101,-1'
+    '8,1,-6,-29,-26,-52,-15,-29,11,-36,2,-18,-6,-104,-2,-28,14,-43,7,2,-6,36,-22,79,-12,9,-5,-18,-6,-'
+    '23,1,-30,-10,-84,1,-30,-6,25,-15,-38,-13,-38,-1,-10,10,-1,21,-11,19,-32,-2,-6,-16,14,-28,9,-9,-7'
+    ',-7,-13,-3,26,-23,36,-22,1,-8,-11,-3,-113,7,-43,-4,-18,14,-16,4,-13,-5,-10,-17,-57,-22,-7,-35,-1'
+    '2,-7,-32,-2,-41,4,-77,-11,12,-7,87,0,29,-7,5,-15,58,-23,-17,-20,-21,-10,6,-6,23,-2,9,-23,-15,-11'
+    ',9,-18,-27,-12,-4,-9,64,-7,52,-36,1,-19,15,-12,28,-7,-1,-8,38,-3,7,-7,-6,-9,-45,-18,32,-2,33,-8,'
+    '42,9,37,19,10,-2,1,-9,13,-16,55,-14,85,-7,7,-9,-8,-8,-53,0,-40,12,-149,-3,-199,-30,-67,21,-21,15'
+    ',-9,0,-16,-3,-1,-11,45,-29,0,-6,-21,-3,-55,8,-32,-7,-39,-15,19,-16,-2,-7,-67,-16,10,-4,24,-1,3,-'
+    '5,-48,-10,3,-7,49,-2,17,-5,0,-8,-179,-28,-21,-6,1,-7,207,-3,-12,-13,30,-9,1,-6,-57,-6,2,-6,44,-6'
+    ',0,-29,-24,-7,-1,-7,44,-5,67,-22,42,-4,160,-47,8,-7,-251,-22,11,-8,136,1,37,-5,26,7,148,11,170,-'
+    '37,67,-8,15,-8,-4,-7,7,-4,30,-6,49,8,52,-10,-37,-16,-57,0,-1,-4,45,-9,173,-4,49,-8,71,3,18,-3,7,'
+    '-8,63,-8,95,-3,95,-14,119,-3,31,-10,29,-3,379,-24,60,-14],[18000,7154,-45,-9,-66,-22,-26,-18,16,'
+    '-23,86,8,35,9],[5471,4089,-16,-6,-18,4,-5,-4,6,-14,-19,3,-32,-7,-11,2,-14,15,-29,-4,-18,4,-21,22'
+    ',-21,-64,7,-35,24,-28,-9,13,4,9,41,-3,9,-5,-2,-24,11,-6,2,-6,-21,-1,-15,7,-12,-18,4,-17,18,8,36,'
+    '-13,2,-11,15,-15,-5,-102,20,-98,0,-10,-5,-3,-29,3,24,8,-15,0,-158,-31,-43,-1,-83,20,-59,34,-21,2'
+    '6,-66,9,-30,10,-15,18,-9,24,-8,82,16,29,10,-5,1,-8,5,3,10,26,9,6,-4,26,16,48,7,10,37,13,45,-4,-6'
+    ',13,-13,9,-19,8,-21,0,-32,22,-23,23,-12,27,-29,33,-16,16,-28,16,-30,40,-35,33,-2,13,-25,23,5,18,'
+    '0,29,14,37,-9,-5,-10,-27,-15,54,-29,24,-30,11,4,21,20,12,4,10,8,-6,27,40,6,20,10,7,1,11,-6,8,17,'
+    '-10,7,11,13,-3,33,8,33,19,24,-3,-5,19,40,10,5,9,12,1,-4,10,8,5,7,-3,-1,11,54,8,53,28,16,0,60,23,'
+    '44,-8,12,-10,27,-3,13,-7,34,16,44,-4,15,-9,10,-19,-11,-19,8,-29,-10,-22,-27,-40,7,-7,36,-17,-29,'
+    '-1,-48,8,-101,-4,-17,-24,-24,-20,5,-11,25,-19,23,-9,-36,-3,-32,13,-45,-1,-11,-4,-5,-17,8,-8,35,-'
+    '6,15,-8,23,-44,24,-27,0,-31,32,-1,28,-29,28,0,9,-7,22,2,11,-6,4,-20,-18,-46,1,-21,14,-36,24,-33,'
+    '-2,14,5,31,-7,6,16,27,19,11,59,4,10,-4,24,-57,58,-40,4,-23],[18000,6898,-73,28,-32,4,-10,9,-193,'
+    '26,-100,25,-113,-4,-84,1,-51,8,-9,-3,-7,-10,-72,15,-207,14,1,-25,-34,-23,42,-5,13,-19,29,-26,0,-'
+    '8,-46,-22,-93,-4,-20,13,-10,16,-101,19,-15,31,-29,15,-23,1,-81,-24,-106,8,-125,3,-35,11,-21,2,-7'
+    '5,-3,-103,-10,-63,-23,-6,-18,9,-14,0,-15,-20,-9,-27,-26,-24,-2,27,11,21,26,-3,7,-27,12,-13,51,-1'
+    '08,17,-10,9,28,44,-10,20,-18,14,-38,14,-65,15,-66,10,-59,3,-155,3,-30,-6,-119,-7,-62,-9,-128,-5,'
+    '-75,15,33,4,-51,27,-61,9,-87,-15,57,23,-7,6,-54,-1,-20,9,-36,6,-53,3,-5,2,13,9,83,4,14,6,-6,9,-4'
+    '6,17,-110,15,-114,2,-119,-52,-88,-11,-20,5,8,8,-1,10,35,-4,35,5,0,8,-10,5,5,14,5,2,47,-9,-22,-19'
+    ',10,-1,49,18,21,12,2,6,-179,-4,-57,-9,-30,9,42,5,19,7,145,-3,2,9,-273,26,-146,2,-54,7,-21,7,-50,'
+    '3,-16,-5,32,-12,1,-9,10,-4,-63,-10,-85,1,-46,-17,4,-17,25,0,19,7,57,-4,-34,-4,-21,-15,-28,-5,36,'
+    '-7,-2,-18,28,-21,-77,-5,-43,19,-11,0,-14,-7,-30,4,-18,-7,-13,-15,39,-5,-47,-10,13,-6,2,-3,-5,-1,'
+    '-82,29,-103,20,-53,-1,-20,-7,-34,-2,-32,-13,-60,-1,-41,5,-56,18,-33,16,-15,16,-42,-29,-23,-29,4,'
+    '-11,-13,-4,-35,-30,-29,-13,-25,-2,-12,5,-7,14,-7,2,-9,-7,-13,0,-78,23,-63,47,-21,1,-8,6,39,8,23,'
+    '0,-25,18,-9,3,3,-7,-3,-6,-21,-6,-55,33,-52,22,-11,10,7,2,113,-35,35,1,13,8,0,15,-13,12,-86,10,83'
+    ',17,-2,7,-21,9,-42,3,45,15,5,6,-19,0,-4,3,2,5,-30,7,-33,1,2,6,-54,15,-71,7,-48,-22,-26,6,-3,3,8,'
+    '9,-9,4,-65,-10,2,7,-108,23,-52,-4,-22,-8,-31,4,-7,-3,-11,-11,1,-10,30,-24,-16,-5,-16,-14,-14,-5,'
+    '-63,7,-3,-5,25,-6,-21,-3,-51,2,-28,7,-75,-3,-40,4,-85,0,-132,27,-5,12,8,9,48,2,-7,6,-42,5,-114,1'
+    ',-81,8,-116,2,-52,-9,-76,-3,-55,-8,3,-7,35,-8,-33,-12,2,-9,-4,-9,-32,-24,8,-7,41,-9,-5,-2,-35,3,'
+    '-12,7,-6,10,24,11,10,11,2,30,-33,11,26,19,-39,26,-19,5,10,-12,-14,-9,-65,-4,-75,12,-17,14,32,6,-'
+    '42,2,-7,-11,-80,8,-39,-9,-20,-13,4,-6,38,-3,63,7,15,-5,-10,-4,-91,-22,-53,2,-24,-11,-74,-7,-60,-'
+    '14,-127,-3,-77,-30,-57,-6,54,18,51,35,49,2,59,29,50,0,43,7,88,34,73,14,10,9,-7,6,39,6,14,9,93,19'
+    ',57,8,105,28,69,27,12,16,-37,8,-12,8,-28,-4,-23,17,-26,10,100,-18,5,-4,-3,-6,13,3,25,27,-1,6,-30'
+    ',-3,-13,22,-16,14,-28,-1,16,-7,-6,-4,-43,-8,14,8,-12,9,-6,16,-32,5,-36,-5,15,10,-15,7,-83,17,-64'
+    ',4,-49,-5,-180,3,-15,-2,-13,-15,-18,-5,-89,-4,-42,3,-3,8,26,-2,79,36,-15,6,-34,4,-79,2,-33,-5,-1'
+    '1,0,-6,10,-145,0,118,14,35,11,33,4,-17,10,-18,4,-74,6,-16,6,-63,8,-62,-10,-43,0,-52,-12,-109,-31'
+    ',-33,-17,-20,-4,-8,-9,1,-8,18,-12,-17,-14,75,-7,-8,-5,-76,9,-126,-6,-71,4,-6,-3,81,-24,21,-10,2,'
+    '-21,-31,-13,-10,0,16,5,17,18,-21,8,-90,13,-74,-15,-25,-1,-17,-10,-15,5,-85,-14,10,10,-9,2,-77,-1'
+    '4,-9,2,43,19,-50,6,-54,-3,-46,4,-7,-4,-41,1,-45,-7,-39,5,-16,-7,-13,5,-11,-10,3,-7,29,5,23,-6,16'
+    ',6,12,-4,47,4,-8,-5,-223,-19,-37,-7,-130,-6,-58,-13,-29,1,-58,-10,-106,-24,-50,6,-16,-2,-9,-6,2,'
+    '-4,53,-6,-5,-7,-56,-22,-21,-4,-45,14,-14,-9,-18,1,-9,-9,64,-6,80,-23,-33,-3,-24,8,-26,4,-22,-3,-'
+    '18,-10,57,-8,64,-36,36,-7,-45,-19,-74,-5,-44,-11,-3,-7,6,-4,75,-22,-4,-2,-86,22,-3,11,4,5,26,9,9'
+    '4,24,-14,7,-128,-7,-16,-9,-25,-1,-46,4,-120,-9,-172,-1,-124,-9,2,-10,-20,-11,2,-13,9,-14,25,-6,8'
+    ',-8,-18,-24,17,-22,27,-10,99,-12,9,-3,14,-17,33,-14,55,-6,33,-19,2,-14,-28,-26,-12,-18,43,-33,16'
+    ',-22,-8,-13,-16,-7,-43,-7,6,-12,-5,-7,-22,1,-18,12,24,19,11,17,2,24,-4,8,-14,5,-28,-6,-14,-20,-1'
+    '9,-15,-4,-14,-6,20,18,21,-10,19,8,26,66,19,25,22,-12,5,-35,4,-110,-4,-80,25,-10,12,-81,13,-53,16'
+    ',-94,1,-51,-6,-53,-17,-3,-5,8,-4,29,4,24,-2,21,-14,-4,-4,-64,-7,-68,19,-45,-2,-39,-10,28,-31,12,'
+    '-5,105,-24,43,1,30,-5,28,-24,23,-5,36,2,-6,-5,-70,-2,-73,24,-59,1,-7,-5,-19,7,-101,7,-40,7,-5,9,'
+    '19,10,3,12,-25,16,2,15,12,2,16,19,19,13,-15,16,1,12,-23,22,-22,5,-36,-4,27,-26,3,-29,-10,-12,-50'
+    ',-14,-82,-15,-58,-41,49,-22,73,-57,3,-7,-51,-40,-25,-38,-2,-9,33,-29,-11,-22,20,-9,38,3,45,-5,24'
+    ',3,37,12,58,0,147,-33,18,-1,35,-64,-34,-7,-12,-18,-2,-10,7,-16,125,-12,8,-4,-115,-2,-60,21,8,16,'
+    '-1,53,-13,13,-37,18,-28,20,-134,-12,-54,-11,-10,-9,-9,-24,35,-35,3,-30,-70,-36,-28,-41,-28,-14,-'
+    '109,-30,-10,-23,-25,-8,-71,11,-102,-2,-36,6,-79,18,-18,21,87,6,40,-16,41,6,-25,-8,-6,-7,34,-8,62'
+    ',17,20,-1,1,8,-18,20,30,-2,18,7,74,58,48,18,8,10,2,10,-3,21,45,30,-4,9,-74,25,-23,15,-5,18,9,33,'
+    '-2,31,-7,38,-6,10,23,19,0,50,-12,19,-50,16,-21,15,4,9,37,15,29,31,18,33,6,35,-36,10,-52,3,-43,9,'
+    '-176,-3,-9,2,4,8,-30,-2,-35,-29,-43,-66,-34,-33,-73,-27,-62,-13,-28,-20,5,-4,16,2,-18,-16,3,-8,4'
+    '4,2,14,-10,-13,-52,9,-11,-17,-10,-14,0,-13,-27,0,-8,10,-11,6,11,10,3,56,-11,39,-10,6,-6,5,-18,42'
+    ',-27,22,-5,38,3,-31,-38,-33,-22,-13,-4,-64,20,-58,24,-15,12,-58,8,-139,32,-13,-2,3,8,-74,20,-83,'
+    '15,-245,17,-35,-16,-28,-4,-11,-6,49,-48,20,4,7,-16,-44,-26,-59,-2,-3,-11,7,-9,-2,-4,-6,-7,-13,-5'
+    ',-63,9,1,18,26,12,-26,16,-5,11,-71,-9,-11,-9,-7,6,-104,-34,-109,10,-62,-8,-50,-20,-6,-17,-14,-2,'
+    '-24,11,-51,-6,-71,4,8,7,35,6,14,-2,10,6,-1,10,-16,9,21,21,-17,7,69,8,-69,1,-112,-27,-34,-12,21,-'
+    '2,17,-11,-5,-5,-27,-8,-22,2,11,9,-30,8,-129,-22,-154,-45,-41,3,-5,-3,18,-14,-5,-5,-18,2,-78,-12,'
+    '4,-13,-14,-17,-11,-30,-117,-18,-60,9,-33,30,-62,16,-4,6,4,7,59,28,116,9,-1,12,-79,51,-81,10,-103'
+    ',-3,-58,13,-14,-1,7,-6,77,-28,3,-8,3,-25,-37,-56,-8,-19,8,-6,43,-9,14,-16,6,-27,-39,-43,5,-13,-5'
+    ',-10,-26,13,-30,-2,11,13,-42,17,-63,0,-39,10,-73,-40,-79,-16,-36,-21,-51,-15,-7,-15,5,-10,48,-35'
+    ',16,-22,-38,-1,-21,-8,-9,-11,-19,-1,-52,14,-51,8,-13,7,-40,2,-48,23,-39,8,-26,-2,-9,-18,-26,-5,0'
+    ',-9,5,-6,60,-38,56,-1,21,-8,11,-23,1,-6,-10,-8,-53,-14,-108,19,-21,19,-50,19,-22,-3,-39,9,-17,12'
+    ',-1,15,9,5,-12,4,-3,19,-13,18,-26,23,21,11,16,26,1,9,-10,9,-29,18,-29,10,-75,10,23,5,7,6,-44,9,-'
+    '4,15,-32,4,-40,20,4,8,-30,11,-30,5,103,-7,-8,-7,30,-18,130,-19,-5,-4,8,-6,34,6,69,-21,147,-13,92'
+    ',-17,75,-3,64,6,81,17,42,15,67,38,9,8,7,21,1,9,-23,6,0,12,-7,5,-9,27,-59,12,-57,32,-6,1,7,-10,-2'
+    '5,1,-74,25,-40,4,-70,33,-187,50,-57,9,-28,-6,-78,9,-55,0,-24,-18,-30,-6,19,8,12,28,-47,-6,-4,1,8'
+    ',7,-2,2,-62,1,-5,7,-24,8,9,4,74,-7,7,3,2,9,-103,23,5,-11,-3,-3,-21,1,-12,-10,-12,-2,-84,10,-23,-'
+    '1,-5,-7,-8,11,-11,3,-15,-14,-40,2,-5,4,1,16,-5,4,-80,11,-2,6,115,-5,33,2,68,15,-1,13,-33,12,-39,'
+    '2,3,8,-17,8,-33,-5,-64,21,-27,0,-22,-10,-17,-26,-13,-6,-12,-19,-2,11,3,22,7,9,-5,3,-32,-2,43,15,'
+    '5,4,1,11,-66,10,-13,1,-36,-14,31,-15,-24,0,-13,-6,-19,-23,-40,-10,5,23,-8,3,12,7,5,11,-7,9,-15,-'
+    '3,-104,-57,-5,-10,-38,-13,-6,3,1,8,16,10,12,23,51,27,-7,5,-27,4,-18,-7,-50,17,-50,-18,1,-6,13,-2'
+    ',2,-5,-13,-4,-25,-17,-38,-9,-28,-15,-9,-15,11,-8,-5,-4,-30,12,-11,20,-26,7,-26,-3,-10,-8,-10,5,-'
+    '44,-8,-42,0,4,-6,40,-10,9,-7,8,-17,-4,-2,-50,20,-18,-1,-9,-11,-54,2,-7,-6,-2,-16,21,-17,-25,2,-4'
+    '4,-21,29,29,5,25,-7,8,-36,-13,-32,-40,8,36,-52,-3,-16,-9,-5,-10,-38,-7,1,-6,30,-9,-27,-2,-39,15,'
+    '-18,-14,2,-17,-40,-6,-15,-10,-6,-12,-10,-8,-26,-11,-25,0,-30,-10,-7,-6,7,-6,85,1,12,-5,-60,-8,-3'
+    '3,6,-23,-2,-19,-7,-3,-4,9,-14,13,-5,-13,-9,5,-12,-19,15,-6,17,-5,3,-69,-16,-3,-3,7,-4,25,-1,1,-4'
+    ',-22,-3,-27,5,-33,-16,-2,-14,7,-1,45,11,5,-4,-13,-7,3,-6,24,-9,20,1,-11,-8,1,-9,-18,12,-45,10,-2'
+    '1,-7,-31,-23,86,-1,13,-1,-1,-5,-64,-1,-67,-7,-23,-16,-23,-5,5,-6,26,-6,-34,0,-41,-15,-2,-10,-9,0'
+    ',-3,-11,5,-20,91,7,-36,-12,-89,-8,25,-14,-21,-1,-13,-5,-6,-9,-36,-24,-15,-21,1,-8,29,-10,50,16,-'
+    '41,-24,-20,-1,-15,9,-67,-20,-14,-7,-5,-16,26,7,7,-1,-11,-7,-29,-6,-66,-26,-33,-24,-23,-10,-15,-1'
+    '6,-25,-13,-4,-8,2,-3,18,2,15,-18,14,-1,87,26,12,8,-14,7,17,7,23,6,12,-3,3,-2,-28,-10,13,-2,6,-8,'
+    '-64,-18,-6,-6,9,-10,-42,1,-32,-8,-32,23,-38,-5,-16,-11,-8,4,8,7,-2,2,-30,6,-26,-5,-22,-10,3,-5,2'
+    '0,-2,5,-9,-37,-5,-9,-5,-2,-8,46,-31,-41,15,-11,9,-53,1,-63,-17,-21,-21,51,3,17,-4,64,6,5,-4,-56,'
+    '-6,-1,-6,16,-2,-12,-4,-61,8,-61,-2,-23,-16,2,-4,55,6,-11,-6,-50,-6,-17,7,-38,-11,-17,-16,-12,4,-'
+    '10,-3,-4,-13,6,-7,11,-2,86,-9,60,2,-26,-6,-45,-2,-55,11,-54,-2,0,-17,24,-17,17,-5,-34,-6,2,-18,9'
+    ',-6,34,-9,63,7,30,-4,11,2,11,14,6,-8,51,-4,11,1,5,19,11,6,-9,-13,5,-8,20,-1,-56,-12,4,-12,-4,-2,'
+    '-7,11,-19,8,-36,-6,-44,4,-97,-8,4,-33,7,-7,12,-7,41,12,-51,-24,4,-14,11,-10,40,-9,-20,-5,-28,2,-'
+    '4,-4,5,-7,-12,-25,5,-9,34,19,21,18,18,6,2,8,25,20,20,7,65,9,-28,-9,-19,-27,4,21,-5,5,-38,-18,-7,'
+    '-15,-34,-22,10,-7,39,3,-35,-9,-10,-7,-30,5,-17,-7,-6,-8,-11,-33,4,-7,19,1,20,12,86,26,-47,-25,2,'
+    '-11,-8,-9,0,-4,21,-11,26,5,-26,-13,-49,14,-5,-3,-4,-16,0,-9,7,-11,46,-24,34,-11,27,-1,3,-4,-13,-'
+    '10,17,-5,7,8,8,0,3,-1,-1,-7,10,-5,47,0,70,13,35,15,72,44,8,1,8,6,-9,5,35,11,4,4,-14,10,8,1,20,-1'
+    '6,24,7,10,-2,25,27,2,16,-5,8,17,7,-4,11,7,6,4,-37,19,-21,54,-8,2,-3,-19,1,-5,-9,6,-12,6,-39,-2,-'
+    '11,18,-3,2,-22,10,-12,15,-3,3,-25,15,-4,8,-25,9,2,10,-22,27,-32,15,-9,15,-16,16,-4,4,-10,-6,-7,-'
+    '20,-1,14,-18,-9,-2,-24,5,50,-54,-3,-27,-5,-7,43,-6,49,8,36,-3,17,13,-14,20,2,10,18,15,16,7,19,-2'
+    ',-4,10,7,3,85,3,20,-7,17,10,15,28,20,21,18,36,-5,20,17,23,-9,31,4,10,9,1,1,24,7,5,-12,22,27,6,-1'
+    '3,10,-58,5,77,1,48,21,83,25,8,7,4,11,21,4,-6,6,-43,-7,-17,4,32,8,69,32,2,7,-14,20,-31,12,2,10,-4'
+    '0,16,-20,18,-30,-5,-7,9,-23,1,-11,6,3,11,-8,14,-4,33,4,3,-6,7,-1,20,9,8,-2,6,27,-4,-10,19,14,30,'
+    '12,6,-20,10,-6,10,4,8,24,-6,39,15,-14,6,7,6,-9,15,29,-8,29,11,4,9,-19,1,22,6,8,12,25,3,-7,3,3,2,'
+    '21,-2,21,11,11,13,14,-6,1,9,22,-5,19,15,29,5,56,21,26,31,45,20,5,8,-13,8,-11,18,-14,9,43,32,-2,8'
+    ',-14,11,20,-6,-9,10,5,5,31,1,7,5,-3,6,23,2,-6,6,16,-1,4,15,11,11,14,-7,21,8,35,-13,12,5,47,4,20,'
+    '-5,35,3,16,-3,23,8,-5,-10,9,-9,57,-12,11,-7,-9,-34,8,-4,3,-9,-14,-6,6,-9,-35,2,-38,-8,-28,-28,-6'
+    '3,-39,-5,-9,-11,-1,-73,-35,-23,-3,0,-7,-13,-9,-8,1,3,-6,-11,0,8,-13,-42,-10,-35,-1,10,-16,-18,-1'
+    ',-1,-8,-32,-21,-4,-12,7,-21,15,-7,2,-6,-8,-29,12,-8,23,-32,-11,-4,7,-7,-6,0,0,-20,-15,-31,8,-37,'
+    '17,-7,20,6,4,-8,41,-11,32,-2,-7,-10,8,-5,-15,-7,2,-13,29,3,12,16,4,-1,8,-11,21,-8,-1,-5,-23,-14,'
+    '6,-1,16,2,28,15,99,3,15,9,56,8,50,14,10,-6,28,7,-8,13,24,-6,18,1,19,20,3,-2,-8,-13,1,-6,68,13,25'
+    ',-8,72,11,33,11,14,-7,-3,-12,-13,5,15,-16,43,-19,65,1,26,-17,19,-7,-1,-6,-4,-3,-97,13,-20,-17,-2'
+    '0,-2,-23,4,-19,-16,-27,9,-5,-6,5,-17,-17,-14,-92,4,-35,10,-111,9,1,-8,-8,-4,-106,-5,-20,-9,-13,-'
+    '1,3,-8,-30,-1,-29,-8,3,-9,-5,-8,5,-3,-9,-8,7,-13,18,0,-15,-7,-2,-6,18,-15,8,-15,34,-9,13,2,10,9,'
+    '19,-3,2,-5,-6,-4,-3,-15,-16,-33,6,-13,2,-40,-45,-24,-28,-4,-36,12,-15,23,-49,28,-10,12,-82,-15,-'
+    '27,-25,-11,-30,-28,-20,-4,-18,-2,-38,5,-45,18,-35,-5,-52,-30,-3,-30,7,44,37,8,27,-10,-22,-33,-30'
+    ',-28,-15,-43,-3,-3,-17,-8,-12,-30,-20,-15,-4,-57,-2,-17,6,-23,31,36,-11,-4,5,-44,16,-23,0,-83,-1'
+    '1,-37,-13,-33,-5,-37,-26,-90,-15,-91,-22,-13,1,-42,20,0,-7,9,-6,1,-12,63,-6,2,-18,-63,16,-8,5,-5'
+    ',17,-10,13,-27,-1,-30,14,-12,13,-45,6,-47,-30,-31,-2,-40,-21,-55,7,-4,7,20,10,5,10,-5,10,-28,-6,'
+    '-37,12,-15,-3,-7,8,-27,-2,16,11,-1,9,-13,11,-14,3,-4,12,2,4,-4,3,-24,4,22,23,-8,22,43,27,-12,8,2'
+    '8,3,14,34,11,7,11,-8,21,4,11,6,7,14,-8,8,-36,0,-21,10,2,38,22,24,2,21,-10,11,4,9,13,9,-35,-12,-3'
+    '0,-4,-53,-41,-81,-6,-34,-26,-1,-10,20,-9,30,7,22,29,12,2,14,-3,-5,-31,-13,9,-18,-5,-15,-11,-7,-1'
+    '3,-12,6,-39,5,-4,-47,8,-16,-7,-38,49,-18,5,-26,-10,-3,9,-14,2,-20,28,-25,-1,-7,-30,-7,-1,-11,14,'
+    '2,13,-5,-1,-26,8,-7,33,-7,32,-26,15,-5,-19,5,-38,26,-31,-2,-28,4,-9,-10,-3,-39,-1,12,-16,10,-13,'
+    '-18,-9,4,6,7,-16,15,-38,1,-42,-5,-10,-9,-6,-18,15,-10,-23,5,-15,11,-76,-3,-53,-14,-17,-17,-30,-1'
+    '4,-17,-5,-12,3,-29,-63,-45,-38,-8,-12,23,-20,-18,-1,27,-13,-13,-1,-40,14,-29,-6,14,-9,23,-4,19,3'
+    ',22,-5,-35,-4,-45,4,-98,-32,-68,-13,-10,-5,-9,-15,-3,-45,4,-4,-18,-16,-16,-9,-63,-14,-43,-16,-8,'
+    '-14,2,-5,29,-6,-58,-15,-98,9,-9,10,-3,19,-60,0,-1,-8,6,-11,23,-29,1,-39,9,-11,10,-5,-44,-2,-9,7,'
+    '-9,-12,-8,7,-37,0,-24,-11,-31,25,-23,5,-24,-3,-24,-10,-35,0,-47,-9,-19,-8,-4,-9,4,-9,33,1,15,-7,'
+    '-34,-1,25,-12,-35,-13,25,-7,12,-15,41,2,46,-13,28,-2,20,-9,17,3,6,-3,-7,-6,3,-3,22,2,12,-6,-10,-'
+    '9,3,-7,15,-3,37,3,24,-9,-29,5,-12,-5,-5,-6,18,-12,-7,-17,30,-36,40,-16,24,-4,5,-38,7,-19,-18,3,1'
+    ',-6,41,-24,15,-38,9,-9,-14,9,-14,29,-25,15,-11,-37,-6,-49,10,9,7,-7,-9,-3,-8,-10,-23,-100,-15,-1'
+    '2,-36,-9,-35,-2,-54,12,-17,-8,-55,15,-92,-10,-115,16,-18,7,-23,-6,-98,-4,-20,4,-24,15,-20,2,-56,'
+    '-18,-3,-4,4,-10,-11,-4,-31,-8,-20,1,-31,-16,-6,-19,20,-17,11,-1,-11,-14,1,-7,22,5,0,-17,8,-6,-9,'
+    '-12,13,-2,-20,-16,1,-16,10,-1,-11,-18,4,-5,9,-1,-5,-5,0,-9,15,-47,-2,-34,-19,-49,-2,-8,5,-6,-31,'
+    '-58,-22,-20,2,-9,-13,-45,1,-7,11,-3,22,4,19,28,16,6,-15,-8,-8,-25,-23,-9,4,-21,41,7,13,-10,-21,3'
+    ',8,-27,-8,-22,9,-23,-2,-30,-19,-40,40,9,77,-11,34,16,52,3,11,8,-2,-9,39,-24,9,-12,8,8,10,0,-19,-'
+    '18,3,-9,11,-4,4,-17,19,-24,41,-16,17,4,2,8,8,-2,19,29,23,8,27,1,30,21,54,4,40,-5,28,5,36,-5,34,1'
+    '2,14,-1,12,-7,8,3,17,17,14,28,16,16,31,17,51,2,10,5,-10,8,1,6,13,22,3,16,10,5,3,12,72,44,-5,6,-1'
+    '8,7,-17,17,-13,46,25,36,68,73,29,11,-18,10,32,24,105,23,23,18,69,30,25,17,-1,14,-9,8,2,10,14,3,-'
+    '22,30,-5,25,1,8,21,27,65,37,14,3,17,-11,49,-11,35,7,1,-7,25,-3,9,-11,26,-5,14,-8,31,-3,45,13,15,'
+    '17,54,33,74,18,55,47,22,7,52,-10,44,-22,46,-15,13,-44,20,-31,-1,-23,20,-3,9,-14,37,-26,1,-8,-8,-'
+    '4,4,-3,16,3,34,-13,17,-21,27,-14,55,-47,22,-6,24,-17,16,5,48,-5,13,-11,19,-26,-1,-6,27,0,15,-8,-'
+    '12,-13,43,7,18,-20,4,-9,-6,-7,2,-7,34,-17,30,-2,10,-6,33,-64,9,-33,10,-8,-1,-18,-23,-5,-9,-10,2,'
+    '-13,-8,-18,-12,-4,-6,-8,1,-15,7,-9,34,0,22,31,27,16,1,30,6,9,33,14,15,-2,7,8,-6,38,-29,20,-22,6,'
+    '-8,11,1,11,14,28,26,32,10,5,15,-1,8,-10,14,-6,47,-6,21,-34,26,-12,15,28,-3,12,-51,44,-48,18,-37,'
+    '22,-55,17,-65,28,1,11,24,14,4,5,-3,9,-20,4,-79,-1,-63,31,-53,45,-21,49,-24,39,-87,42,-29,23,-15,'
+    '50,3,11,10,-3,8,5,6,12,-13,7,-16,20,4,21,22,10,5,-1,-11,-7,7,-1,53,18,18,13,26,-6,16,6,15,-14,-2'
+    '6,-15,11,-37,23,-27,11,0,27,32,7,18,24,-4,30,-22,6,-11,-1,-26,8,-11,49,-33,-35,-1,7,-9,31,-26,44'
+    ',-25,5,-14,40,2,51,-15,82,-54,-50,18,-17,-2,77,-21,70,-37,13,1,-2,-6,26,-13,23,-19,7,-11,39,-16,'
+    '0,-15,-14,-22,4,-18,-2,-31,-12,-27,12,-25,-14,0,16,-20,37,-17,11,-17,4,-16,19,-16,11,-22,17,-7,3'
+    '1,-25,34,2,3,-11,-4,-2,-22,4,-11,-1,-1,-6,1,-6,9,-3,12,-13,12,-27,7,-3,12,2,3,12,14,-17,50,9,35,'
+    '-5,10,8,41,-21,26,-3,9,-7,-6,-6,-23,-2,3,-9,-7,1,-29,14,-74,22,-16,-15,-26,2,-9,-17,-19,-14,17,-'
+    '12,4,-10,24,-13,11,-15,1,-8,-11,-11,0,-12,16,-22,15,-12,7,25,12,4,30,-33,-1,-19,12,-6,0,12,12,21'
+    ',11,1,6,0,20,-26,18,-8,-12,19,2,21,-33,69,5,5,24,-11,14,-15,33,13,-9,12,-20,4,-5,18,-10,10,49,13'
+    ',43,-35,9,3,0,6,-4,37,-5,14,-29,7,-11,14,-20,4,-12,13,-68,21,23,3,27,14,-10,-1,-8,14,-5,9,8,5,7,'
+    '2,17,-7,-4,-13,3,-3,18,7,-10,19,-25,20,-14,24,-25,24,4,46,29,9,-7,-10,5,-9,41,-18,9,-23,23,-7,4,'
+    '4,-24,16,-4,10,4,4,23,-4,18,-20,11,-5,5,5,-3,9,-25,18,1,4,18,3,25,-8,18,-13,-13,18,-18,8,-16,1,-'
+    '4,6,5,6,-14,14,2,7,32,-3,40,23,31,-9,31,13,15,-6,61,-9,15,-7,10,-16,68,2,-7,-9,-27,-9,-20,-14,-5'
+    ',-23,13,4,44,38,49,19,17,15,7,13,43,2,24,9,61,-11,18,4,10,22,-86,32,-21,30,-1,20,-27,30,-23,12,2'
+    '7,24,14,4,4,44,20,21,19,3,15,-4,9,11,10,48,-1,32,24,27,-8,0,12,24,-4,11,4,5,17,1,-5,-5,3,-13,-3,'
+    '-4,51,8,17,50,-6,20,-7,6,3,12,19,1,40,14,44,40,14,28,60,8,16,15,-3,-12,34,-1,4,28,-15,28,18,-23,'
+    '0,-20,10,-14,31,-8,23,6,-22,-15,-81,8,16,-8,30,-4,-2,-7,-21,-4,5,-4,21,-2,44,-18,72,10,23,-12,16'
+    ',4,7,-15,-38,-18,-14,-2,-63,-35,10,-7,31,2,27,-16,20,0,17,-9,5,-19,-16,-36,21,-12,25,-4,37,15,19'
+    ',18,25,9,37,-1,6,10,21,8,11,12,21,0,19,-9,52,6,6,16,13,16,-41,6,-16,-8,-18,3,-37,-8,-20,13,-24,2'
+    '5,-16,29,-1,20,21,8,17,17,6,-7,-1,-9,-22,-18,20,10,14,18,43,24,45,4,28,10,23,-5,26,17,29,4,20,15'
+    ',64,1,40,16,18,2,-21,-11,12,-1,26,4,9,9,18,0,9,-16,-2,-7,-83,-23,6,-15,-27,4,-26,-8,-20,2,14,-23'
+    ',17,-2,41,-30,-31,0,-10,-16,-1,9,-6,3,-8,-5,-9,-20,-23,-24,0,-6,6,-1,-2,-11,-44,-11,-34,16,-15,-'
+    '6,22,-8,-32,-10,1,-4,57,-18,15,-18,15,-9,20,-4,15,4,33,-28,54,-13,61,-39,54,-43,59,-32,38,-9,22,'
+    '-13,7,-10,29,-9,7,-8,27,-69,0,-15,-6,-11,-29,-29,-114,-46,-46,2,-38,13,-105,-19,-47,8,-14,8,-70,'
+    '10,-8,10,-21,8,-13,-1,-14,-9,-10,1,-23,16,-13,25,-13,3,-36,-8,-26,10,-18,16,3,14,-14,3,-26,-10,-'
+    '137,6,-107,-29,-22,-14,-63,-27,-11,-16,-10,-5,-44,-3,-47,12,-42,-5,-77,7,-10,-21,6,-7,25,-13,49,'
+    '-5,-89,-13,-17,-10,27,-11,-5,-3,-105,-2,-3,1,6,11,-12,2,-14,-3,12,-10,-12,-5,-25,-1,-15,6,-5,8,-'
+    '16,-1,-11,-5,-27,0,-43,-38,-13,-3,-7,-52,79,8,-22,-26,17,-17,-4,-16,20,-7,-10,-11,-15,-7,15,-23,'
+    '23,-3,-28,-8,-13,5,-6,-8,-7,8,-1,14,-15,8,-6,-2,4,-25,-8,0,-5,-9,29,-13,10,5,20,-15,35,-7,-1,-25'
+    ',-15,-7,8,-6,7,-21,30,-14,2,-9,-24,-3,-5,-5,1,-10,9,4,89,1,-23,-20,-54,-8,-2,-4,9,-3,54,7,-6,-12'
+    ',9,2,19,16,18,-1,34,-12,15,4,7,-3,10,-29,8,-8,47,-16,54,15,16,-7,6,3,11,26,2,27,6,7,60,-5,78,-28'
+    ',36,-36,41,-14,14,6,76,8,26,12,35,30,40,22,69,-24,15,2,12,12,39,19,13,-10,1,-15,-38,-35,15,-31,-'
+    '12,-15,-8,-28,14,-15,4,-20,-5,-27,9,-40,-18,-11,-15,-19,-4,-22,-50,-95,-43,-118,-20,-31,-30,-29,'
+    '-51,-17,-48,-5,-6,9,-53,-10,-35,22,-3,0,6,-9,-7,-8,-11,-3,-9,13,-24,7,12,19,25,-14,-25,20,-37,-8'
+    ',-44,14,-8,-14,-44,-4,36,15,-52,-11,-18,-20,-29,-3,-50,-30,-36,-10,-56,22,-54,5,-14,10,-29,1,-29'
+    ',17,-48,9,-88,15,-51,-11,-15,2,-21,35,-14,10,-75,3,-33,15,-51,5,-18,12,-2,29,-90,30,-47,2,-8,0,-'
+    '22,-14,-36,-2,-44,-20,-50,-36,-15,-22,-4,-18,3,-26,18,-36,1,-12,-14,-28,-42,-39,-30,-12,-35,0,-2'
+    '7,13,-48,36,-36,15,-105,28,-66,5,-41,17,-21,23,-14,31,0,19,-18,23,-67,12,-35,20,-62,11,-26,9,-53'
+    ',-11,-47,6,-47,23,-61,16,6,6,-11,6,-7,19,-12,7,-6,-10,-18,-2,-1,18,-26,-3,-14,7,-15,12,-11,21,1,'
+    '15,63,47,43,56,-8,10,-4,29,-41,26,-8,14,-2,22,15,17,16,7,17,25,16,13,-8,20,-10,-1,-18,-13,-20,-5'
+    ',-16,-15,-12,5,4,9,-14,16,1,18,-32,4,2,-7,-7,-4,-5,7,6,10,-15,3,-55,-15,-32,-19,-91,-14,-48,20,-'
+    '23,3,4,-12,-31,-5,-35,8,-9,9,-16,-4,-8,-11,-19,-8,-76,-21,-54,25,-98,0,-26,-10,-55,-2,-38,-18,-1'
+    '33,-8,-29,-8,-66,-28,-16,-10,-20,-23,-38,3,-49,-19,-42,-31,-57,-27,-93,4,-13,28,-24,-17,-18,-3,-'
+    '30,7,-64,-12,-30,5,-21,7,-41,33,-9,14,0,11,6,4,-12,3,-22,-10,-30,-4,-43,-101,-55,-81,-66,-33,-74'
+    ',-27,-21,-12,-74,-68,-10,-48,-32,-38,-14,-29,-2,-57,-5,-13,23,-27,3,-10,-5,-24,-53,-73,-29,-32,-'
+    '59,-35,-47,-40,-44,-18,-96,-22,-23,-25,-40,-92,-37,-25,-22,-7,-24,-17,-6,-9,-5,-23,-27,-53,-11,-'
+    '68,-14,-17,-15,-7,-40,-41,-31,-23,-8,-17,18,17,1,-5,-42,-69,4,-7,-13,-20,-6,-24,-15,-26,-17,-6,-'
+    '11,-11,-14,-26,-17,-104,5,-5,5,23,7,7,5,-2,26,-46,6,-3,3,11,10,-6,22,-42,-7,-44,-16,-32,13,4,-6,'
+    '-10,-14,-5,30,-36,13,-48,5,-63,-5,-34,-38,-95,-8,-31,-3,-56,-27,-44,-31,-37,-39,-16,9,-11,3,7,7,'
+    '1,18,-9,9,-16,11,-8,17,-31,1,-9,17,4,-15,-14,18,-21,6,-23,9,-11,9,-1,21,11,57,5,14,-3,-73,-9,-3,'
+    '-10,-22,-1,-15,3,-11,18,-8,-5,-7,-9,5,-19,0,-52,3,-4,4,1,10,12,16,-11,-24,-5,-10,-9,7,-12,27,-15'
+    ',20,4,-9,-19,19,-13,22,2,-2,-15,12,-3,39,18,24,-1,11,4,-2,-6,-11,-4,-21,0,-8,-9,9,-16,18,7,11,-3'
+    ',5,-6,-36,-10,-5,-9,13,-3,-4,-5,0,-11,7,-7,10,1,0,-13,17,11,-4,-13,8,-21,3,0,9,17,11,-4,10,-24,9'
+    ',8,-2,-22,18,-30,26,-12,12,1,10,-17,13,-8,7,-2,6,6,3,-29,-3,-10,12,0,13,-12,17,-25,-3,-9,3,-9,21'
+    ',-11,-15,-4,-2,-14,5,-12,9,5,20,0,-20,-21,-17,7,-1,-6,12,-22,13,-1,6,-5,11,-33,15,-10,13,-2,9,5,'
+    '-3,-8,8,-12,-6,-16,76,-30,44,-40,44,-22,6,-16,51,-23,115,-103,87,-46,72,-24,69,32,94,34,85,12,-3'
+    '1,2,9,6,26,-1,12,-6,86,9,-8,3,-49,-2,6,4,43,3,14,-2,11,-7,52,-9,15,22,5,0,-2,-15,15,-7,-19,2,-4,'
+    '-4,85,-18,31,-17,9,0,50,28,70,19,45,27,61,26,49,0,20,5,16,24,20,10,98,18,105,7,9,12,29,8,3,-2,-3'
+    '0,-15,68,-2,30,-6,43,-32,23,-26,2,-13,6,-4,16,11,2,-9,11,-1,-24,-4,-2,-4,19,-13,16,7,-5,-9,-13,-'
+    '4,0,-14,11,-5,-10,-2,11,-29,10,-19,21,-19,28,-17,13,0,0,10,6,4,-1,-12,29,3,3,14,5,-14,23,3,-7,10'
+    ',-2,25,15,-33,9,1,14,11,1,11,-8,10,20,-17,18,1,7,10,4,-10,7,-3,65,3,4,10,-8,26,18,-17,14,0,-4,-1'
+    '4,4,-8,12,2,-3,12,10,-9,16,-3,-1,-19,9,-27,43,-17,7,8,-2,7,7,-4,14,3,-5,-9,10,-12,-11,2,-7,-7,8,'
+    '-19,13,1,-10,-8,21,-23,7,-23,-13,-54,-4,-47,3,-14,-18,-36,-14,-13,-10,-30,21,-9,2,-47,-12,8,-17,'
+    '-5,-1,-6,23,-25,23,-11,22,0,-19,-6,-1,-9,-33,12,-12,18,-5,-5,4,-35,-4,-29,-16,-22,-19,-12,-13,-2'
+    ',-12,12,36,-71,14,-8,15,6,-5,-20,15,1,5,-5,2,-4,-20,-3,-28,32,22,-42,1,-10,21,-6,0,-7,-18,6,23,-'
+    '26,9,-21,44,-18,-6,-4,-28,12,4,-5,59,-49,29,-39,31,-26,8,-17,75,-74,4,-19,22,-28,14,-28,3,-15,-5'
+    ',-16,8,-18,21,-19,23,4,18,11,21,-1,-28,-14,-51,-12,24,-47,30,-36,4,-28,52,-114,-2,-32,-31,-32,4,'
+    '11,-4,-2,-5,-13,16,-34,5,-31,12,-30,17,-26,4,-16,18,-21,13,-42,-6,-76,-10,-31,-27,-40,-44,-26,-8'
+    ',-25,-35,-41,-5,-32,-12,-28,-10,-60,-26,-87,-12,-21,-15,-11,5,-16,2,-51,-10,-97,6,-53,26,-47,42,'
+    '-46,58,-110,13,-15,28,-74,39,-55,13,-30,35,-42,14,-26,6,-36,-2,-11,-6,4,-4,-9,7,-31,3,-92,34,-83'
+    ',1,-70,8,-23,4,-36,17,-19,-1,-28,16,-49,43,-69,76,-67,26,-37,21,-39,40,-104,33,-58,53,-72,10,-38'
+    ',2,-38,-8,-15,-13,-10,-8,-3,-7,7,-12,-12,14,-32,27,-27,17,-30,4,-17,-12,-5,-2,-13,2,-12,11,-16,4'
+    ',24,25,3,6,-3,2,-25,27,1,5,-7,9,1,9,-8,-3,-13,9,1,24,-14,39,-4,51,33,46,9,36,-4,44,4,46,30,30,6,'
+    '72,-7,32,9,11,0,90,-18,23,0,17,20,17,1,40,-8,7,3,1,16,16,11,18,3,44,-5,65,24,28,16,109,74,41,33,'
+    '62,62,49,35,50,61,87,133,44,44,25,10,26,22,24,42,13,59,19,53,4,25,6,75,-3,-1,-7,-18,-26,27,20,36'
+    ',17,15,39,23,164,61,17,11,28,37,10,35,-5,4,-3,-7,-9,5,21,84,-9,30,5,36,-5,18,-3,0,-8,-33,-6,5,1,'
+    '36,-6,39,-14,25,-1,20,-14,39,-27,34,5,65,-11,12,20,-12,10,1,42,32,48,50,27,15,12,-2,2,14,7,-7,7,'
+    '2,14,25,36,39,4,14,57,42,63,33,53,19,21,1,20,7,16,18,60,35,-5,15,19,6,12,16,1,9,45,51,9,21,-3,14'
+    ',7,5,1,14,14,14,0,7,-2,25,-4,5,-5,0,-8,-12,-1,15,8,18,-12,4,0,5,-5,66,3,9,-1,39,-13,0,1,8,10,8,3'
+    ',18,-3,11,-6,4,4,49,-10,34,4,21,-7,12,14,26,-2,14,8,10,-11,6,12,11,-22,31,-31,19,-10,0,-12,14,-1'
+    '3,2,5,9,-15,50,1,22,-19,25,4,8,-11,14,-8,28,14,43,-1,20,-10,6,-4,-4,0,27,26,50,-8,14,-18,7,-16,2'
+    '5,-26,23,-7,26,2,19,16,36,25,85,6,6,9,-2,11,15,33,69,4,21,13,23,13,10,7,23,-1,20,10,19,12,7,24,2'
+    ',17,15,11,20,-3,17,6,-4,5,11,11,-3,28,11,34,44,25,46,174,183,61,53,59,42,113,67,83,81,110,121,10'
+    '7,167,18,61,44,69,18,49,25,24,33,65,39,58,11,91,28,9,17,-4,1,3,-2,6,-18,7,0,-7,-16,-4,6,5,5,17,-'
+    '6,68,17,49,-46,15,-15,-4,-17,-21,-36,-20,-47,-8,-58,-18,-16,-2,-33,7,-55,-18,-31,-3,-31,6,-83,-4'
+    '2,-75,9,-88,-40,-55,-1,-11,4,-43,31,-22,26,-19,31,-28,22,-25,2,-37,-9,-2,7,12,-1,16,18,25,9,29,2'
+    '0,7,16,-6,18,-22,29,-5,16,-8,8,-3,-9,-17,5,-7,16,-21,20,-12,-1,-15,38,-59,39,-48,64,-38,12,-25,1'
+    '9,-35,8,-12,14,-4,18,-18,14,-7,-15,3,-12,-3,-8,-16,33,-5,7,-7,1,-9,26,-12,13,-16,81,-23,70,-34,6'
+    '4,-29,22,-8,-4,-28,31,-45,26,-22,76,1,21,-7,33,4,44,-9,42,1,12,11,-6,0,7,-33,48,-6,43,-4,8,-42,2'
+    '9,-18,24,-32,11,-21,21,-18,49,-2,34,4,14,24,2,-30,21,-29,33,-62,121,-61,96,-11,53,-15,16,-15,27,'
+    '0,29,-35,31,-54,72,-6,39,-24,31,13,22,-2,8,10,4,15,-45,41,-54,12,-41,51,-52,29,-22,17,-7,18,26,5'
+    ',34,17,40,12,51,23,29,-19,-105,-16,-36,0,-9,10,7,36,-4,10,-6,24,-30,16,-30,18,-17,9,-19,40,-48,2'
+    '7,-49,16,-6,8,-29,16,-11,23,-35,12,-33,-9,-14,36,-53,38,-10,37,-28,17,-20,25,-40,9,-26,14,-17,-6'
+    ',0,13,-11,5,-18,4,-20,-11,-51,16,-36,-6,-21,19,-34,45,-58,15,-10,20,-2,40,-28,14,-17,14,-6,36,-6'
+    '8,11,-40,20,-23,23,-44,63,-58,9,-31,32,-38,9,-29,5,-42,-12,-38,8,-32,-1,-6,-9,6,-4,-10,20,-10,8,'
+    '-19,-2,-12,17,-62,0,-19,14,-15,5,-17,-5,-42,25,-43,1,-14,14,4,30,-12,43,5,26,15,14,-6,28,6,12,18'
+    ',23,7,27,27,113,13,62,19,22,20,36,19,29,-5,39,5,26,22,12,19,30,18,56,19,26,2,36,19,79,19,90,43,-'
+    '5,30,7,21,9,12,25,18,72,25,31,4,46,25,50,2,20,-7,29,8,22,28,-2,27,22,25,90,15,17,18,11,42,17,16,'
+    '35,15,50,6,13,6,-10,66,15,56,24,33,7,2,8,1,-4,-18,26,-1,43,70,47,39,45,81,0,20,-28,7,-11,8,-40,4'
+    '7,-26,39,-19,12,-26,-2,-20,10,-90,20,-31,23,-27,32,-27,55,-1,55,-6,8,7,15,4,55,-10,-11,-15,-3,-2'
+    '2,-42,-42,-29,-42,-46,-35,-23,-35,-53,-25,-11,-35,-10,-115,8,-53,-18,-28,4,-5,6,-2,18,-11,0,-5,9'
+    ',-8,-5,-22,5,11,19,-1,4,-14,4,16,6,18,38,-12,47,8,26,-3,12,-28,25,-26,-17,-25,-58,10,-51,-5,-10,'
+    '-7,8,-17,22,-10,33,-22,20,-21,49,13,-1,5,21,-3,9,-15,13,-2,15,14,-2,-16,17,-27,13,-18,19,-13,3,-'
+    '23,26,6,5,-33,14,-11,9,3,8,-2,10,-18,23,-29,63,-16,22,-13,38,-33,3,25,23,17,-5,-13,27,-3,17,16,3'
+    ',31,-10,22,9,16,1,9,8,-3,21,3,7,12,5,-4,6,22,-4,3,-6,-6,-3,-14,2,-5,-3,3,-4,52,-30,43,18,9,-1,10'
+    ',-28,48,-50,3,-27,20,-9,-1,-19,19,-14,3,-22,19,-29,0,-9,31,-27,44,-4,45,-20,21,-30,29,-18,47,-20'
+    ',6,-9,20,-12,54,-3,39,-19,26,5,39,23,13,-2,23,21,29,6,18,10,24,6,37,-7,18,-14,13,-19,6,-43,23,-5'
+    '8,40,-7,7,-7,14,4,26,-10,60,-4,25,-13,41,6,16,-8,78,-9,11,13,8,-3,7,-13,75,-18,12,10,38,-7,18,3,'
+    '11,6,12,-9,34,13,83,-5,1,9,6,5,16,4,22,-5,12,6,9,-7,51,-15,12,13,63,6,27,-1,55,10,24,-1,-11,6,-2'
+    '3,-2,9,10,21,-1,27,-35,0,-37,47,-10,14,-59,25,-29,9,4,2,-11,15,2,4,7,9,-7,9,2,8,-10,5,11,6,-26,5'
+    '5,25,-36,-28,22,-38,18,-14,42,-20,42,-9,46,19,22,-1,15,15,2,-9,-7,-3,-26,-40,-17,-2,-19,-10,-9,2'
+    ',-7,-7,-11,1,-27,-12,-23,15,-7,-5,-1,-10,22,-30,56,-48,28,-33,46,-34,23,-10,30,0,100,42,23,37,1,'
+    '13,-5,7,-17,9,23,27,4,10,-13,8,41,1,22,-5,-26,-7,-3,-18,18,-1,-11,-9,-5,-18,30,-1,27,6,-30,-13,-'
+    '20,-16,12,1,-11,-10,7,-19,12,-6,8,-45,-22,-84,6,-25,7,-6,-4,-7,3,-9,20,-8,-18,2,-1,-22,3,-10,14,'
+    '17,4,-13,-13,-38,11,-54,17,-48,18,-116,14,-41,20,-34,5,-5,10,0,-6,-9,16,-17,-13,0,8,-9,7,-24,43,'
+    '-58,12,-44,17,-38,10,-59,18,-52,25,-50,32,-36,20,-34,20,-58,28,-58,0,-11,15,-17,11,-38,-8,0,-4,2'
+    '9,-10,10,8,-48,23,-55,52,-58,23,-17,22,-7,54,30,7,13,6,38,23,22,56,16,43,-8,-13,9,-26,5,-10,12,2'
+    ',12,32,47,-1,13,6,9,22,7,31,-1,1,88,-5,14,-11,-3,10,14,-4,13,11,41,28,46,9,24,11,67,-28,25,10,10'
+    ',15,-22,-20,72,7,27,-13,59,5,25,19,39,9,8,27,11,13,-3,5,-10,15,-1,5,12,10,8,16,38,11,3,36,-4,50,'
+    '23,10,22,-8,16,8,16,84,51,45,46,45,22,59,67,8,17,46,38,21,12,-7,5,-19,-9,7,17,25,13,6,-2,0,-12,-'
+    '6,-5,8,-1,64,21,9,9,-6,6,13,-4,12,16,25,14,1,11,22,28,-14,41,2,13,24,26,58,15,27,18,21,29,-20,14'
+    ',-2,11,5,-10,21,-13,-14,-45,6,-5,13,-2,4,14,16,-15,13,5,-1,17,7,29,10,-11,-5,-28,6,-15,11,16,5,-'
+    '9,14,0,-3,18,-7,11,8,0,2,15,4,-22,14,-15,12,0,15,19,-2,37,9,-51,24,21,7,41,11,8,-10,-16,3,-19,3,'
+    '-10,26,14,-12,-14,-2,-13,9,-7,7,1,13,22,23,21,3,10,-18,39,2,13,9,2,-8,15,13,8,-1,14,-7,8,-13,2,-'
+    '12,9,29,-4,4,17,6,-56,29,-43,27,4,26,24,5,-17,27,-41,6,5,-4,-12,19,-55,5,-51,25,-38,41,-49,2,26,'
+    '15,-22,-10,-13,4,-3,5,-3,16,26,3,-3,-5,-19,8,-1,-10,-11,13,-21,6,-1,1,5,-4,14,9,3,16,-3,17,-13,1'
+    '3,0,-10,-13,13,-8,10,-17,16,-9,-4,-11,-14,-9,-9,3,-15,13,-9,-3,22,-34,22,-13,4,10,-3,15,10,14,3,'
+    '-40,18,-15,-8,-1,26,-53,16,-63,-3,-26,-9,-17,-12,-50,-8,-12,-5,-50,8,-1,14,8,23,25,3,17,-4,-61,1'
+    '4,7,9,21,5,-36,24,1,17,27,1,-11,-6,-23,9,-4,29,26,8,19,25,8,3,9,28,10,-8,13,-5,20,6,0,3,-17,15,-'
+    '10,19,6,15,15,14,32,-6,17,6,10,-6,10,35,-30,1,-21,17,-37,35,5,-10,-11,-5,-44,13,-14,10,-102,6,-1'
+    '2,7,2,8,-11,-9,5,-2,-5,9,-31,10,-18,-3,-17,4,-28,4,-6,5,33,5,-25,33,-57,8,-50,-4,-22,6,-9,-8,-10'
+    ',10,-2,-6,-49,5,-2,11,6,8,-6,-14,-13,0,-35,-6,-11,0,-14,-22,-31,6,-57,4,-8,14,16,-33,-90,-4,-32,'
+    '-9,-20,0,-35,7,-19,11,-5,8,14,8,2,12,-8,9,-20,26,-17,3,-17,10,0,8,-10,10,-25,8,-4,16,3,-5,-14,17'
+    ',-11,-2,-23,17,-13,25,-31,22,-46,1,-39,12,-55,14,-39,0,-28,19,-35,-8,-5,58,-72,5,-24,-5,-12,22,-'
+    '21,26,-11,37,-32,40,-21,18,-18,63,-31,12,-22,7,0,14,12,30,0,-1,17,20,-26,10,6,1,6,-32,78,-16,32,'
+    '-27,19,-10,16,1,59,-9,25,11,62,-2,28,-3,18,-22,41,-22,26,-45,34,-19,31,-24,7,-30,23,-30,40,-20,4'
+    ',-28,-5,-43,32,-17,1,-26,41,0,13,10,4,6,-5,-4,-17,10,-1,6,-26,11,-5,-10,21,-17,83,-12,24,-3,-8,-'
+    '14,16,-15,70,-12,2,-33,-10,-14,6,4,14,-13,32,3,45,-2,14,32,57,14,57,36,71,-3,52,13,36,-10,19,3,1'
+    '1,22,13,30,3,6,6,36,-14,-10,-72,4,-6,5,-3,14,5,35,-5,28,7,31,-16,20,-20,3,6,8,-14,20,-14,5,9,17,'
+    '-19,15,-31,4,7,5,-6,1,-12,12,-13,-4,-25,6,-30,20,1,18,23,12,-9,7,-17,-4,-13,-14,-9,-1,-7,6,-5,7,'
+    '-4,18,7,3,8,7,-7,32,-5,40,-37,14,3,7,-9,16,-4,6,-17,-19,-8,-5,-21,-3,-81,8,-5,-13,-15,34,3,21,17'
+    ',18,29,67,31,4,10,-5,9,-33,41,55,-44,10,0,9,8,-6,18,-37,40,46,-36,19,26,-6,7,-27,11,30,0,-2,14,-'
+    '13,2,12,8,8,-11,14,-3,6,26,8,-16,17,-10,59,30,15,2,9,18,18,3,55,39,17,2,5,25,9,1,7,12,-4,12,4,16'
+    ',5,-9,1,4,-5,47,9,-3,-8,26,12,10,10,-15,-2,36,-15,32,-2,57,4,-8,1,9,-21,69,-1,17,-26,66,-24,20,-'
+    '29,41,-2,10,-6,0,-18,24,-20,-1,-3,8,-26,21,1,3,-37,26,-6,16,-38,31,-22,29,-15,9,11,-3,-2,15,4,8,'
+    '-61,55,-27,47,17,32,2,30,17,35,19,5,35,30,5,10,-2,14,20,21,-7,26,21,-5,19,5,8,-5,19,11,6,22,23,9'
+    ',17,13,44,6,7,13,12,-8,6,2,-2,27,11,0,3,-13,15,-14,33,-4,3,-5,-5,-10,27,1,19,9,-2,15,7,-2,10,-15'
+    ',7,4,7,-8,10,0,-1,-10,-14,-4,-10,-21,-2,-21,15,-21,-2,-9,7,-11,11,-6,1,-5,-9,1,5,-11,18,-4,22,3,'
+    '11,7,6,16,-20,15,8,12,-2,5,-19,2,-3,8,4,10,18,13,4,17,5,-11,11,-2,20,18,23,4,2,8,30,-2,28,7,18,1'
+    '6,9,0,7,13,36,-11,9,6,-3,18,7,-2,-1,-8,17,-10,22,16,9,-6,5,3,6,21,8,9,6,-13,40,14,4,13,-4,24,-22'
+    ',32,11,3,1,12,7,4,10,3,-3,-11,3,-16,21,-25,19,-10,-12,-11,37,-10,7,10,-7,14,7,5,21,-6,-1,9,11,14'
+    ',6,-2,4,-11,10,-1,35,20,18,-10,12,0,6,10,8,3,21,-5,31,9,9,9,22,-3,5,6,2,17,16,10,-7,7,23,10,5,20'
+    ',17,-7,21,13,4,0,4,-12,9,15,-3,5,4,5,16,0,11,17,10,0,22,24,-4,13,-14,2,-4,7,17,1,0,8,8,7,21,-6,3'
+    '6,5,6,13,-8,9,27,9,5,7,-5,13,7,8,31,2,-12,13,1,9,24,1,17,-9,3,2,-8,20,11,33,-3,8,-29,-5,-19,17,3'
+    '2,-7,42,28,-10,22,-14,7,-5,16,12,-5,11,12,6,-24,9,-2,12,8,5,22,14,21,10,6,23,25,-2,17,24,31,-8,1'
+    '2,21,3,19,29,7,2,5,-13,24,10,10,-3,-13,35,15,13,3,8,-12,8,10,-1,4,3,-2,6,-21,12,8,11,19,2,13,-13'
+    ',7,1,5,35,-3,12,-5,2,-20,-12,-18,-3,57,39,-40,11,-25,25,-17,7,-10,0,-26,-14,-27,-3,-14,17,-30,-6'
+    ',26,15,37,-4,8,4,10,17,42,23,46,13,-9,24,-13,16,-31,17,-29,23,-27,10,-7,16,-22,4,-31,-11,-15,3,4'
+    '8,17,27,-8,18,-16,38,-1,33,-15,19,-1,-1,12,-11,17,-35,22,0,16,-6,6,-49,23,5,18,-3,18,-37,62,-23,'
+    '63,-31,18,-38,13,-23,17,-15,0,-3,10,5,16,13,10,8,19,29,29,26,15,7,12,23,12,-10,4,-9,10,9,8,15,3,'
+    '0,-12,6,-6,25,8,4,4,3,24,7,5,12,-2,-9,19,24,-2,88,35,23,0,8,-11,10,-2,18,12,0,5,-7,7,14,11,-2,14'
+    ',10,8,-33,1,-28,12,-10,-8,-32,1,-25,12,-17,2,-17,13,-30,10,-49,-15,5,-6,-43,-27,1,-10,-13,-9,-47'
+    ',-2,-18,6,-16,13,4,31,10,6,-15,34,-14,9,-26,-4,-53,9,-24,13,-11,11,-11,27,23,44,26,10,26,-16,33,'
+    '11,35,0,24,23,4,15,13,19,20,15,89,33,29,36,40,31,56,-5,10,12,3,-13,28,-15,14,-15,-2,-4,-7,-14,-3'
+    '9,-41,-28,-11,-5,-9,5,-11,-25,-10,1,-16,54,1,-19,-17,5,-11,-57,-19,5,-19,16,8,33,6,-2,8,5,5,18,0'
+    ',12,5,35,32,51,23,39,9,12,7,23,3,7,9,11,-6,35,2,24,17,0,-10,21,-12,8,-17,9,3,5,11,32,-17,26,-6,5'
+    ',-24,-25,-42,1,-6,38,-12,-24,-2,-24,-11,-19,-22,-1,-11,-18,-10,52,-5,4,-2,-26,-13,32,-9,5,-12,9,'
+    '1,32,26,17,-12,11,0,7,-13,8,9,17,5,26,-10,-7,-6,10,-17,-1,-10,14,-16,-4,-10,12,-21,11,-4,-11,-12'
+    ',-9,13,-29,6,-27,-14,-6,-10,2,-8,21,-4,10,4,6,-21,-1,-31,15,-16,-4,-9,10,-5,-3,-10,-23,-12,0,-4,'
+    '12,-4,-12,-7,-20,-35,13,-33,17,0,-12,-6,5,-6,-22,2,-4,-5,22,-18,5,-18,5,1,3,8,14,11,15,-7,13,17,'
+    '22,15,1,-10,-9,-11,15,-9,16,17,-9,11,1,8,12,2,11,-15,9,3,2,6,-10,11,7,6,33,7,5,-9,35,-6,-2,15,9,'
+    '8,47,0,23,8,21,32,14,45,1,10,-11,-4,-6,4,-1,27,8,42,-5,32,-8,21,-72,91,-29,50,-36,22,-18,18,-40,'
+    '13,3,16,10,1,3,8,-2,24,4,8,30,12,10,10,33,4,21,9,19,19,41,17,23,24,37,13,3,7,-3,19,6,18,-9,19,1,'
+    '10,7,12,48,47,22,12,18,-3,9,6,10,19,-12,14,45,-3,63,63,15,4,7,-2,-14,-18,8,0,36,21,-1,-43,41,0,1'
+    '5,-9,14,2,6,-9,10,-2,85,25,112,58,13,15,22,16,5,13,34,40,27,12,11,18,55,50,89,65,42,43,10,21,13,'
+    '8,5,21,20,31,41,32,37,51,74,53,11,35,16,19,-7,9,21,55,-6,31,16,17,-8,5,-6,42,4,25,15,25,2,18,15,'
+    '18,9,21,44,30,2,14,10,12,-32,19,-4,7,12,11,1,29,-17,6,-25,19,34,-7,22,16,-3,11,-15,4,-21,16,-32,'
+    '11,-34,21,-17,24,-38,21,-9,2,-39,-9,-62,13,-4,-2,6,-8,0,-18,-6,-30,-21,-20,-20,-2,32,30,0,13,-4,'
+    '1,-15,-5,-13,-18,-30,-13,-70,-5,-3,3,30,13,12,16,19,8,-21,2,-28,13,17,6,16,12,-29,0,-24,-10,-4,-'
+    '5,16,-10,-10,-21,-14,3,-13,-1,-9,-6,-8,2,-4,13,14,52,-2,17,-95,-4,-59,15,-5,11,5,10,28,17,21,5,4'
+    '3,19,28,23,33,11,90,45,38,29,15,20,44,34,31,12,21,17,26,7,18,13,18,5,20,18,45,12,23,40,11,9,81,3'
+    '5,43,35,55,24,61,13,33,-3,35,7,61,-3,107,3,21,-4,17,-17,12,-3,22,5,17,21,10,3,26,-9,71,-10,18,2,'
+    '18,10,39,2,23,-15,24,0,18,2,5,9,-22,0,-3,8,9,8,13,-5,27,1,-13,14,35,13,22,1,103,-21,-19,-7,34,-3'
+    ',21,13,32,-3,14,-4,31,-20,37,-4,9,-6,-27,-6,-49,0,-38,-8,21,-20,76,3,8,9,15,3,50,-10,26,15,19,1,'
+    '9,12,34,1,31,-14,24,3,21,11,24,-8,12,5,34,0,1,17,-20,9,-39,9,-31,-6,-12,5,12,13,2,17,15,5,14,22,'
+    '39,28,75,30,34,32,57,27,5,21,40,20,39,12,60,-5,26,8,22,-2,64,12,11,-2,25,-19,63,18,13,-1,1,-10,-'
+    '7,-14,-37,-36,7,-16,-16,-17,9,-2,30,11,20,-2,-15,-20,-6,-19,31,10,29,1,27,21,135,70,31,-1,5,6,11'
+    ',0,13,-17,10,3,17,13,-25,9,1,10,11,16,3,21,14,11,-6,9,9,9,109,15,37,-13,61,-8,2,-4,-21,0,0,-8,-6'
+    '1,10,-39,-18,-14,-24,-5,-34,-14,-7,-8,-18,17,-4,4,-8,-12,-10,-27,-13,-7,-8,16,-11,-36,-12,-38,-2'
+    ',-26,-12,-64,-19,-32,-32,-30,-12,-59,-40,-31,-8,-20,-16,-50,-26,-26,-33,-38,-28,-76,-36,-17,-15,'
+    '-61,1,-22,-22,-58,0,-8,-5,16,-13,3,-15,-13,-18,-12,-14,-75,-45,-26,-63,-17,-72,1,-15,15,-68,24,-'
+    '78,16,-87,12,-24,13,-12,13,-60,3,-53,2,-7,13,-8,8,-26,45,24,33,27,29,13,28,20,23,28,16,29,-1,25,'
+    '13,24,-18,9,4,7,9,2,19,-14,20,14,64,19,18,-1,18,-10,8,0,-3,14,-10,11,6,17,-12,23,8,23,15,18,70,3'
+    '5,36,6,16,-8,33,0,49,23,-3,14,-30,32,-6,29,6,15,30,44,45,17,-4,14,18,9,21,-1,16,4,-15,-12,-18,-7'
+    ',-8,-10,21,-16,21,-3,29,19,-10,33,2,13,-21,5,-13,-2,-12,9,1,29,-5,14,2,12,41,28,4,15,-58,16,-13,'
+    '-5,-5,-13,-8,-5,2,6,-37,14,-8,16,18,37,31,26,52,28,3,3,-6,9,14,2,19,17,5,41,17,18,29,15,36,-6,-3'
+    ',-8,33,17,23,-7,11,-13,17,-3,12,11,1,15,86,26,24,12,17,0,-21,-50,5,-13,8,1,69,45,27,10,91,16,32,'
+    '2,21,-3,56,4,39,-16,27,-22,9,-15,17,-8,20,-2,26,46,178,63,-3,6,4,5,18,2,15,12,18,0,-10,13,5,3,27'
+    ',-6,49,31,20,-4,32,12,37,2,21,13,47,8,8,7,106,25,37,16,46,5,3,3,-23,7,6,12,32,0,2,-4,-7,-14,73,-'
+    '5,110,-23,6,15,30,14,9,8,0,8,-6,9,-13,2,-12,13,15,7,-8,11,-41,16,-13,19,-5,-15,-6,1,3,12,-6,4,-1'
+    '8,1,-3,4,29,6,-4,17,-4,13,-20,4,3,12,-10,13,-15,10,-10,-12,-9,-2,-35,8,-26,14,-2,13,6,17,-8,3,-3'
+    '4,-5,-21,-9,-33,5,-37,-9,21,12,-10,13,-19,6,-38,-12,-113,-10,123,16,28,12,37,-10,40,-1,24,-6,15,'
+    '7,-18,14,-70,5,54,3,30,-7,57,-29,54,-5,23,-7,93,22,38,21,17,4],[14594,4343,-7,3,7,-3],[14633,436'
+    '5,-6,-2,6,2],[14609,4345,-6,-4,6,4],[-15981,-2119,-3,-5,10,-1,0,4,-7,2],[-17249,-856,0,0],[-1712'
+    '0,-934,0,0],[-17221,-450,3,-1,-3,1],[-17165,-286,1,5,-8,5,7,-10],[-17109,-313,0,0],[-17125,-444,'
+    '0,0],[-17450,-469,-4,3,4,-3],[-15502,-405,6,-4,1,6,-7,-2],[-15181,-1139,2,-7,-2,7],[-15591,-561,'
+    '5,-2,-5,2],[-17858,-1913,-2,-2,5,-3,-3,5],[-17987,-1898,7,4,-7,-4],[-17872,-2067,0,0],[-7884,-33'
+    '59,-5,1,-10,-8,22,2,-7,5],[-1438,-788,-3,-9,9,1,-6,8],[7279,1122,0,4,0,-4],[7305,826,-2,2,5,4,-3'
+    ',-6],[7342,323,-4,4,5,2,-1,-6],[7352,419,-5,-2,5,8,0,-6],[13114,304,5,2,-5,-2],[15159,738,-2,-3,'
+    '7,-2,0,5,-5,0],[15188,747,-2,-4,5,2,-3,2],[16689,1117,-5,-2,5,2],[17712,-1248,-11,-1,7,-3,4,4],['
+    '17459,-2170,4,2,-4,-2],[17920,-853,0,6,0,-6],[17867,-746,2,-4,-2,4],[17839,-803,-1,-4,1,4],[1695'
+    '2,-87,4,1,-4,-1],[-12833,-2432,3,-9,-3,9],[-17735,2822,-4,-2,4,2],[-8178,2454,4,4,-4,-4],[-8673,'
+    '2126,3,-7,-3,7],[-16582,6633,-33,-11,33,11],[5443,2447,-3,4,-7,-4,13,-5,-3,5],[12474,3795,0,3,-1'
+    '0,0,2,-6,6,1]],"frontieres":[[4798,800,96,145,0,181],[4798,800,-156,-150,-148,-159,-95,4,-41,-10'
+    ',-45,-21,-11,-8,-16,-24,-84,-18,-14,-16],[3425,3121,28,32,-5,5],[3555,3240,-19,11,-17,2,-12,-7,-'
+    '11,-30,3,-25,-3,-9,17,0,7,-7,-25,-15,-7,-23,22,0,35,11],[3511,3308,30,0,8,4,4,13,7,-1],[3579,327'
+    '3,10,21,-10,35,5,13],[3400,3507,-13,2,-39,-9,-2,10,-8,6,-19,1,-27,-8,-21,8],[7780,3550,9,-5,15,3'
+    ',-3,-23,32,-64,34,-9,30,-22,0,-7,-22,-14,-2,-8,7,-51,12,-11],[7705,3511,-5,-12,-22,-9,-19,-16,-1'
+    '3,2,-42,-9,-33,-17,-39,8],[9163,2776,35,-3,12,8,31,1,14,6,14,11,-5,7,6,9,47,21,19,29,54,9,7,12,3'
+    '0,11,2,17,33,17,11,-6,4,-7,62,-14,13,11,0,6,19,3,6,10,36,4,10,-13,13,0,-18,-13,2,-16,24,9,14,-29'
+    ',-30,-35,11,-4,21,9,18,-9,20,-3,10,3,24,-15],[12837,3862,-20,-26,-13,-5,-95,-3,-42,-36,-4,-14],['
+    '-868,2766,-14,0,7,-47,-4,-7,-62,-3,-33,-23,-8,-1,-21,6,-22,-5,-30,13,-21,3,-63,-14,7,-14,-2,-11,'
+    '-17,-16,-21,-37,-34,-11,-37,-116,-56,-36,-32,-49,-46,-19,-12,-10,-21,-59,-12,-79,-41,-45,2,-11,-'
+    '14,-25,-22,-6,-107,6,-96,-8],[3592,462,-16,19,4,35,-5,18,-28,8,-14,-6,-7,5,1,8],[-12476,4849,90,'
+    '-23,32,-4,15,3,25,15,-10,24,23,15,-30,20],[9163,2776,1,16,-37,16,-25,-11,-30,10,-37,1,-2,4],[236'
+    '1,5152,0,9,10,3,27,-5,38,28,71,6,72,-1,135,-17,16,-15,39,-3,1,-9,16,11,15,-3,17,5,42,-7,5,-8,8,-'
+    '3,12,11,25,9,25,-25,81,10,15,-8,2,-7,21,-6,9,9,-10,24,23,30,32,18,14,-3,13,6,41,-1],[3584,3342,-'
+    '24,-18],[3584,3342,19,17,-9,8,5,8,10,8,28,1,-9,9,30,29,-8,21,-17,7,10,11,-5,5,-40,-3],[3468,-120'
+    '1,8,-2,-8,-9,0,11],[8021,4219,5,5,-10,39,4,10,5,7,29,7,0,4,-16,6,1,7,23,9,13,-3,4,6,-12,15,3,12,'
+    '-5,13,-29,54,0,45,2,11,10,5,-22,10,-26,-1,-13,8,19,13,57,12,22,0,84,22,10,-12,15,-7,33,6,25,-9,1'
+    '0,16,-1,13,-28,10,-1,7,65,138,6,22,6,2,93,-24,65,0,12,-14,44,21,25,2,18,19,-13,67,10,28,12,19,80'
+    ',14,17,17,4,16,-3,8,8,11,24,6,27,-2],[2348,5394,25,-3,46,4,13,-6,30,9,15,-1,10,18,18,-2,41,16,7,'
+    '-7,-2,-6,24,0,0,10,-20,7,17,23,0,16,14,20,32,8,11,14,31,-1,18,14,-32,7,13,33],[-5337,-3374,-16,8'
+    ',0,49,5,10,35,33,-3,6,-44,28,-16,34,-16,11,-30,9,-37,37,-31,10,-14,11,-5,-3,-8,3,-39,40,-7,2,-18'
+    ',-17],[11668,4982,-65,-104,-21,-20,-3,-33,-26,-12,3,-18,6,-8,28,-18,33,17,53,1,31,-6,28,-16,42,3'
+    '4,38,4,35,-5,26,-22,32,-11,8,-12,55,-38,19,-29,-3,-19,-16,-6,-38,0,-49,15,-12,-7,-41,3,-24,-5,-3'
+    '3,-15,-30,7,-11,-23,-47,3,-30,-10,-35,-40,3,-9,-4,-6,-52,-28,-52,-7,-60,0,-14,-19,-34,-23,-49,-2'
+    '2,-88,13,-30,18,-51,0,-28,-23,-22,-46,20,-26,24,-18,9,-12,0,-10,-16,-5,-22,-16,-54,-16,-61,-57,-'
+    '106,-33,-117,1,-140,-16,-157,-55,-22,-14,-12,4,-36,2,0,22,-79,-13,-64,26,-91,15,-19,6,-31,28,-16'
+    ',4,-152,14,-51,-11,-226,22,-82,-7,-9,21,-44,35,-2,10,-31,57,-20,9,2,24,-30,-2,-34,9,-51,30,-24,2'
+    ',-30,23,-14,4,-73,10,-37,-3,-84,7,-53,14,-17,-2,-22,33,5,20,29,31,-9,23,12,30,-16,38,-15,5,-22,2'
+    '9,-17,37,-23,9,-7,13,-25,-5,-30,20,-28,-5,-15,2,-47,22,-6,16,-54,18,8,15,-23,8,-9,9,13,12,-6,16]'
+    ',[1381,4877,-26,19,-15,2,-11,12,-37,23,-11,0,-13,8,-29,33,12,16,-30,20,-12,20,8,-1,11,-11,27,21,'
+    '22,4,17,-2,8,8,16,2,19,11,7,-2,12,10,81,20,-11,10,6,4,23,-5,11,-16,11,-1,4,4],[2735,5753,-38,8,-'
+    '51,-7,-16,6,-31,24,-71,21,-2,-5,-15,6,-79,-19],[2735,5753,16,-2,3,-8,29,-14,0,-10,-11,-14,-8,-20'
+    ',21,0,16,-25,9,-5,10,-29,-5,-12],[2105,5607,60,24,43,10,80,-1,16,-8,16,5,61,-4,31,-7,35,2,37,13,'
+    '6,-1,17,-20,59,-10,62,-35,31,-8],[2062,6904,-50,-2,22,-12,1,-5,-11,-18,-27,-13,27,-6,-27,-12,-16'
+    '7,20,-14,-3,2,-33,-26,-24,-60,14,-54,-20,-21,-28,-11,-7,-27,-4,-6,-8,30,-27,-3,-11,-98,-56,6,-18'
+    ',-44,-14,-50,-4,9,-34,-8,-14,-7,-35,-83,-72,43,-12,6,-29,-18,-16,-76,7,-41,-8,-61,-40,3,-11,-21,'
+    '-20,22,-29,-11,-8,0,-33,19,-30,-14,-57,44,-18,28,-19,-17,-29,-42,-6,2,-11,28,-44,-10,-34,-32,-20'
+    ',-24,-5,-10,-16,-15,-11,12,-30,-16,-36,-17,-2,-13,18,-10,1,-10,-1,-8,-13,-15,-1],[2062,6904,6,3,'
+    '39,-3,6,4,-6,13,20,6,32,0,71,-41,11,-14,91,-7,39,6,14,10,109,-22,15,5,16,18,33,7,17,10,2,29,30,4'
+    '1,46,23,60,-1,62,15,14,0,52,-24,73,-15,19,-20,-48,-29,-2,-6,14,-10],[10443,1041,13,11,29,1,20,17'
+    ',0,21,26,-6,10,10,35,4,9,-13,9,3,22,-10,-3,13,3,12,-30,25,-1,35,8,1,8,11,39,-7,1,26,29,3,6,7,17,'
+    '3,28,22,12,2,6,-6,12,10,5,18,-8,49,13,41,-28,69,3,24,13,18,3,16],[-6951,-1750,1,-12,14,-15,5,-17'
+    ',22,-11,-6,-9,18,-83,51,-46,-24,-29,12,-14,2,-11,-4,-7,-16,-5,7,-22,-7,-11,28,-21,-8,-9,0,-18,12'
+    ',-5,24,-35,1,-32,8,-13,3,-23,9,-8,11,-43,0,-33,9,-6,21,-1,39,7],[-6951,-1751,-17,-14,-17,-5,5,-2'
+    '9,-13,-22,-25,-12,-24,-2],[634,4945,4,15,10,11,1,9,-29,12,-9,11,1,9],[252,5110,8,-22,16,-13,8,-4'
+    ',27,7,12,-12,4,-13,33,-5,9,-17,6,3,20,0,22,-9,-3,-11,5,-5,-4,-12,40,-1,27,19,4,-1,-7,-18,8,-17,4'
+    '1,-11,23,-17,28,3],[612,5012,-14,5,-24,-25,-2,-11,16,-17,-9,-10],[4643,4189,-22,10,-26,5,-31,17,'
+    '7,29,-37,3,-18,15,-29,8,-10,-14,-13,11,-13,2,-55,-18,-13,0,-9,5,4,13,-69,24,-10,10,-23,8,-19,-1,'
+    '-15,6,-37,-3,-47,3,-22,11,-28,4,-43,16,-13,-2,-37,6,-7,-2,-10,-13],[2096,4085,-3,5,-22,3,-22,34,'
+    '-4,25,7,5,-1,14,6,16],[2057,4187,1,14,-9,21,-25,12,-18,21],[4151,4152,31,-9,11,7,54,-6,14,14,14,'
+    '0,7,-9,33,-18,6,-11,19,-2,4,-7],[10114,2157,6,-5,-2,-11,7,-21,29,3,16,-8,10,6,-8,10,2,52,-14,16,'
+    '-8,26,22,25,10,-11,18,5,11,-6],[7363,3945,19,4,9,9,-7,22,15,24,42,10,27,17,15,2,-3,10,4,5,27,-3,'
+    '45,18,12,-32,19,-1,39,13,6,-8,16,10,18,33,25,24,67,-3,54,9,32,34,85,36,48,12,7,10,38,3,3,3,-4,13'
+    '],[4344,4111,79,10,61,0,-3,5,19,3],[8021,4219,-29,22,-49,7,-30,30,-24,-1,-37,9,-128,5,-25,6,-48,'
+    '-5,-67,2,-20,-13,-27,3,-55,14,-61,26,-6,-5,-20,1,-39,-20,-14,-41,7,-18,-21,9,-42,6,-11,8,-47,12,'
+    '-52,6,-50,-9,-24,-19,-13,-20,6,-9],[-5648,194,-36,-6,-17,4,-11,9,-20,-5,-9,-5,-14,-18,-43,-8,-5,'
+    '-13,-31,7,-6,-11,-11,-4,0,-16,-17,0,-14,-8,-15,10,-26,8,-31,32,-13,5,0,9,-9,6,0,37,-13,9,-10,33,'
+    '2,30,14,36,-2,24,17,11,13,23,-19,30,4,15,-13,10,-32,5,12,21,4,34,-15,16,-10,2,-22,-7,-28,1],[839'
+    ',5510,20,-18,31,-2,35,-9,37,5,12,-3],[952,3023,38,16,32,39,4,16,-15,52,16,22,21,6,13,19,22,15,68'
+    ',33,2,11,-8,12,5,54],[4500,4129,19,-14,-12,-7,35,-9,17,-14,-21,-18,7,-14,12,-11,39,-19,-7,-21,-3'
+    '1,-4,62,-39,12,3,16,-6,0,-8,-11,-8,21,-18,-18,-3,9,-12,0,-16],[4477,3970,26,7,9,-7,5,-13,8,3,21,'
+    '-11,23,7,9,-1,-1,-17,21,-14,-3,-6,16,-30],[2024,4611,27,6,10,-4,15,12,28,-1,8,4,7,11,7,2,-1,8,7,'
+    '12,18,9,-1,9,16,17,1,8,34,36,0,11,29,22,32,4,27,18],[7096,4024,34,5,22,-8,11,1,6,-7,27,11,17,18,'
+    '10,1,13,-5,5,6,-4,6,3,6,20,-5,17,12,37,16,-15,5,-33,1,-30,17,-17,-1,-3,14,-28,3,-2,11,-20,23,-6,'
+    '-4,-1,-17,-9,-2,-8,3,-3,-22,-53,10,-8,4,-9,19,-22,-4,-27,10,-2,6,45,31,17,4,6,11,37,13,-19,12,-9'
+    ',-3],[1883,4951,11,-1,3,-10,18,0,10,11,19,9,19,-19,14,-4,-1,-17,30,-2,10,14,20,7,26,0,25,-8,13,3'
+    ',8,8,56,-1,25,-7,13,-13,52,-14],[-722,5509,-16,-6,-17,-26,-36,-7,16,-11,-37,-11,0,-7,24,-13,3,-6'
+    ',24,-8,29,-1,16,11,-4,6,19,11,13,-8,8,-12,15,-5,0,-10,43,3],[1883,4951,-2,10,-22,15,-3,12,-25,3,'
+    '-28,13,-16,-7,-24,15,-4,4,15,7,-4,8,-28,-6,-27,13,-27,5,11,-19,-35,-14,-43,32,21,15,-14,9,-27,-5'
+    ',-28,13,-38,7,-9,15,-27,5,-1,-12,-17,-3],[7096,4024,-1,-5,-31,-11,-2,-8,-10,-5,-7,10,-48,15,-44,'
+    '-10,-6,-8,1,-10,-17,5,-3,-5,-5,-16,7,-24,30,5,57,1,7,-4,26,5,11,-3,12,-15,7,-2,20,2,7,8,40,11,5,'
+    '-5,-2,-7,23,-6,0,-11,5,-3,26,7,19,-14,13,13,20,4,55,-2,36,10,16,-1],[2000,3971,13,-5,12,2,6,12,7'
+    ',0,-7,18,35,14,15,33,14,4,8,13,-7,23],[3320,-1401,-5,7,-16,-8,-12,20,-10,6,3,7,-13,10,18,13,12,2'
+    '4,3,32,-5,10,7,17,38,14,11,14,-17,4,-9,20,5,42,-7,16,0,11,15,26,-12,27,8,8,12,3,20,23,-11,16,-2,'
+    '16,-22,19,4,18,-15,23,-20,1,-8,21],[2213,4841,1,16,16,12,24,38],[-1151,691,24,32,62,53,8,31,21,1'
+    '2,8,30],[2415,867,7,-6,-4,-15,3,-9,8,-8,56,-15,35,-33,5,-9,-7,-16,10,-13,61,-37,47,-42,-5,-18,20'
+    ',-39,22,-7,41,-28,9,-16,3,-27,7,-10],[4292,1100,33,50],[4292,1100,-36,8,-60,-14,-16,4,-4,43,3,28'
+    ',59,78],[2940,-445,-8,-45,29,-82,-13,-31,6,-28,17,-31,50,-42,54,-115],[4238,1247,10,4,22,-13,17,'
+    '24,25,9],[1381,4877,18,-8,6,-9,64,0,10,15,13,2,5,21,10,2,9,-5,15,2,52,-11,23,-11,31,-1,17,6,34,-'
+    '10,7,-10],[4236,3711,10,2,31,24,17,-5,15,5,59,-14,16,-1,17,9,10,-1,8,-5,1,-20,8,-7,33,20,16,-4],'
+    '[1609,4686,16,11,20,4,4,11,-7,10,4,5,-2,13,18,5,6,9,-4,7,-22,6,17,8,20,-7,28,3,-4,13,12,17],[702'
+    ',4593,11,-5,41,10,25,-6,20,10,14,14,-3,11,32,18,4,-20,18,-14,18,-3,-4,-8,17,-17,7,2,-2,16,25,28,'
+    '1,19,17,0,10,-17,41,5,10,-12,9,0,-9,24,5,12,11,2,7,-6,16,-1,-3,12,5,19],[1045,4686,-4,10,-6,2,-2'
+    '2,-13,-25,9,-3,7,-27,5],[4477,3714,2,15,-22,15,-2,22,4,5,-38,20,24,42,-15,6,-3,45,-10,9,1,21,-10'
+    ',8,-6,16,37,4,7,25,13,10,23,-12],[2348,5394,-3,20,-8,6,-48,19,-12,-3],[3075,-819,14,-28,14,-13,3'
+    '2,-1,18,-10,3,-10,11,-10,25,-3,2,-11,49,-11,49,-25],[720,5328,-1,-28,-16,-35,-32,-3,-2,-9,6,-7,2'
+    '2,-2,7,-6,-6,-17,-26,-13,0,-4,8,-7,-6,-6,-22,-6,-16,-3,-19,6,-22,-8,25,-35,-12,-23,5,-7,-27,-12,'
+    '19,-13,-6,-15],[958,4706,3,5,-8,16],[-849,756,6,4,20,-4,22,52,-4,9,-21,8,2,21,19,4,23,-3,8,-9,6,'
+    '3,-4,23,-6,8,-17,7,1,19,16,10,-14,11,2,23,-13,-2,-11,10,-2,47,17,19],[749,4377,-1,9,20,22,-4,8,-'
+    '32,-2,-42,20,-6,17,19,21,-4,11,-25,9,-11,15,0,5,6,2,15,0,24,10,7,14,-36,36,1,7,22,12],[2897,6902'
+    ',-56,-12,36,-6,-2,-7,-27,-23,8,-19,13,-16,65,-13,65,-39,-5,-12,-70,-45,-15,-13,-2,-8,83,-80,19,-'
+    '30,1,-11,-38,-6,10,-5,-9,-10,-2,-13,-10,-9,20,-5,2,-5,-21,-11,-2,-7,18,-17,33,-7,1,-9,-13,-12,12'
+    ',-15,38,-13,4,-16,-32,-28,-22,-6,43,-24,76,-29,33,-25,2,-7,-34,-41,-194,-119,-84,-39,-61,-36,-7,'
+    '-8],[3087,6978,5,-17,-6,-7,-24,-1,-44,11,1,-10,-10,-11,-70,-13,-18,-20,-24,-8],[5519,2270,1,33,3'
+    '3,79,-6,12,8,5,44,7,-6,16,-17,2,5,11,-4,14,3,38,12,10,8,-2,-3,-9,9,-12,33,24],[4857,4184,-18,-24'
+    ',-33,-14,-20,-25,-7,-1,-47,8,-18,24,-39,29,-18,-1,-3,7,-11,2],[-5462,233,-8,3,-2,8,-16,1,-10,15,'
+    '-36,-11,-5,-5,-34,-3,-23,11,-18,-26,22,-22,-1,-15,-9,-5,-46,10],[4643,4189,-13,-13,-10,-2,-2,-8,'
+    '13,-15,36,-22,-4,-13,-10,-7,-10,-1,-26,12,-25,-1,-19,7,-1,8,-44,11,-28,-16],[-1139,1240,1,8,-7,8'
+    ',6,38,-24,43,-13,2,-7,-7,-22,31,9,25,-6,9,0,24,-21,25,4,19,-9,16],[-5462,233,19,-12,30,-9,36,23,'
+    '4,-4,22,-6,18,9,10,-14,33,1,20,15,12,17,25,65,17,18,17,34,22,29,12,7],[271,637,6,34,-5,27,7,50,-'
+    '7,14,-3,25,8,118,27,3,11,24,-1,13,19,22,2,14,21,10,9,25,-7,13,7,12,12,1,6,19,-7,16,-4,31,-23,32,'
+    '0,10,11,20],[1307,-463,-19,18,-8,2,-42,-19,-7,-15,-11,-1,-18,-22],[1652,4650,-20,3,-8,-5,-1,-11,'
+    '-16,0,-14,-9,-29,-8,-5,-6,8,-9,-2,-19,-37,-13,7,-7,-7,-8,6,-11,-55,1,-22,18,-20,-18,-38,3,-11,-8'
+    ',-30,9],[1891,4593,-24,-2,-14,-11,-17,-5,-55,4,-20,12,-30,9,-44,34,-35,16],[2024,4611,-63,6,-33,'
+    '-17,-19,2,-18,-9],[1652,4650,-14,14,-10,22,-19,0],[5127,2461,-30,-4,-17,22],[2526,-1779,-2,-18,7'
+    '0,-97,1,-14,22,-46,51,-35,50,-21,8,-13,2,-25,40,-2,-1,-56,34,-49,102,-25,1,-22,20,-6,12,-11],[77'
+    '80,3550,-35,-2,-68,18],[2801,4197,-13,2,-35,-7,-29,17,-23,-3,-13,-7,-30,-4,-7,-12,-15,-3,-4,-8],'
+    '[10293,1171,-19,38,-3,17,5,17,-26,24,-4,35,-13,27,1,27,21,3,-1,7,19,18,18,30,29,19,40,9,38,-6,80'
+    ',7,19,-6,3,-12,7,-2,11,12],[8889,2732,-15,-14,10,-11,2,-11,29,-14,18,3,22,-5,6,-8,51,3,9,10,14,4'
+    ',39,-12,55,2,14,8,9,-6,15,-1,38,7,2,11,-8,12,9,19,-9,16,-25,-1,-15,12,4,20],[10407,128,-1,12,-24'
+    ',6,-12,-2,-11,-18,1,-5],[10012,644,6,23,8,1,9,-13,28,-10,12,1,12,-21,18,-1,3,-28,-10,-19,13,-13,'
+    '8,3,7,12,30,12,12,-13,19,5,23,41],[599,5075,25,-15,-7,-5,3,-5,14,-5,2,-13,-18,-9,-6,-11],[-7178,'
+    '1972,7,-23,-4,-20,10,-13,-16,-17,8,-13,-1,-13,-13,-12,-13,-1,13,-18,11,-8,-1,-30],[1406,1308,-45'
+    ',62],[4653,2910,38,44,24,46,18,8,31,2,34,-12],[8811,2787,3,8,44,14,22,-8,5,-14,-10,-35,1,-9,13,-'
+    '11],[-9010,1374,0,9,5,7,50,34,-2,15,21,3],[12404,-934,5,-8,19,-1,13,12,3,12],[12492,-894,2,-11,1'
+    '6,5,5,-4,-5,-15,-14,-2,11,-30],[11514,490,9,-15,10,-37,-8,-3,-14,4,-8,30,0,21],[10963,203,-9,-13'
+    ',3,-9,7,-3,1,-17,86,-75,59,19,38,-5,33,1,11,10,16,3,11,30,29,12,46,1,5,-2,2,-12,50,-12,11,-7,28,'
+    '19,49,7,12,-5,12,17,7,23,10,4,3,9,-7,18,3,9,39,27,0,5,-10,6,4,26,13,14,6,-4,14,4,12,42,0,49,11,2'
+    '5,16,14,18,-4,22,7,17,-5,10,6,59,-3,44,-17,34,2],[1045,4686,54,-8,14,16,11,4,54,1,39,9,3,-2,-7,-'
+    '8,2,-4,24,-24,131,-18],[1370,4652,-2,-6,-28,-14,-2,-6,4,-5,21,-3,-15,-17,13,-5,-3,-15,14,-5,15,-'
+    '15,-15,-2],[2901,-272,9,12,20,-7,9,-14,31,2,17,7,6,38,19,-8,29,11,14,-9],[9257,2198,6,-67,-6,-5,'
+    '-24,18,-15,-15,14,-50],[143,4260,-14,11,-59,14,-7,-16,-43,3,-24,-3,-26,14,-29,-3,-17,14,-42,8,-1'
+    '2,8,-7,-6,-9,1,5,19,-30,7,-8,10],[143,4260,7,4,21,-4,3,-4,-3,-6],[171,4250,32,-15,17,7,45,-8,5,7'
+    ',19,5,32,-3],[143,4260,2,-16,26,6],[7489,3723,23,16,-2,6,-21,15,5,17,-16,42,6,21,-3,6,-53,20,-15'
+    ',0,-10,-12,-23,7,-10,24,11,12,-20,26,2,22],[7489,3723,-16,6,-36,-13,17,-14],[2096,4085,44,6,18,-'
+    '4,20,8,21,18,61,1,12,4,6,15,14,1],[2156,4225,-17,-3,-10,-12,-23,7,-28,-10,-6,-20,-15,0],[2234,42'
+    '31,-10,5,-68,-11],[2234,4231,8,2,10,11,-8,19,3,21,24,4,23,22,4,9,-43,26,-18,33,5,23,18,7,3,11,8,'
+    '5],[2292,4134,8,40,-6,4,-10,21,-26,11,-24,21],[1844,4256,8,-13],[1844,4256,-32,13,-32,21,-13,0],'
+    '[7892,3339,20,-16],[2034,4283,13,3,1,9,14,8,4,7,-4,10,18,6,4,-9,22,-8,18,-18,16,-8,-1,-8,36,-8,-'
+    '14,-28,-9,-6,4,-8],[2034,4283,-15,-8,-14,1,1,-21],[1919,4353,3,-8,39,-28,66,-23,7,-5,0,-6],[-893'
+    '6,1442,24,-5,41,-34,20,-5,3,-13,33,14,16,-11,19,1,8,-8,-6,-29,4,-7,-7,-5],[-8734,1298,33,3,9,21,'
+    '19,6,-3,47,43,2,18,22,11,6,6,-8,19,-13,6,2,5,12,50,36,2,19,12,8,5,14,13,6,21,-15,20,-2,18,6,3,5,'
+    '9,-3,8,7,10,-2,33,11,10,10,38,1],[-7528,-11,-34,17,-16,3,-29,26,-20,9,-12,-4,-4,-14,-6,-2,-34,1,'
+    '-28,11,-29,3,-7,25,-18,8,-5,12,-13,-1,-35,14,-50,31,-18,18],[-5760,337,-5,2,0,13,-18,16,-8,18,-1'
+    '2,14,-2,17,20,50,-7,15,4,6,17,11,38,3,2,9,10,9,-11,14,13,21],[-5408,333,9,26,-36,46,-13,79,3,17,'
+    '29,35],[-5841,-3394,-7,29,10,51,14,3,11,13,-7,51],[-5761,-3019,-26,-40,6,-27,-9,-12,1,-22,-16,-2'
+    '9,6,-9,-2,-10,-18,-24,3,-26,4,-7,-8,-22],[-5462,-2558,18,-4,29,10,26,-15,7,-29,15,-33,-4,-6,-4,-'
+    '40,3,-13,-12,-24,-27,-15,-5,2,-17,-17,-50,-13,-8,-16,-13,-6,-6,-10,-14,-3,-24,-19,-25,-11,-2,-6,'
+    '6,-12,-20,1,-1,-7,-33,-30,-16,-26,-25,-20,-30,-39,-28,-19,-19,-25,-20,-16],[2062,6904,28,-6,2,-7'
+    ',108,-39,85,-15,25,-11,8,-12,14,-1,32,-18,-14,-7,4,-27,-9,-15,28,-4,4,-9,-14,-10,1,-10,35,-32,-1'
+    '0,-10,-2,-13,-17,-10,-3,-10,5,-16,19,-7,25,-34,-3,-5,6,-15,-7,-10],[423,5139,-6,-8,-27,-10,-32,8'
+    ',-15,-4,-8,13],[599,5075,-24,1,-11,8,11,11,7,14,-2,6,-32,14,-27,-1,-11,7,-7,12,-18,-7,-9,9,-13,-'
+    '7,-13,5,-12,-4,-1,-7,-14,3],[634,4945,19,-6,21,-23,15,5,11,-3,4,-7,41,4,16,-9,52,-9,1,-8,-30,-25'
+    ',-22,-48,-9,-49,9,-8],[952,4752,-34,15,-30,-1,-31,12,-17,-9,17,-4,-12,-5,-52,-4,-31,3],[953,4727'
+    ',10,20,-11,5],[958,4706,-9,0,4,21],[702,4593,-25,24,5,11,-6,14,-33,1,-20,-10,4,-8,-7,-6,-19,-5,-'
+    '4,7,13,7,2,10,-5,8,9,15,25,15,5,19,21,8,33,29,-10,7,7,6,17,4,6,-6,14,0,28,16],[-741,3718,-9,41,6'
+    ',14,25,28,17,3,6,15,-15,-1,-23,28,6,25,23,20,5,15,-17,8,-17,33,-20,19,42,2,14,12,8,22,-13,15,22,'
+    '17,-4,10,1,34,-9,23,72,52,-10,11,-23,3,-2,20,-6,7,-53,4,-6,-8,-19,-7,-52,5,-23,-7,-7,9,9,12,-8,1'
+    '1,-6,1,-32,-9,-19,-11],[1381,4877,-2,-18,-7,-5,-23,4,-12,-22,-47,-16,-14,-9,19,-22,-5,-17,13,-2,'
+    '2,-4,-4,-18,-20,6,-4,10,-8,3,-21,-3,-27,8,-2,-10,-47,-4,-42,-16,-26,-3,-6,1,-11,12,-43,3,-7,-18,'
+    '-19,-9,2,8,-13,3,-1,6,-9,6,-22,7,-23,-6],[1609,4686,-11,-6,-2,-12,-19,3,-33,-8,-55,-2,-34,-21,-8'
+    '5,12],[1844,4256,11,8,-8,14,-1,22,16,3,5,20,18,12,18,-6,-8,24,24,0],[1919,4353,11,6,15,-3,5,8,-1'
+    ',6,-24,27,33,4,-46,35,3,17,14,17,6,18,-11,3,-40,-3,-18,20,-66,6,-19,-6,-16,8,-15,-4,-37,5,-21,11'
+    ',-13,-8,-26,2,-24,-21,-26,18,-21,1,-8,-43,36,-25,11,-30,9,-10,78,-60,19,-7,2,-14,36,-30,-6,-7],['
+    '1901,4487,-1,3,9,3,1,4,-4,17,7,1,1,5,16,-3,9,0,1,4,-40,19,6,12,-14,8,3,6,-11,18,7,9],[1695,4860,'
+    '19,24,34,-1,28,6,33,18,7,19,44,23,23,2],[1715,4801,-28,38,8,21],[1715,4801,17,-2,44,-22,96,2,6,6'
+    ',-3,9,4,6,12,5,56,6,16,11,32,-7,38,15,16,23,38,2,20,-4,38,4,27,-20,41,6],[1481,5086,21,39,-11,21'
+    ',-19,6,2,11,-14,20,15,25,-5,3,-2,14,-13,11,7,17,-11,12,-38,23,1,5,23,18,4,11,-20,73],[2288,4795,'
+    '-11,16,-19,2,-6,8,-17,5,-10,15,-12,0],[2859,4374,-37,3,-17,5,-17,17,-14,-3,-31,6,-34,15,-87,-16,'
+    '-40,-24,-32,-10,-228,20,-30,-4,-5,3,0,9,16,13,-32,16],[2024,4611,12,-13,22,-11,13,-13,6,1,2,-28,'
+    '23,-15,47,-17,-7,-12,-7,-2,18,-11,-17,-4,0,-3],[2292,4134,24,-2,8,6,40,1,37,7,5,7,43,3,11,-12,17'
+    ',-8,8,3,14,-3,26,-12,53,9,14,-2,22,8,0,13,-7,15,13,7,38,-14,4,-20,-2,-5,-27,-11,0,-29,-29,-22],['
+    '2006,4255,-27,-7,-6,15,-8,0,-37,-46,8,-10,-2,-20],[2662,4826,17,0,19,-10,36,-52,27,-30,46,-36,17'
+    ',-34,0,-19,-14,-48,6,-32,-9,-5,14,-15],[2288,4795,32,13,21,-9,26,0,51,-8,40,2,31,-21,9,0,48,19,7'
+    '0,8,15,21,31,6],[2254,4907,27,-5,4,4,-14,11,2,13,-8,24,6,7,33,29,67,48,26,3,12,12,0,9,-11,17,12,'
+    '8,-11,7,-33,37,2,8,-7,13],[2090,5529,49,-1,68,-22,50,0,6,-9,19,-10,-14,-31,0,-7,9,-13],[3176,521'
+    '0,-18,21,4,24,-10,15,4,6,-30,26,16,18,25,0,18,-9,29,-2,29,12,4,6,23,7,1,8,-24,13,-4,7,2,7,-25,9,'
+    '-45,3,8,22,-43,17,-22,25,-11,4,8,14,-35,15,3,13,15,14,-2,9,-15,17,9,9,1,17,-28,10,-17,12,-23,6,-'
+    '29,0,-46,-17,-13,10,5,10,-2,6,-35,8,-24,-8,-23,15,-28,-3,-13,8],[3176,5210,36,-5,16,6,8,16,8,4,3'
+    '7,-6,34,9,59,0,18,-9,19,-27,29,-20,-2,-6,-26,-4,8,-13,3,-19,4,-2,-6,-8,50,-9,35,3,10,-14,15,-2,0'
+    ',-9,13,-22,-5,-12,2,-7,18,-17,8,-2,22,9,23,-3,19,-13,19,0,12,-7,14,8,66,12,16,-12,12,-18,35,-19,'
+    '10,2,3,9,8,2,19,-9,20,-1,27,-13,25,4,13,-12,16,-1,32,-16,30,1,-2,-15,7,-6,-2,-12,-22,-19,-20,-5,'
+    '6,-10,25,-9,-21,-1,-9,-7,-6,-15,20,-5,5,-18,-4,-6,11,-3,-18,-31,0,-7,-12,-5,-76,2,-8,-2,-18,-17,'
+    '-27,-6,-8,-5,-9,-24,8,-4,-8,-10,1,-9],[4344,4111,19,-18,9,-21,-5,-15,-10,-9,14,-31,-4,-4,34,-12,'
+    '28,3,27,-15,22,-21],[8782,4916,11,0,19,10,7,19,44,4,20,-4,7,9,11,-7,10,3,13,13,16,-2,25,11,-1,18'
+    ',34,8,7,11,61,13,36,20,40,5,3,5,35,17,39,1,11,15,5,1,28,-17,11,2,4,7,16,0,7,-13,9,-5,115,-4,10,-'
+    '34,26,-20,32,2,18,-10,41,-3,27,10,15,-5,13,4,25,-10,67,-2,22,-15,15,1,23,17,41,10,10,7,15,22,3,2'
+    '3,-25,11,-8,22,-12,13,1,6,7,12,4,18,9,10,18,6,13,21,29,8,25,32,52,-20,31,-5,20,-11,55,-3,91,-28,'
+    '19,2,54,-12,5,-4,6,-48,10,-11,-3,-13,39,-20,48,-10,14,-9,33,-6,17,4,28,-3,39,16,62,8,29,8,50,-6,'
+    '34,-11,49,1,52,-32,69,-4,5,-30,64,-33,63,1,96,-16,23,5,28,-8,63,22,74,6,41,11,32,-1,25,10,10,18,'
+    '41,21,73,26,44,-4,69,-33,29,-2,50,13,33,-9,13,-10],[11668,4982,57,-20,62,-11,58,33,31,12,50,11,9'
+    ',21,-5,7,-14,6,29,29,6,16,24,25,6,16,26,33,44,25,17,12,7,13,-1,11,-7,9,-2,10,5,9,-4,8,-30,6,-19,'
+    '-3,-10,3,-3,9,66,45,29,11,135,21,18,-3,63,8,46,1,61,-18,25,-14,34,-10,27,7,57,-16,8,-15,14,-2,18'
+    ',-13,-3,-13,17,-9,15,-16,17,-43,19,-23,1,-13,10,-6,11,-41,39,-39,4,-9,-4,-17,3,-10,25,-14,-10,-2'
+    '3,6,-18,16,-13,29,-10,70,3,7,-2,0,-9,5,-3,25,-9,43,2,3,-7,14,-4,53,-39,35,-3,7,-9,-7,-17,25,-26,'
+    '-9,-21,2,-11,19,-18,4,-13,36,2,47,-5,69,3,23,24,43,16,33,-1,37,17,45,10,27,-5,11,-7,0,-10,-10,-1'
+    '3,18,-30,-21,-23,-25,-8,-12,-11,3,-17,-13,-18,-5,-24,-15,-21,3,-13,-4,-12,-16,-11,-5,-18,-14,-8,'
+    '-7,-28,-25,-11,-8,-17,0,-19,-17,-10,-96,21,-13,9,-20,-12,-20,-23,-37,-7,-10,-7,28,-77,-9,-37,1,-'
+    '19,6,-4,2,-9,-8,-24,-9,-10,-2,-14,-49,-9,-16,-8,16,-11,0,-5,-5,-3],[13053,4254,-28,20,-1,15,-16,'
+    '8,-18,3,-12,-22,-8,-33,-18,-7,-10,6,-11,-3,-11,-19,-28,-18,-87,-5,-2,-9,26,-29,-14,-22,-14,6,-32'
+    ',-1,-51,9,-23,24,-23,-5,-12,-8,-11,-28,-50,-46,-26,-3,-31,-21,-35,-11,-7,-9,-11,0,-50,-36,-3,-10'
+    '],[13053,4254,16,-24],[7096,4024,-31,-4,-12,12,-16,6,1,7,37,27,-11,6,2,6,-26,20,-11,-15,-58,-23,'
+    '-30,14,-5,-3,-5,-5,0,-9,-10,-6,9,-24,-8,-4,5,-9,-32,2,-32,-5,1,-4,29,1,4,-5,-17,-4,7,-14,-9,-1,-'
+    '4,-6,-10,0,-5,-21,-13,-9,-74,8,-29,-15,-7,-25,29,-9,4,-14,35,-1,9,-5,-8,-26,4,-20,26,-26,-6,-18,'
+    '-48,-54,-5,-32],[3589,3592,26,-9,5,11,15,6,3,17,26,6,-10,23,12,34,28,-4,13,-11,37,-1,75,26,25,-4'
+    ',33,-17,59,-1,66,15,69,27,81,-1,54,12,14,9,11,-7,5,-12],[3545,3148,-5,-25,4,-10,-30,-71,0,-28,-1'
+    '7,-58],[3555,3240,1,-63,-11,-29],[3561,3268,-6,-28],[8811,2787,-25,2,-24,-7,-48,2,-53,26,-6,-1,-'
+    '3,-13,-11,-3,-19,9,-8,9,-6,-3,-2,-15,-7,-2,-31,37,-56,4,-3,5,7,22,-36,-3,-57,35,-13,31,-16,6,-36'
+    ',-10,-42,43,-31,7,-36,26,-27,12,-18,27,-40,6,-22,-5,-24,-30,-7,0,-10,12],[9732,2822,2,-28,-38,-2'
+    '4,-8,-11,2,-15,20,-32,-15,1,-22,20,-54,-7,-13,-4,-15,-17,-45,-29,-33,-16,-8,-25,8,-31,-11,-13,-7'
+    ',-21,-16,-18,-12,-6,-9,-14,-3,-10,13,-8,3,-9,-13,-28,-29,-45,-16,-44,-45,13,-19,-4,-16,9,8,-38,-'
+    '2,-34,-4,-26,-4,-5,-15,0,0,-12,-8,-19,7,-49,-11,-5,-8,-18,-11,1,-16,12,-12,-15],[10012,2032,-23,'
+    '10,-17,-9,-26,3,3,-21,-15,-7,-27,2,-15,-33,-55,-8,-35,6,-3,-10,-17,-19,-2,-33,-9,-20,4,-34,-23,-'
+    '9,-15,2,8,-16,7,-6,11,-1,11,-35,-3,-14,73,-82,4,-25,18,-40,3,-2,15,11,5,-7,-7,-17,-23,-13,-3,-68'
+    ',-11,-1,-26,-16,1,-22,5,-17,32,-45,36,-31,21,-33,4,-49,-7,-13,1,-7,10,-29,19,-19,5,-36,15,-41,-4'
+    '2,-67,-43,-45,1,-23,-7,-24],[10309,1814,0,0],[10309,1814,17,14,3,13,20,1,30,-10,16,0,48,-62,31,-'
+    '24,8,-16,-8,-42,1,-23,7,-18,23,-31,36,-17,-1,-16,24,-17,-2,-17,-13,-23,6,-33,-5,-34,-8,-12,-24,-'
+    '12],[10012,2032,2,-7,18,14,20,-21,2,-9,-14,-33,2,-12,9,-9,12,-5,11,1,23,10,24,-6,-1,-22,9,-35,-1'
+    '2,-36,-12,-18,9,-15,0,-15,-23,-56,5,-4,15,-6,6,2,52,39,8,14,18,5,15,13,45,-24,11,-15,15,13,24,8,'
+    '4,11],[10114,2157,-6,-10,-38,-22,-16,-26,-2,-7,10,-6,-29,-6,-8,-7,-13,-41],[9732,2822,22,29,6,1,'
+    '9,-5,8,-11,12,0,17,-17,24,-64,5,-1,10,12,20,-9,9,-78,-5,-60,-13,-12,10,-21,-19,-7,-14,-20,-19,-2'
+    ',-13,-28,-9,-5,-10,1,-11,-22,3,-16,-16,-10,-5,-28,14,-11,4,-15,-15,-32,13,-1,33,17,19,4,29,1,8,-'
+    '5,26,5,-16,-21,15,-29,-3,-10,8,-14,-2,-19,56,-12,9,-11,-12,-13,-5,-33,-13,-22,-2,-15,73,-10,2,-2'
+    '7,16,-10,-1,-10,6,-8,45,-1,24,19,24,10,5,-2,1,-17],[10213,2238,36,-42,9,-6,8,-22,8,0,8,13,3,-8,1'
+    '0,-5,-10,-41,25,-38,54,-19,46,25,48,-30,-5,-10,-16,-11,25,-7,8,-16,15,-1,8,-18,-19,-27,-15,-13,-'
+    '33,7,-23,-1,3,-20,-17,-18,83,-50,43,-15,-6,-15,2,-9,22,-22,13,-4,13,-17,10,-24,81,-79,5,-30,11,-'
+    '16,8,-4,11,7,8,-17,47,-31,-1,-9,-22,-15,11,-18,28,-23,9,-13,-17,-28,4,-27],[2740,511,-33,9,-25,-'
+    '14,-129,25,-13,-5,-15,-24,-18,-5,-30,-4,-33,8,-12,-2,-90,-33,-30,8,-26,-2,-15,-13,-20,-38,-9,-8,'
+    '-73,15,-15,-4,-41,9,-17,8,-40,5,-33,37,-42,26,-31,4,-18,-6,-25,-18,-24,-37,-13,-14,-11,-3,-2,-9,'
+    '6,-31,-2,-47],[3055,-240,-13,-24,5,-5,-4,-18,35,-11,1,-29,-16,-8,0,-7,-20,-17,-28,-50,-20,-22,-2'
+    '3,-15,-32,1],[2901,-272,1,-8,20,-25,-1,-78,12,-27,7,-35],[2958,-139,-23,-13,-15,-20,-7,-14,0,-34'
+    ',-25,-20,1,-24,12,-8],[3527,549,-19,18,-10,19,-2,19,-25,61,-23,24,-20,10,-22,23,-4,14,-12,14,-23'
+    ',16,-44,9,-23,14,28,54,67,0,12,11,1,91],[2286,1092,-37,8,-33,-17,-12,-1,-27,-18,-6,-7,2,-20,-5,-'
+    '8,-15,-8,-13,-21,-14,-3,-49,-56,-43,-28,-27,0,-40,-11,-52,0,-19,-8,-7,-10,22,-18,-55,-61,-91,-7,'
+    '-87,-43,-19,19,-4,13,-15,-10,-2,-9,-35,-11,-7,-6,-11,-3,-37,4],[1329,216,-7,10,-166,4,-21,0,-2,-'
+    '13],[1113,-392,10,23,27,17,19,-16,19,1,-5,14,10,21,-21,14,-3,5,7,15,-12,12,-10,2,5,17,2,33,12,-5'
+    ',22,5,11,-7,39,8,3,22,-5,18,16,10,20,-10,20,-38,47,-9,27,26,15,-19,1,-14,10,-2,10,2,11,12,-4,13,'
+    '9,22,13,11,8,48,-5,44,6,40,-11,10,-15,4,-14,16,-21,7,2,39,7,16,14,19,14,1,9,7,11,19,0,9,-25,47,-'
+    '33,5,-63,-17,-3,3,6,9,-9,28,1,14,12,37],[1548,752,7,14,0,13,-11,6,-32,71,-79,64,-33,39,-2,10,26,'
+    '29,60,-4,29,4,41,-2,11,5,-37,35,-15,29,-10,46,9,43,-4,10,0,21,-20,42,-3,23,-9,16,-22,16,-2,16,-6'
+    ',4,-40,6],[1406,1308,14,-70,32,-8,10,-15,-4,-62,-38,-26,-22,-6,-28,-34,-16,-26,-13,-44,-14,-13,-'
+    '7,-48,-27,-13,-15,-61,-20,-20,-18,-2,-17,-32,-7,-34,-13,-21,-1,-14,-25,-32,9,-15,-28,-23,-3,-19,'
+    '-7,-10,-24,-15,-13,1,-10,28,-40,32,-13,-17,-27,0,-7,11,-36,-24,-12,-23,-29,-21,-37,-40,-20,-72,-'
+    '24,-44],[360,1170,6,6,-5,13,4,64,30,25,9,15,11,53,27,19,24,8,58,3,25,11,81,-21,29,-25,28,-37,14,'
+    '-4,16,9,19,2,47,23,27,-5,65,-38,45,-9,42,-1,43,40,43,12,93,2,58,-16,13,-10,34,0,19,24,22,12,32,1'
+    '2,13,10,29,3],[119,609,0,5,-14,6,-7,12,-24,13,-21,40,10,50,-12,9,-1,11,11,18,-3,42,11,20,-7,13,-'
+    '20,17,-5,11,12,9,-2,27,6,28,-12,9,-15,-6,-3,3,5,11,6,3,-8,4,6,5,6,60,-47,38,10,35,-8,10],[-270,9'
+    '48,3,-20,-8,-23,6,-2,9,-23,9,-59,-10,-6,0,-10,-18,-12,-17,-48,-3,-25,-25,-39,0,-16,4,-30,20,-64,'
+    '4,-7,17,-4,3,-24,-6,-21,-27,-2,-2,-4],[-552,1043,6,34,-3,27,14,9,10,25,2,14,-6,31,18,14,41,11,27'
+    ',26,1,24,-6,9,25,12,-10,33,18,19,20,9,42,-22,23,10,5,38,30,-1,8,30,28,28,13,4,35,-10,5,2,9,27,27'
+    ',5,65,31,29,23,22,3,13,-7,17,5,46,-15],[-270,948,-12,-5,-17,26,-23,21,-57,2,-48,-18,-6,-9,-20,7,'
+    '-10,-1,-34,22,-13,31,-16,8,-12,-1,-14,12],[-849,756,5,-4,14,-54,-3,-18,-27,-29,15,-5,16,-14,31,-'
+    '3,9,-6,9,-25,35,-14,5,-29,-3,-23,-8,-21,-6,-3,-2,-26,5,-47],[-849,756,-9,12,-8,1,-23,-43,-23,-4,'
+    '-14,16,-20,4,9,28,-15,65,-16,13,-6,-3,-4,9,-28,-11,-9,9,-13,-3],[-552,1043,-32,-4,-19,-20,-17,4,'
+    '-4,5,5,12,-7,32,-17,-5,1,-11,-23,10,-4,-31,-26,-1,-4,-9,2,-7,-5,-4,-34,12,-3,8,-11,10,-16,-1,-15'
+    ',-19,-18,-8],[-1504,1094,36,57,23,5,18,10,32,0,22,8,-1,27,-21,17,0,4,24,9,4,17,-6,19],[-1139,124'
+    '0,-11,-20,19,-18,10,0,14,15,14,4,22,-31,9,4,15,20,20,7,52,-18,9,11,30,12,3,6,-7,14,18,2,18,-8,22'
+    ',-48,0,-25,11,-5,5,-10,26,-15,-27,-36,6,-2,14,6,13,-6,7,-50,26,-17,2,-16],[10752,1471,-11,-15,-1'
+    '2,3,-18,-17,-8,1,-9,-10,-16,1,-28,24,-15,-13,-12,3,-6,-11,-19,-3,14,-29,-5,-13,-17,0,-16,16,-21,'
+    '8,-18,-5,-10,9,-7,15],[11406,460,16,-12,10,-22,10,0,15,-21,8,-1,13,13,6,22,-9,33,28,18],[-8823,1'
+    '573,-73,-58,-18,-8,-8,-20,5,-26,-19,-19],[-7737,866,-11,-16,28,-53,-15,-13,0,-13,-19,-14,-5,-3,-'
+    '12,15,-5,1,2,-16,-9,-10,-7,-21],[-6074,520,-65,74,26,27,-7,38,5,10,21,4,7,6,15,-2,37,23,0,15,-23'
+    ',1,-5,5,2,11,-11,22,21,27,13,2,35,22,7,14,11,6,2,6,-19,24],[-6074,520,7,-4,7,-21,-8,-12,-23,-14,'
+    '-9,-15,-28,-2,-20,-12,-7,-11,-27,-9,-33,-10,-26,6,-30,-14,-5,-35,-10,-8,-11,0,-37,35,-19,-5,-12,'
+    '5,-37,-1,-17,20,-39,1,-14,13,-7,1,-3,-5,15,-22,45,-42,0,-39,21,-53,-4,-17,13,-5,53,-4,-4,-25,-58'
+    ',-23,-10,-31,-10,-9,-9,-7,-19,-1,-24,-20,-9,1,-28,-15,-26,-24,-11,-18,-9,0,4,15,-5,9,-11,5,-38,-'
+    '19,-29,-2,-53,45],[5249,4178,57,37,63,15,43,4,73,-37,40,-51,18,-16,12,-4,43,6],[5598,4132,104,-6'
+    ',10,9,-10,10,-6,41,33,26,52,7,22,30,25,-6,12,-14,7,1,-5,11,-27,22,11,6,22,-3,11,12,29,-22,28,-5,'
+    '12,-15,7,-4,51,-2,13,-9,-5,-24,17,-6,9,-11,-12,-4,6,-17,-7,-11,2,-8,36,-18,42,3,37,-6,26,9,40,-1'
+    '9,20,-41,28,-35,10,-35,103,-60,25,-22,40,-21,15,3,31,-22,99,-52,36,0,60,-23,6,-8,-10,-14,-1,-44]'
+    ',[4923,4634,-69,27,-4,9,6,6,32,-5,8,6,-41,55,-38,39,-69,9,-19,-6,-20,21,3,18,-6,10,-40,18,-5,16,'
+    '9,24,33,34,-23,22,9,33,10,15,26,15,8,27,17,13,21,-2,62,-52,10,-3,33,10,8,8,-21,60,18,-1,51,25,18'
+    ',23,32,5,49,19,48,41,37,-8,11,-6,7,-11,27,0,40,19,21,4,11,-3,24,-20,77,0,19,-8,16,-15,27,-9,18,-'
+    '12,28,-26,5,-20,9,-4,8,5,1,7,-4,22,-6,7,9,6,23,-7,49,-27,33,-9,36,13,9,13,35,18,13,-4,39,9,17,-3'
+    ',26,-15,21,4,19,16,52,-3,19,-9,33,-28,57,-7,7,-4,0,-9,29,9,15,22,10,5,23,-15,13,-2,52,2,45,16,20'
+    ',37,-4,9,-19,12,-90,21,-7,12,-36,16,40,20,24,2,32,19,-22,34,28,29,35,3,57,-6,11,7,-7,10,-35,12,-'
+    '46,6,-4,5,7,11,17,1,13,6,-6,6,-22,-3,-27,7,13,13,3,21,9,6,10,3,60,-10,11,5,46,1,13,6,44,4,12,6,6'
+    '6,7,61,14,19,-3,28,5,16,-6,7,2,8,16,24,10,23,0,20,7,4,-3,27,1,194,31,8,7,-3,11,31,4,46,19,51,-3,'
+    '69,-20,31,12,25,3,17,-18,28,-53,-4,-24,-10,-10,4,-5,25,-5,66,5,11,10,8,2,20,-21,1,-16,5,-2,14,6,'
+    '-3,9,6,4,29,-2,32,-15,15,0,29,10,4,-2,-3,-11,-28,-12,-9,-10,-2,-11,12,-15,23,13,22,4,35,-4,14,-9'
+    ',5,1,5,15,38,18,22,0,17,6,16,8,6,12,25,2,58,20,57,13,-19,-29,-23,0,6,-13,138,-75,62,-63,99,-115,'
+    '52,-72,8,-1,2,8,13,7,20,4,3,23,29,11,14,-1,9,-9,16,0,-6,-22,32,-1,8,-22,46,3,17,-6,39,2,27,16,26'
+    ',1,14,9,20,0,59,-22,23,-25,8,-23,6,-5,29,-4,38,-14,1,-17,23,-27,95,-12,50,28,5,-8,-12,-9,2,-5,18'
+    ',-7,19,-20,23,-7,9,-13],[3420,3132,70,-184],[3398,422,40,40],[4188,398,-74,-2,-37,31,-93,-42,-30'
+    ',-38,-31,1,-114,17,-118,76,-83,4,-10,5,-6,12],[2338,-1764,-196,-36,-31,4,-36,-6,-36,13,-143,9,-2'
+    '4,10,-23,26,-9,4,-438,-1,-33,18,-21,19,-38,7,-55,-24,-54,4,-27,-8],[2526,-1779,19,-6,19,3,22,-13'
+    ',14,-2,14,6,19,-2,25,-9,20,-2,24,8,91,106,83,37,7,11,8,43,58,29,24,6,67,0],[2338,-1764,89,16,46,'
+    '-4,27,-5,26,-22],[3129,-2240,114,110,-8,16,13,19,1,29,18,14,32,54,2,11,-23,48,7,29,-15,16,2,11,1'
+    '6,10,11,37,-3,28,1,83,-9,37,7,17,-21,3,-10,9,-40,14,-30,2,-25,22,-20,3,-25,16,-80,2,-4,36],[1228'
+    ',-600,14,-5,76,19,122,-3,192,2,11,-3,27,-26,4,-46,18,-31,6,-33,60,-84,33,3,10,-4,55,17,38,-6,40,'
+    '3,3,31,11,19,5,33,13,10,22,5,71,7,-5,-26,7,-10,117,-3,6,-11,-6,-45,2,-24,10,-23,1,-35,-10,-78,5,'
+    '-12,34,-45,7,-22,4,-43,-13,-20,5,-23,8,-8,25,14,52,-3,38,12,37,-4,14,14],[-1656,1359,105,0,8,14,'
+    '16,6,25,2,61,-31,43,4,13,-6,0,-14,-40,-10,-19,3,-71,29,-14,-16,-52,-7,-2,-17,-82,-1,-11,-9],[22,'
+    '1491,-6,-41,22,-25,-3,-11,8,-17,19,-27,28,-9,12,-14,18,-11,-21,0,0,-32,57,-40,23,-3,17,10,14,-1,'
+    '13,-23,-3,-6,-13,-3,0,-7,32,-41],[1861,348,-14,14,-31,-12,-5,5,-23,0,-39,14,-27,-9,-61,-9,-13,-3'
+    '4,-1,-34,-29,-56],[1618,226,-10,-15,6,-39,-8,-4,-32,24,-40,2,-18,10,-26,-3,-2,7,-12,0,-18,12,-10'
+    ',-5,-119,1],[1548,752,-10,-16,-17,-15,-18,-43,-17,-22,-12,-28,-23,-12,-8,-12,7,-12,12,-5,0,-37,-'
+    '6,-22,8,-10,9,-58,33,-32,8,-24,-11,-2,10,-19,64,-70,13,-3,16,-19,5,-44,7,-21],[3398,422,-49,-46,'
+    '-34,1,-15,11,-16,-8,-50,-9,-20,-19,-20,9,-14,19,-25,-12,-40,11,-22,-16,-9,-14],[1307,-463,-24,-1'
+    '1,-38,-33,7,-8,-2,-55,-29,-6],[3195,-2596,-3,19,6,14,1,117,-19,57,-25,41,-2,20,-24,88],[3320,-14'
+    '01,-297,-98,17,-65],[3496,-1158,-34,-4,-7,-21,-19,-33,12,-51,8,-69,10,-13,25,-6,34,-35,60,-77,4,'
+    '-22,-8,-38,1,-41,-6,-38,-40,-10,-19,-40,11,-25,1,-29,-17,-3,-6,5,-2,6,7,12,-3,7,-15,7,-51,51,-2,'
+    '17,-15,19,29,59,2,28,-5,42,-18,19,-69,-16,-44,56],[2958,-139,-2,41,16,108,21,40,1,32,24,15,14,22'
+    ',16,5,77,80,2,11,-9,12,-10,2,-12,11,-13,0,-10,6,12,43,-10,15,16,37,-7,8],[3652,1426,-9,87,9,12,3'
+    '9,105,-2,32,9,18,3,26,40,0,14,26,23,14,47,12,36,43],[4238,1247,-25,30,-18,11,-18,30,-41,32,-54,6'
+    '1,-30,12,-38,23,-24,-2,-37,10,-33,-6,-6,10,-12,5,-21,-15,-38,-5,-21,22,-22,9,-12,11,-31,-70,-6,1'
+    ',-25,29,-13,-4,-11,-14,-21,5,-29,-6],[2735,5753,5,14,14,13,24,7,-11,6,-17,29,3,22,-10,35,33,26,1'
+    '4,23,25,9,-14,11],[7431,3281,4,-4,31,-1,-2,-15,5,-12,30,-3,31,-14],[-8435,1098,-35,7,-21,-10,-67'
+    ',24,-16,-13],[-8288,807,-3,13,-12,14,17,11,0,19,-6,10,19,18,-5,7,-16,7,0,39,14,14,16,-8,8,7],[-6'
+    '688,122,-11,46,-23,60,1,11,-36,30,-5,10,-15,4,-9,-4,3,10,48,43,4,10,-35,44,-20,65,4,76,18,29,6,2'
+    '7,11,10,3,10,-4,15,-9,6,-29,5,-61,-13,-47,4,-15,-2,-18,-8,-9,5,-7,-3,-70,83,-26,2,-35,12,-39,-10'
+    ',-49,4,-27,-4,-12,4,-7,7,-13,27,-18,5,-8,10,2,45,9,12,-3,20,-3,9,-25,25,-13,48,-16,3,-10,12,-13,'
+    '-7,-18,0,36,60,14,70,18,35,24,27,20,9,29,47,64,19],[-6844,-5236,-2,7,-75,15,-28,0,-47,13,-201,5,'
+    '2,8,-32,19,-14,15,11,24,-8,20,7,7,3,12,-6,23,-17,7,-36,-4,-21,-11,-7,2,-16,38,-19,23,-3,22,5,14]'
+    ',[-6863,-5265,-2,-227,59,4,71,-5,87,-18],[2277,5436,-317,10],[4844,2854,-77,-1,-9,10,-15,36,-90,'
+    '11],[4477,3714,11,-34,14,-10,3,-23,19,-11,12,-34,20,-4,22,-16,39,0,10,-5,-23,-10,-4,-6,-2,-13,13'
+    ',-16,2,-19,-21,-10,-24,-23,-4,-23,-14,1,-6,-16,10,-20,-14,-25,34,-37,14,1,-1,-12,11,-2,4,-5,13,-'
+    '19,-7,-14,3,-13,27,-3,74,-46,17,0,8,-5,14,-27,32,-36,-15,-39,0,-40,33,-1,0,-52,32,-18,10,-25,12,'
+    '-8],[6126,3562,-1,25,-10,11,6,21,-4,38,-5,7,-78,0,-28,32,-61,29,-8,8,-7,18,-48,17,-17,-3,-10,4,-'
+    '16,-5,-13,3,-28,16,-63,14,-4,16,-12,9,-75,3,-12,-6,-5,-11,-69,2,-20,-5,-48,-27,-20,-31,-51,-14,-'
+    '28,1],[14097,-260,0,-375,-11,-39,12,-17,0,-221],[952,3023,-21,-11,33,-48,17,-46,3,-21,-2,-41,10,'
+    '-77,-17,-46,5,-29,9,-19,-1,-22,-2,-8,-37,-22,-5,-8,1,-18,55,-74,3,-28,9,-26,14,-20,14,-10,29,6,8'
+    '2,-24,46,-79],[-1373,1267,-147,1,-37,-19,-27,-5,-30,2,-38,-11,-19,0],[-1139,1240,-65,0,-36,-6,-4'
+    '0,11,-13,8,-13,-4,-2,14,-65,4],[90,1099,-41,-4,-1,4,-55,13],[-13906,6000,-13,8,11,26,-60,-1,-29,'
+    '-15,-48,12,-8,-8,-47,8,0,935],[-13062,5471,41,32,19,25,-10,41,9,20,-3,18,-4,4,-11,-3,-20,4,-7,11'
+    ',-17,3,-9,8,-34,6,-50,20,-24,-1,-5,20,-23,7,7,17,-31,5,11,12,-119,114,2,7,-42,30,-48,19,-14,19,-'
+    '50,20,-13,15,2,14,-43,21,-84,-19,7,-7,-10,-7,-12,0,0,-18,-11,-13,-23,0,-63,-25,-8,2,4,7,-11,24,-'
+    '104,55,-8,12,-35,10],[-12331,4899,62,0],[-8889,1589,-35,0,8,192],[-7528,-11,-20,-5,-15,4,37,-47,'
+    '1,-36,-10,-2,-6,5,-16,-61,-52,-60,-59,-43,-118,-42,-32,-37,2,-12,-7,-2,-5,9,-7,0,-7,-38,-26,-55,'
+    '3,-13,-4,-10,-22,-15,-1,-15,-11,-11,-30,4,-17,26,-2,13,-12,9,-16,-3,-34,18,-24,-16,-10,3,13,22,-'
+    '14,4,0,16,5,3,14,-3,12,13,-9,46,-5,3],[-6997,-424,-37,43,-19,-6,-21,9,67,103,-3,9,-87,45,-23,-10'
+    ',-20,-2,-35,18,-23,-18,-24,-7,-18,-3,-23,8,-31,-4,-21,11,2,20,-7,25,-30,14,-2,24,-14,20,-20,5,-1'
+    '9,17,-20,6,-8,12,-9,27,-20,21,-14,7,-4,10,-15,1,-19,14,-8,1,-6,-7],[-6688,122,-20,-3,-4,51,-28,4'
+    '2,-16,-5,-26,-28,-12,-4,-9,4,-16,20,-7,-14,8,-13,-114,0,-22,5,-31,-6,0,-65,54,-1,15,-19,1,-20,-1'
+    '3,-3,-19,10,-34,-12,-24,-3,-2,-72,15,-18,29,-19,4,-13,-2,-12,7,-16,9,-8,5,-19,-57,-305],[-6958,-'
+    '1095,89,-155,-7,-11,0,-8,-22,-19,0,-62,-9,-18,20,-49,-13,-10,-1,-11,-22,-22,-5,-15,-8,-5,-1,-16,'
+    '20,-28,-25,-40,20,-51,9,-7,22,-4,7,-8,-19,-14,1,-16,-18,-13,-24,-32,-18,-11,-3,-5,13,-14,1,-11],'
+    '[-6958,-1095,73,-6,12,-11,11,1,31,13,24,28,35,2,14,17,16,12,31,12,53,37,66,11,36,-1,16,9,9,-16,1'
+    ',-28,-15,-36,13,-51,-7,-23,7,-19,14,-21,-1,-10,10,1,10,-24,16,-5,32,-22,9,-19,48,-9,25,5,34,-20,'
+    '10,-3,18,4,5,-14,25,-19,42,-13,23,-3,3,-8,30,-29,71,4,57,-30,11,-23,-7,-16,17,-44,3,-47,-31,-1,3'
+    '4,-38,6,-79,164,-6,19,5,0,-21,-13,-21,8,-53,41,-28,16,0,24,-61,9,-9,-7,-7,-21,-63,5,-1,1,-12,-8,'
+    '-4,-33,-66,27,-24,-30,-18],[-6997,-424,0,-6,-8,-3,-8,4,-11,-1,-16,15,-40,-2,-17,-18,-87,-15,-51,'
+    '-29,-35,-28,-19,-5,-9,-51,-26,-47,10,-24,0,-13,-10,-9,-26,-12,-26,-23,-4,-17,8,-23,-24,-7,0,-13,'
+    '-4,-5,28,-22,-6,-16,14,-13,9,-28,19,-13,6,-17,33,-34,0,-13,-24,-29,40,0,43,-10,6,-5,6,-21,9,-7,-'
+    '1,-16,4,-1,90,4,70,53,-5,-10,2,-16,-7,-12,0,-119,11,6,14,-11,10,0,33,13,38,-2],[-6265,-2223,37,1'
+    '16,0,51,36,50,16,41,175,35,92,1,91,-53,2,-34],[-1705,2081,-1,9,10,43,394,0,-13,149,12,18,41,27,2'
+    '5,5,35,15,0,253,334,0,0,129],[-868,2729,386,-229],[-868,2766,2,106,97,63,20,4,33,22,52,-4,12,9,4'
+    ',16,48,1,55,13,27,21,21,30,65,23,33,21,32,5,5,11,-21,13,4,16,-6,21,2,9,39,4,42,13,9,21,7,3,41,6,'
+    '117,-4],[-868,2729,0,37],[-1228,1481,-58,43,-7,21,-28,17,-20,44,-10,8,-36,1,-22,27,-21,16,-23,8,'
+    '-46,2,-10,-2,-3,-6,-65,-11,-47,4,-20,-33,-10,-36],[-482,2500,-177,-1,96,-842,27,-29,-15,-78,-367'
+    ',0,-16,3,-1,15,-8,-6,-2,-16,-49,-9,-47,7,-29,-2,-20,-27,-5,0,-55,49,-26,-21,-11,-43,-7,-11,-16,-'
+    '14,-18,6],[423,1914,-83,-15,-14,2,-15,14,15,26,-6,15,0,23,-7,6,-72,21,-19,19,-47,8,-6,5,-8,18,-4'
+    '4,26,-2,28,-597,390],[423,1914,161,34,164,139,449,265],[952,3023,-48,184,-71,47,-12,39,-10,13,-3'
+    '8,21,-23,56,1,25,24,17,9,16,28,15,13,17,3,25,11,22,-7,20,0,25,-7,15,10,57,-14,15,16,11,7,13,16,7'
+    ',-2,11],[2398,1950,-800,395,-100,-45],[2498,2200,0,-200,-100,0,0,-50],[2515,3165,-30,-32,11,-65,'
+    '-8,-22,-18,-26,28,-102,0,-718],[2286,1092,8,27,-2,15,-33,24,-3,9,2,32,-11,8,-8,39,2,9,-6,11,-12,'
+    '5,-30,-3,-10,11,16,32,17,11,7,11,-12,47,6,11,37,25,-9,12,-7,27,29,17,1,13,8,15,17,16,4,15,-4,22,'
+    '18,17,49,5,37,-3,1,378],[2498,2200,623,-1,5,1,14,20,9,-5,-6,-15,544,0],[4188,398,-54,-78,-38,-39'
+    ',2,-368,54,-70,1,-13],[4292,1100,-26,-40,18,-40,23,-27,11,-5,12,-27,18,-23,14,-4,36,-33,300,-101'
+    ',100,0],[3075,-819,-185,-30,3,-10,-6,-20,-19,-22,-28,-21,20,-46,1,-72,4,-15,-29,-93,2,-9,10,-24,'
+    '58,-54,43,-7,2,19,29,7,-2,-128,-13,3,-2,11,-8,5,-35,-15,-19,3,-28,44,-6,7,-12,2,-14,32,-55,24,-2'
+    '9,5,-15,29,-18,16,-8,20,-11,-4,-10,-28,-13,-7,-79,8,-41,15,-11,-1,-16,13,-7,22,4,16,-3,3,-62,-14'
+    ',-15,-9,-14,2,-4,5,6,11,-3,13,-5,6,-18,4,-6,14,-11,2],[2338,-1764,-92,82,-31,22,-11,34,-6,30,0,2'
+    '96,198,1,-8,19,11,38,-2,78,8,23,-8,54],[3390,-100,4,117,22,44,25,26,7,17,12,12,20,8,-2,14,19,26,'
+    '1,13,-7,71,-17,34,-15,10,-7,20,-7,4,-5,25,4,24,-27,16,2,6,-6,2,-15,33],[3390,-100,15,-4,359,-201'
+    ',5,-20,-7,-26,160,-118],[1133,217,-135,0,-11,4,-7,9],[1133,217,1,-117,-131,0,-12,-4,-11,4,-4,7,-'
+    '17,-4],[2526,-1779,-35,-3,-38,-23,-17,7,-12,-4,-64,-44,-30,43,-8,3,-225,-32,1,-364,-1,-4,-99,0,0'
+    ',-275],[1998,-2478,0,-367,-31,-5,-13,-7,-6,-9,-17,-7,-6,-17,-9,-4,-32,7,-74,0,-65,17,-10,20,4,15'
+    ',-3,8,-16,7,-5,12,-9,5,-18,-10,-12,-32,-31,-17],[1998,-2475,0,-3],[90,1099,-11,-28,-3,-32,57,-39'
+    ',6,-64,21,-31,2,-205,-9,-1,5,-11,2,-27,14,-18,4,-14,-17,-4,1,-3],[4280,1637,37,32,1,12,-6,13,4,2'
+    '7,8,6,-5,9,23,16,18,-5,11,-10,21,-5,24,8,99,3,39,-13,77,-7,42,4,25,-32,16,0,30,16,14,34,59,71,87'
+    ',42,294,42],[5198,1900,75,-170,7,-3,29,-62],[5519,2270,45,-70,-66,-200,-300,-100],[5519,2270,-9,'
+    '-8,-254,31,-97,115,-2,21],[4236,3711,-57,-51,-37,-9,-12,-13,-5,-31,10,-26,0,-17,-13,-35,-3,-52,-'
+    '20,-34,-30,-10,-192,-96],[3579,3273,10,-2,17,-18,16,-3,15,-11,45,-7,195,105],[3561,3268,18,5],[3'
+    '915,3212,14,12,-4,11,-21,-4,-6,16,8,2,-29,88],[3495,2935,112,-15,41,30,28,37,71,13,18,33,33,17,-'
+    '102,99,200,50,19,13],[4653,2910,-17,-4,-167,14,-262,188,-170,86,-122,18],[6159,2520,7,55,9,9,9,3'
+    '9,29,14,11,-1,7,13,13,7,35,8,37,1,3,19,6,4,-1,20,6,7,-13,10,-25,-3,-16,3,5,25,-7,50,2,24,-20,0,-'
+    '21,17,-46,14,-27,24,-28,48,-2,10,-48,49],[6084,2986,94,97,3,8,-5,38,-10,9,-84,12,-3,38,4,37,-27,'
+    '81,0,8,36,37,-41,13,-2,45,15,22,25,1,-16,20,22,13,13,21,7,23,-5,18,9,4,9,20,-2,11],[7373,3689,31'
+    ',-6,50,19],[6084,2986,164,-45,109,9,53,-11,29,15,71,2,108,28,13,13,-7,14,7,21,-2,29,6,19,5,11,20'
+    ',11,23,24,9,5,37,-9,16,1,29,11,-16,17,44,17,14,12,28,-5,16,5,18,-15,9,-2,21,11,20,20,-4,49,17,25'
+    ',9,34,42,9,34,18,2,8,-15,25,-26,28,2,11,10,4,34,-9,32,-1,40,10,5,32,-13,16,32,34,17,10,16,21,-7,'
+    '11,5,12,-3,14,-17,33,-21,16,4,8,39,32,15,-1,48,30,37,10,111,6],[7095,4225,-23,-8,-14,-13,-16,4,-'
+    '32,-26,-44,-15,-29,-18,-22,-6,-9,-6,-7,-16,-25,-17,-16,-16,-1,-26,-15,0,-37,19,6,22,-17,17,-113,'
+    '-6,-10,4,-21,81,-49,1,9,99,-30,-11,-30,43,-23,11,-36,29,-47,-16,-123,8,-122,-14,-83,68,-15,22,-2'
+    '45,117,-258,-57,0,-367],[1361,1370,-16,68,92,137,110,116,27,299,22,45,-37,38,-5,14,7,8,-43,57,-1'
+    ',40,-19,108],[1197,2352,151,-34,74,-56,76,38],[22,1491,7,7,66,0,35,29,170,7,1,7,5,2,44,-7,2,12,3'
+    '2,22,17,49,11,17,11,64,0,214],[-7,1112,-23,5,-5,-8,-8,0,-20,-16,-7,6,-34,2,-179,-1,-8,-41,12,-16'
+    ',-3,-7,5,-12,-1,-49,8,-27],[-1329,905,16,0,10,5,7,16,20,11,26,49,7,4,15,3,14,-5,22,4,1,7,64,1,6,'
+    '-2,52,-67,-6,-21,13,-4,1,-19,11,-18,-21,-35,15,-2,17,16,11,1],[579,4954,22,-9,17,5,16,-5],[5608,'
+    '2606,9,-1,-3,-36,11,-6,5,2],[3051,-107,-15,0,-26,-30,-17,-10,-10,13,-25,-5],[3051,-107,-4,-6,4,-'
+    '8,12,-16,8,-3,10,-16,1,-41,6,-17,-5,-20,-28,-6],[3390,-100,-309,1,-30,-8],[3459,-1197,-5,-5,8,-5'
+    ',2,6,-5,4],[8732,4909,50,7],[4550,4066,-2,-5,7,1,1,3,-6,1],[4499,4109,-3,-4,4,-3,3,3,-4,4],[1244'
+    ',4398,-4,-5,9,-3,1,9,-6,-1],[7057,4102,0,-4,8,-4,-8,8],[-11713,3253,241,19,-12,-21,380,-119,283,'
+    '1,0,45,176,-1,30,-32,123,-87,24,-45,6,-28,22,-28,41,-25,73,-32,17,4,20,18,16,42,12,11,13,2,14,9,'
+    '35,-6,44,1,17,-7,63,-56,42,-68,3,-17,19,-16,36,-44,24,-18,5,-49,23,-30,12,-31,83,-34,48,-7,42,-1'
+    '7,10,7,13,2],[-9224,1455,8,14,0,27,9,11,-13,21,46,79,129,0,3,32,-21,12,-8,20,-27,16,-43,39,42,-1'
+    ',0,57,183,-1,3,16,8,3,15,-9,9,6,29,48,6,3,16,-1,5,-6,21,1,0,-22,21,-2],[-5462,-2558,1,15,17,31,1'
+    '6,81,-4,18,8,8,-39,24,-35,-16,-21,-5,-23,7,-4,26,-8,11,2,16,-13,53,3,22,-23,36,-40,5,-20,18,-18,'
+    '-15,-31,-4,-30,7,-33,2,-15,8,-10,-4,-14,3,-3,6,7,35,-3,21,8,13,4,36,-7,13,-2,18,-6,3,-2,19,-16,3'
+    '1],[-6265,-2223,44,-38,14,-26,27,-31,59,-38,18,-20,52,-20,40,-5,22,-8,70,-47,67,-28,15,-12,23,-2'
+    ',18,-7,32,-28,7,-20,-18,-17,-14,-31,-22,-17,-9,-20,1,-25,-13,-23,-12,-6,-18,-21,2,-18,43,4,106,-'
+    '20,14,3,25,-5,12,2,16,-8,7,1,21,22,21,-1,24,-8,8,5,7,21,13,14,29,8,21,23,10,5,15,34,6,73],[-6265'
+    ',-2223,-19,23,-108,-3,-35,-57,-6,-23,-28,60,-38,12,-78,1,-33,26,-12,4,-15,-31,-34,-11,-9,-19,-23'
+    ',-14,-3,-10,-13,-17],[2662,4826,23,13,38,-2,32,11,27,-6,27,-16,20,-2,6,-3,-1,-7,8,1,4,-6,7,6,24,'
+    '-3,15,-17,21,1,8,-18,-8,-29,41,-22,-3,-14,6,-17,31,-13,6,-11,-2,-18,21,-12,-5,-4,-24,-3,-13,10,-'
+    '10,-5,-31,7,-10,-9,-1,14,-23,-6,-3,-10,8,-18,-6,-13,-21,-11,-1,-9,-24,-18,1,-15,-29,-7],[6776,37'
+    '17,20,-20,11,-2,19,6,13,13,52,19,39,-21,11,9,-1,19,9,15,33,6,22,-6,15,3,6,8,-4,26,21,16,20,25,26'
+    ',13,38,-15,7,-14,-5,-25,30,-1,-15,-78,10,-28,14,-15,13,-1,56,29,30,5,10,14,14,10,48,19,34,-4,0,-'
+    '9,-9,-7,2,-2,52,9,9,9,9,0,31,-3,23,-16],[6652,3735,31,2,24,-4,13,-9,12,-3,20,6,24,-10],[6126,356'
+    '2,8,1,28,-20,36,1,23,-15,10,-12,15,8,23,1,37,19,11,23,-4,17,88,16,8,10,42,23,31,79,27,11,46,1,9,'
+    '22,13,10,34,-16,41,-6],[9257,2198,-8,71,-13,24,-3,39,-8,36,-10,4,-22,-3,1,-19,-19,-21,0,-24,-13,'
+    '-7,-11,5,-7,17,-7,0,0,-13,-5,3,-16,56,7,26,14,17,16,0,20,12,15,-1,7,16,15,5,13,47,21,-3,3,9,-42,'
+    '23,-161,-1,-61,13,-3,9,2,56,-15,27,-8,-2,-4,-18,-18,0,-18,10,-17,30,-10,-3,5,-13,-14,0,-15,4,-6,'
+    '14,-20,14,-7,-7,9,-6,0,-7,-29,-28,-7,-20,28,-19,14,-16,27,-5,5,-12,13,-11,-13,-8,-36,1,-15,-31,-'
+    '16,3,-13,-28,13,-14,14,-1,11,-9,32,-12,-2,-27,-13,-33,17,-23,-2,-19,21,-6,-8,-15,7,-41,13,-36,0,'
+    '-18],[239,1190,2,10,-4,22,44,16,7,-1,42,-44,15,-8,15,-15],[1861,348,1,-18,-13,-38,-28,-51,-14,-4'
+    '0,-1,-48,-16,-41,3,-58,-4,-31,-17,-51,3,-27,-47,-45,-40,-23,-34,-61,-32,-34,0,-85,-7,-43,-16,-31'
+    ',-12,-16,-27,-10,-21,-21,-12,-7,-56,-57,-30,5,-4,24,8,14,-9,15,-42,-18,-22,3,-6,-27,-25,-12,-27,'
+    '24,-7,-3],[2898,-3000,12,8,4,22,15,13,10,30,-9,18,-35,21,-32,30,-40,-12,-27,-17,-22,-7,-45,-58,-'
+    '23,-11,7,-21,23,-32,3,-16,36,-28,31,-3,8,18,25,30,26,2,33,13],[2936,-2219,30,4,53,-14,27,-4,46,4'
+    ',37,-11],[1998,-2478,37,-25,8,-12,36,-77,3,-24,-19,-28,1,-30,5,-8,100,-2,10,13,30,13,13,19,38,26'
+    ',28,67,18,15,21,4,12,-2,50,-31,30,-3,14,-11,42,-8,69,11,14,10,33,86,49,14,44,37,15,54,10,12,22,1'
+    '6,19,5,14,15,12,2,45,51,17,10,46,11,17,20,12,7,23,2],[3496,-1158,60,-2,23,15,12,0,27,-16,1,-6,12'
+    ',-4,36,3,20,11,11,0,24,-12,15,-2,35,13,11,10,9,19,26,1,31,-13,30,18,53,11,12,9,55,21,47,36],[-84'
+    '35,1098,18,-20,25,-4,21,5,7,13],[2815,5614,-25,-6,-26,-17,-6,-11,-53,3,-10,-2,-13,-10,-23,-4],[2'
+    '821,4545,24,-16,31,-6,2,8,11,-2,51,13,17,-5,14,-11],[2136,4483,28,-12,27,-4,18,-13,41,17,14,-6,9'
+    ',-8,-18,-3,-6,-10,22,-20],[5623,2530,1,-9,5,7,-6,2],[3211,-2684,78,-1],[7174,3998,-7,-3,8,-4,4,9'
+    ',-5,-2],[-12269,4899,2753,0,0,38,31,-7,5,-30,9,-19,9,-7,56,-8,35,-13,25,3,8,6,38,-1,50,-17,9,-16'
+    ',24,6,16,-4,49,-24,13,0,47,15,8,-1,10,-10,65,2,10,-10,9,-2,44,0,108,30,350,-140,10,-26,22,-18,41'
+    ',8,6,-31,11,-15,36,4,15,-13,-12,-17,104,-47,41,-178,-27,-50,-14,-45,-32,-23,-20,-9,-8,-16,1,-16,'
+    '11,-15,34,-15,25,-1,116,54,103,16,121,43,12,11,-11,11,-3,26,-11,19,32,11,39,5,164,0,36,43,31,24,'
+    '27,12,48,35,40,20,14,3,334,1,19,28,20,-3,13,8,13,-7,7,13,11,3,-1,12,28,19,12,17,5,34,18,19,6,27,'
+    '77,75,19,-3,0,-16,11,-6,70,14,43,-27,4,-115,-3,-20,20,-11,17,-2,1,-7,-7,-6,6,-9,-4,-10,10,-11,25'
+    ',0],[3496,-1158,-7,19,-12,5,-16,26,5,37,-8,18,-6,50,-20,30,-23,19,-9,4,-5,-16,-6,-1],[10797,2151'
+    ',-21,15,-41,-5,-8,10,-21,8,-9,13,-24,8,-7,-2,-1,26,-10,10,0,16,23,28,-24,13,-26,-5,-13,11,-31,-5'
+    ',-29,15,-11,17,-16,11,-42,-21,-6,-23,-11,-9,-16,-2,-16,-10,-7,1,-9,10,-7,-1,-9,-5,-11,-21,-32,24'
+    ',-13,-19,-16,18,-19,-18,0,-5,-16,-9,-15,14,-36,16,-34,-37],[744,4375,-6,-2],[1243,4191,0,0],[113'
+    '55,2222,-6,2,-1,-4],[11402,2251,10,6,15,-3],[7061,3979,-13,9,22,-3,-9,-6],[7122,3991,-21,-1,3,9,'
+    '-7,5,1,9,4,2,6,-7,15,-3,-5,-7,4,-7],[14594,4310,-8,27,-8,11,-9,7,-15,-4,-30,27,3,13,26,23,9,15,4'
+    ',16,-8,34],[-128,3209,5,2,-1,23,17,13,-4,8,-34,23,-23,54,5,25,-8,21,0,40,-8,19,6,10,-12,14,5,14,'
+    '-33,22,-9,13],[2900,961,47,16,13,15,1,15,39,21,47,-30,29,-25,46,7,57,58,14,28,49,43,-8,22,0,41,-'
+    '27,29,67,0,-2,21,48,0,-13,-63,10,-74,-4,-9,25,-11,53,-47,5,-32,-7,-14,-2,-21,2,-5,19,0],[2415,86'
+    '7,6,10,32,12,12,29,2,21,11,14,1,28,17,18,6,25,8,7,76,10,6,-24,25,-20,38,-44,11,-5,41,13,81,-1],['
+    '2788,960,17,-27,79,0,0,13,16,15],[-5648,194,-22,10,-41,73,-9,8,-10,53,-30,-1],[-5462,233,22,13,2'
+    '0,36,0,32,12,19],[3389,-967,-19,7,-28,-1,-9,9,-20,2,-16,11,-5,-2],[3359,4610,7,12,15,-1,22,-10,1'
+    '9,-1,13,-4,10,-9,24,1,10,-9,1,-10,20,-6],[7705,3511,-28,55],[7705,3511,75,39],[7912,3323,26,-8,-'
+    '5,-17,17,-25,-12,-16,-16,-7],[7922,3250,-9,-2,-6,-9,-15,-3,-15,11,-7,13,-29,-4,-2,-4,10,-29],[78'
+    '49,3223,24,-25,-1,-10],[7872,3188,-3,-14,11,-12,-7,-15,1,-15,10,-2],[7884,3130,13,3,4,8,10,-1,26'
+    ',-32],[7937,3108,20,-13,22,2,12,-7],[7991,3090,28,-14,0,-19],[8019,3057,49,-16,31,-17,2,-8],[903'
+    '3,2812,2,12,-13,4,-24,3,-18,-7],[8980,2824,-32,-18,-36,-44],[8912,2762,-10,-11],[8902,2751,-7,-5'
+    ',-6,-14],[7530,3232,2,-10,-7,-8,-51,-19,-18,-13,-5,-11,8,-24,-7,-28,11,-16,-29,-14,-44,-45,3,-22'
+    ',-12,-13,-43,-16,-15,-38,-33,-52,-56,-28,-21,-40,-18,-17,-8,-22,-107,-25,-11,6,-6,17,-23,9,-26,-'
+    '18,-24,-38,-36,-35,-7,-32,4,-6,23,-11,32,-5,9,-7,-2,-30,-5,-14,2,-16,16,-20,31,0,8,-4,0,-25,40,-'
+    '73,-8,-12,0,-8,7,-9,-32,-16,-14,4,-3,14,-6,-1,-39,-12,-8,-10,-21,-2,-25,10,-73,-1,-5,5,-5,-4,-1,'
+    '-31,-34,-1,-21,-9],[3669,4562,0,-19,-10,-13,5,-4,-13,-6,10,-25],[-5581,-3103,-19,-5,0,23],[-5600'
+    ',-3085,-18,22,-65,52,-29,-3,-9,-14,-34,2,-6,7],[-7348,-4977,-10,19,12,27,32,1],[-7314,-4930,-1,1'
+    '1,12,18,38,17,6,11,1,25,23,11,6,14,-4,12,-18,14,-1,9,18,31,-1,8,25,15,6,10,14,4,-6,18,2,19,24,18'
+    ',-6,33,-12,16,20,12,5,9,-12,11,0,26,24,7,2,7,14,11,0,10,-25,25,-44,8,-2,13,80,1,10,20,1,7,-6,5,-'
+    '61,6,1,27,13,18,-11,18,5,5,-1,11,-15,15,0,9,14,6,1,5,-3,7,-32,10,-5,8,4,21,-3,20,9,11,-6,22,8,10'
+    ',17,0,10,5,1,5,-16,40,4,9,0,67,-7,10,14,35,10,10,-12,16,16,16,2,13,-8,25,18,4,12,31,2,35,31,18,1'
+    '4,2,10,20,-12,9,-6,41,-14,28,-2,13,6,18,-7,15,8,19,-7,27,12,20,1,12,15,10,16,3,3,11,32,22,2,29,-'
+    '4,25,-5,19,-9,8,17,10,10,42,24,43,20,8,-4,49,9,33,-2,12,-20,1,-6,7,-1,17,7,15,-10,7,-6,18,1,16,-'
+    '15,20,-4,19,11,12,-20,12,-14,27,7,42,13,3,8,10,-4,12,20,54,19,0,12,18,-12,10,3,31,-10,45,20,22,1'
+    '7,69,49,49,32,77,14,5,12,-4,24,11,3,6,0,9,-27,41,1,12,17,20,-18,73,9,26,12,7,-18,25,0,9,5,12,26,'
+    '24,89,36,35,103,-18,18],[7532,3458,-13,6,-89,13,-34,-12,-15,-23,0,-9,16,-9,-7,-13,2,-7,33,-5,-3,'
+    '-10,-22,-10,-2,-7,2,-9,15,-12,-3,-13,-13,-16,14,-14,17,-9,1,-18],[2361,5152,-7,10,0,9,9,10,2,23,'
+    '-5,6,-42,19,23,23,43,14,8,11,-6,34,-26,49,-12,34],[3408,946,8,39,15,34,-3,34,6,13,9,13,14,9,20,-'
+    '13,16,11,3,42,15,54,14,14,42,66,46,14,3,33,23,54,13,63],[239,1190,-10,-21,-31,-27,-12,2,-26,-4,-'
+    '4,5,-13,0,-11,-15,-17,-5,-7,-17,-9,0,-9,-9],[3195,-2596,-8,-2,-45,23,-21,-9,-41,-57,-1,-35,9,-3,'
+    '18,-32,41,-19,49,-1,3,49,12,-2],[3211,-2684,0,32,-7,24,2,26,-11,6],[7677,3566,-21,11,-1,12,-30,-'
+    '8,-10,2,-8,15,-16,7,6,12,0,21],[2733,519,16,-22,17,-12,13,-21,40,-29,24,-3,30,18,49,-11,25,22,8,'
+    '3,13,-5,51,-61,32,-14,8,-22,17,0,8,-13],[2286,1092,45,-53,34,-57,-3,-48,-15,-23,2,-12,6,-5,-1,-1'
+    '2,14,-9,47,-6],[4611,3888,38,3],[4478,3968,36,-43,34,-24,63,-13],[4649,3891,6,-1,30,25,14,3,49,3'
+    '2,29,15,23,3,32,-28,-18,-9,-4,-7,3,-7,14,-7,2,-8,-24,-9,-5,-8,31,-24,11,-2,17,-18,28,3],[8101,30'
+    '16,-16,-2,-45,-41,-15,-31,-2,-23,-15,-20,-1,-16,35,-22,6,-1,4,7,7,-2,58,-31,14,-16,54,-31,14,4,4'
+    '6,-24,23,0,5,-15,56,-15,16,10,38,-9,26,11,52,-19,8,-26,44,-18,11,-11,33,9,13,-6,4,-14,5,-4,22,5,'
+    '36,-8,33,-13,32,12,7,-13,20,-7,12,6,22,-2,22,4,15,-6,5,5,11,29,-5,21,-13,20,4,28,13,34,0,9,-4,3]'
+    ',[7597,3638,-13,27,-17,9,-25,0,-7,17,-30,8,-16,-4,-20,9,-15,-2]]}'
+)

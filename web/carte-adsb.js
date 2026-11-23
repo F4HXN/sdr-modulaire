@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Carte radar autonome pour le module ADS-B : côtes, frontières, cercles de distance,
-// avions orientés selon leur cap avec leur trace, et points (stations APRS : rond coloré selon
-// le symbole, indicatif, ancienneté, trace). Molette : zoom ; glisser : déplacer ;
+// avions orientés selon leur cap avec leur trace, points (stations APRS : rond coloré selon
+// le symbole, indicatif, ancienneté, trace) et navires AIS (orientés selon leur route, vecteur vitesse
+// sur 6 minutes, carré pour une station côtière, losange pour une aide à la navigation). Molette : zoom ; glisser : déplacer ;
 // clic : choisir un avion ou un point ; double-clic : recentrer.
 
 import { distanceKm } from "./adsb.js?v=20261122-niveau";
@@ -46,7 +47,7 @@ export class CarteRadar {
     this.c = canvas; this.ctx = canvas.getContext("2d");
     this.lat0 = 46.6; this.lon0 = 2.4; this.kmPx = 2.5;   // km par pixel
     this.selection = null; this.surChoix = surChoix;
-    this.avions = []; this.points = []; this.station = null;
+    this.avions = []; this.points = []; this.navires = []; this.station = null;
     chargerFond().then(() => this.dessiner());
     let glisse = null;
     canvas.addEventListener("wheel", e => {
@@ -84,10 +85,10 @@ export class CarteRadar {
 
   /** Cadre la vue sur la station, ou à défaut sur les avions connus. */
   centrer() {
-    const pos = [...this.avions, ...this.points].filter(a => a.lat !== undefined);
+    const pos = [...this.avions, ...this.points, ...this.navires].filter(a => a.lat !== undefined);
     if (this.station) { this.lat0 = this.station.lat; this.lon0 = this.station.lon; }
     else if (pos.length) { this.lat0 = pos.reduce((s, a) => s + a.lat, 0) / pos.length; this.lon0 = pos.reduce((s, a) => s + a.lon, 0) / pos.length; }
-    let rayon = 250;
+    let rayon = this.navires.length && !this.avions.length ? 10 : 250;
     for (const a of pos) rayon = Math.max(rayon, distanceKm(this.lat0, this.lon0, a.lat, a.lon) * 1.15);
     this.kmPx = Math.max(0.05, Math.min(50, 2 * rayon / Math.min(this.W || 600, this.H || 400)));
     this.dessiner();
@@ -104,6 +105,10 @@ export class CarteRadar {
       const [px, py] = this.versEcran(p.lat, p.lon), e = Math.hypot(px - x, py - y);
       if (e < d) { d = e; meilleur = p.id; }
     }
+    for (const n of this.navires) {
+      const [px, py] = this.versEcran(n.lat, n.lon), e = Math.hypot(px - x, py - y);
+      if (e < d) { d = e; meilleur = n.mmsi; }
+    }
     this.selection = meilleur; this.surChoix?.(meilleur); this.dessiner();
   }
 
@@ -116,7 +121,7 @@ export class CarteRadar {
 
     // Cercles de distance autour de la station (ou du centre de la vue).
     const ref = this.station || { lat: this.lat0, lon: this.lon0 }, [cx, cy] = this.versEcran(ref.lat, ref.lon);
-    const pas = [5, 10, 25, 50, 100, 200, 500].find(p => p / this.kmPx > 70) || 500;
+    const pas = [1, 2, 5, 10, 25, 50, 100, 200, 500].find(p => p / this.kmPx > 70) || 500;
     g.strokeStyle = "rgba(57,255,159,.16)"; g.fillStyle = "rgba(57,255,159,.55)"; g.lineWidth = 1; g.font = "11px ui-monospace, monospace";
     for (let r = pas, i = 0; i < 12; r += pas, i++) {
       g.beginPath(); g.arc(cx, cy, r / this.kmPx, 0, 2 * Math.PI); g.stroke();
@@ -184,6 +189,35 @@ export class CarteRadar {
       if (choisi) { g.strokeStyle = "#fff"; g.lineWidth = 1.5; g.beginPath(); g.arc(x, y, 12, 0, 2 * Math.PI); g.stroke(); }
       g.fillStyle = "#e6f1ff"; g.font = "600 11px ui-monospace, monospace"; g.fillText(p.id, x + 9, y - 2);
       g.fillStyle = coul; g.font = "11px ui-monospace, monospace"; g.fillText(anciennete(p.vu), x + 9, y + 11);
+      g.globalAlpha = 1;
+    }
+
+    // Navires AIS : trace, symbole orienté selon la route (vecteur vitesse sur 6 min), étiquette ; pâlis après 10 min.
+    for (const n of this.navires) {
+      const [x, y] = this.versEcran(n.lat, n.lon), coul = n.couleur, choisi = n.mmsi === this.selection;
+      const vieux = Date.now() - n.vu > 10 * 60000;
+      if (n.trace?.length > 1) {
+        g.strokeStyle = coul; g.globalAlpha = choisi ? 0.9 : 0.45; g.lineWidth = choisi ? 2 : 1.2; g.beginPath();
+        n.trace.forEach(([lat, lon], i) => { const [tx, ty] = this.versEcran(lat, lon); i ? g.lineTo(tx, ty) : g.moveTo(tx, ty); });
+        g.stroke(); g.globalAlpha = 1;
+      }
+      g.globalAlpha = vieux ? 0.45 : 1;
+      g.fillStyle = coul; g.strokeStyle = "#040912"; g.lineWidth = 1.2;
+      g.beginPath();
+      if (n.classe === "station de base") g.rect(x - 4.5, y - 4.5, 9, 9);
+      else if (n.classe === "aide à la navigation") { g.moveTo(x, y - 6); g.lineTo(x + 6, y); g.lineTo(x, y + 6); g.lineTo(x - 6, y); g.closePath(); }
+      else if (n.route_deg != null && (n.vitesse_nd ?? 0) >= 0.5) {
+        g.save(); g.translate(x, y); g.rotate(n.route_deg * Math.PI / 180);
+        g.moveTo(0, -10); g.lineTo(4, -3); g.lineTo(4, 7); g.lineTo(-4, 7); g.lineTo(-4, -3); g.closePath(); g.fill(); g.stroke();   // coque, étrave vers la route
+        g.beginPath(); g.strokeStyle = coul; g.lineWidth = 1;
+        g.moveTo(0, -10); g.lineTo(0, -10 - n.vitesse_nd * 1.852 * 0.1 / this.kmPx); g.stroke();
+        g.restore(); g.beginPath();
+      } else g.arc(x, y, 4.5, 0, 2 * Math.PI);
+      g.fill(); g.stroke();
+      if (choisi) { g.strokeStyle = "#fff"; g.lineWidth = 1.5; g.beginPath(); g.arc(x, y, 13, 0, 2 * Math.PI); g.stroke(); }
+      g.fillStyle = "#e6f1ff"; g.font = "600 11px ui-monospace, monospace"; g.fillText(n.nom || String(n.mmsi).padStart(9, "0"), x + 10, y - 2);
+      g.fillStyle = coul; g.font = "11px ui-monospace, monospace";
+      g.fillText(`${n.vitesse_nd != null ? `${n.vitesse_nd.toFixed(1).replace(".", ",")} nd · ` : ""}${anciennete(n.vu)}`, x + 10, y + 11);
       g.globalAlpha = 1;
     }
 

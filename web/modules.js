@@ -16,7 +16,8 @@ import { FirComplexe, NCO, passeBas, LARGEURS, FFT } from "./dsp.js?v=20261122-c
 import { StereoRds } from "./fm-stereo.js?v=20261122-cw";
 import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
 import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261122-niveau";
-import { CarteRadar, couleurAltitude, couleurSymbole } from "./carte-adsb.js?v=20261122-carteaprs";
+import { CarteRadar, couleurAltitude, couleurSymbole } from "./carte-adsb.js?v=20261123-ais";
+import { MoteurAIS, CANAUX as CANAUX_AIS, decoderMessage as decoderAIS, octetsVersBits, texteMessage as texteAIS, categorie as categorieAIS, couleurNavire, nomNavire } from "./ais.js?v=20261123-ais";
 import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
 import { TAUX_CW, DUREE_FENETRE, DUREE_PAS } from "./cw.js?v=20261122-cw";
 import { DemodAFSK, trameVersTexte, positionAPRS } from "./aprs.js?v=20261122-carteaprs";
@@ -2149,4 +2150,192 @@ class FaxMeteo {
   arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, EnregistreurIQ, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, FaxMeteo, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR, DecodeurACARS, Tonalites];
+class DecodeurAIS {
+  static nom = "Décodeur AIS (navires)";
+  static description = "Navires et stations côtières (AIS, 161,975 et 162,025 MHz décodés ensemble) : nom, MMSI, position, vitesse, route, type, destination ; carte et tableau.";
+
+  demarrer() {
+    this.recus = []; this.nombre = 0; this.cle = ""; this.moteur = null; this.derniersIQ = -Infinity; this.saturation = 0;
+    this.navires = new Map();
+    // Station d'écoute : la sienne, ou celle des modules APRS ou ADS-B.
+    const autre = nom => { try { return JSON.parse(localStorage.getItem(`sdr-web/${nom}/station`)); } catch { return null; } };
+    this.station = this.ctx.lire("station", null) ?? autre("Décodeur APRS") ?? autre("ADS-B (avions)");
+    this.ctx.abonner("iq", (re, im, centre, taux) => this.recevoir(re, im, centre, taux));
+  }
+
+  recevoir(re, im, centre, taux) {
+    this.derniersIQ = performance.now();
+    let sat = 0;
+    for (let k = 0; k < re.length; k += 4) if (re[k] > 0.95 || re[k] < -0.95 || im[k] > 0.95 || im[k] < -0.95) sat++;
+    this.saturation = sat / Math.ceil(re.length / 4);
+    const cle = `${centre}/${taux}`;
+    if (cle !== this.cle) { this.cle = cle; this.moteur = new MoteurAIS(centre, taux); }
+    for (const [canal, o] of this.moteur.traiter(re, im)) {
+      const m = decoderAIS(octetsVersBits(o));
+      if (m) { this.recus.push([canal, m]); this.mettreAJour(m); }
+    }
+  }
+
+  mettreAJour(m) {
+    const maintenant = Date.now();
+    let n = this.navires.get(m.mmsi);
+    if (!n) { n = { mmsi: m.mmsi, nb: 0, trace: [] }; this.navires.set(m.mmsi, n); }
+    n.vu = maintenant; n.nb++;
+    for (const c of ["nom", "indicatif", "type_navire", "destination", "classe", "longueur", "largeur", "imo"])
+      if (m[c] !== undefined && m[c] !== "" && m[c] !== 0) n[c] = m[c];
+    if (m.vitesse !== undefined) n.vitesse_nd = m.vitesse === 1023 ? null : m.vitesse / 10;
+    if (m.route !== undefined || m.cap !== undefined)
+      n.route_deg = m.cap !== undefined && m.cap < 360 ? m.cap : m.route !== undefined && m.route < 3600 ? m.route / 10 : null;
+    if (m.statut !== undefined) n.statut = m.statut;
+    if (m.position) {
+      [n.lat, n.lon] = m.position;
+      const der = n.trace[n.trace.length - 1];
+      if (!der || der[0] !== n.lat || der[1] !== n.lon) { n.trace.push([n.lat, n.lon, maintenant]); if (n.trace.length > 200) n.trace.shift(); }
+    }
+    n.couleur = couleurNavire(n);
+    this.carteAJour = true;
+  }
+
+  accorder() {
+    const f = CANAUX_AIS[0][0];
+    this.ctx.reglerMode("NFM");
+    this.ctx.reglerFrequence(f + this.ctx.taux());      // la clé se recentre…
+    this.ctx.reglerFrequence(f);                        // … et couvre les deux canaux
+  }
+
+  creerPanneau() {
+    this.resume = el("div", { className: "petit" });
+    const accorder = el("button", { type: "button", textContent: "Accorder", title: "Met la clé sur les deux canaux AIS (VFO sur 161,975 MHz en NFM pour écouter)" });
+    accorder.onclick = () => this.accorder();
+    this.statut = el("div", { className: "petit" });
+    this.diag = el("div", { className: "petit", title: "Par canal : crête au-dessus du bruit, messages reçus, décalage de fréquence mesuré (corrigez le ppm de la clé s'il dépasse 2 kHz)" });
+    this.diag.style.color = "var(--doux)";
+    this.liste = el("ul", { className: "journal aprs-liste" });
+    const effacer = el("button", { type: "button", textContent: "Effacer" });
+    effacer.onclick = () => this.liste.replaceChildren();
+    const texte = () => [...this.liste.children].reverse().map(li => li.textContent).join("\n");
+    const copier = el("button", { type: "button", textContent: "Copier" });
+    copier.onclick = () => navigator.clipboard?.writeText(texte()).then(() => {
+      copier.textContent = "Copié"; setTimeout(() => { copier.textContent = "Copier"; }, 1200);
+    }).catch(() => {});
+    const enregistrer = el("button", { type: "button", textContent: "Enregistrer", title: "Télécharge les messages reçus dans un fichier texte" });
+    enregistrer.onclick = () => {
+      const d = new Date(), h = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "_");
+      const a = el("a", { href: URL.createObjectURL(new Blob([texte() + "\n"], { type: "text/plain" })), download: `ais_${h}.txt` });
+      a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    };
+    const ouvrirCarte = el("button", { type: "button", textContent: "Carte", title: "Navires sur une carte, avec le tableau" });
+    ouvrirCarte.setAttribute("aria-haspopup", "dialog");
+    ouvrirCarte.onclick = () => this.ouvrirCarte();
+    this.creerCarte();
+    const actions = el("div", { className: "scanner-choix cw-actions" }, ouvrirCarte, effacer, copier, enregistrer);
+    const contenu = el("div", { className: "cw-contenu aprs-contenu" },
+      el("div", { className: "scanner-choix" }, this.resume, accorder), this.statut, this.diag, this.liste, actions);
+    const { panneau, dialogue } = panneauAgrandissable(this.ctx, { titre: DecodeurAIS.nom, id: "ais-titre", contenu, actions,
+      tailleDefaut: 1.1, attenteTexte: "Messages affichés dans la fenêtre agrandie." });
+    this.dialogue = dialogue;
+    panneau.append(this.fenCarte);
+    this.minuterie = setInterval(() => this.rafraichir(), 250);
+    this.rafraichir();
+    return panneau;
+  }
+
+  creerCarte() {
+    const titre = el("h2", { id: "ais-carte-titre", textContent: "AIS · navires reçus" });
+    titre.title = "Tirer la barre pour déplacer · coin en bas à droite pour agrandir";
+    this.resumeCarte = el("span", { className: "adsb-resume" });
+    const fermer = el("button", { type: "button", textContent: "Fermer" });
+    const recentrer = el("button", { type: "button", textContent: "Recentrer" });
+    const toile = el("canvas", { className: "adsb-carte" });
+    toile.setAttribute("aria-label", "Carte des navires AIS reçus");
+    this.tableau = el("tbody");
+    const table = el("table", { className: "adsb-table" },
+      el("thead", {}, el("tr", {}, ...["Navire", "MMSI", "Type", "Vitesse", "Route", "Dist.", "Vu", "Destination"].map(t => el("th", { textContent: t })))), this.tableau);
+    const st = this.station;
+    const lat = el("input", { type: "number", step: "0.0001", min: -90, max: 90, placeholder: "43.6960", value: st?.lat ?? "" });
+    const lon = el("input", { type: "number", step: "0.0001", min: -180, max: 180, placeholder: "7.2700", value: st?.lon ?? "" });
+    const placer = el("button", { type: "button", textContent: "Enregistrer la station" });
+    placer.onclick = () => {
+      const la = parseFloat(lat.value), lo = parseFloat(lon.value);
+      this.station = Number.isFinite(la) && Number.isFinite(lo) ? { lat: la, lon: lo } : null;
+      this.ctx.ecrire("station", this.station); this.carte.station = this.station; this.carte.centrer(); this.majTableau();
+    };
+    const pied = el("div", { className: "adsb-pied" },
+      el("label", {}, "Station : lat. ", lat), el("label", {}, " lon. ", lon), placer,
+      el("span", { className: "petit", textContent: "Facultatif : sert aux distances et aux cercles (reprise des modules APRS ou ADS-B si déjà saisie)." }));
+    const entete = el("header", {}, titre, this.resumeCarte, el("span", { className: "adsb-boutons" }, recentrer, fermer));
+    this.fenCarte = el("dialog", { className: "adsb-dialogue" }, entete,
+      el("div", { className: "adsb-corps" }, toile, el("div", { className: "adsb-cote" }, table)), pied);
+    this.fenCarte.setAttribute("aria-labelledby", titre.id);
+    this.afficherCarte = fenetreFlottante(this.fenCarte, entete, this.ctx, "carte");
+    this.carte = new CarteRadar(toile, { surChoix: id => { this.choisi = id; this.majTableau(); } });
+    this.carte.station = this.station;
+    fermer.onclick = () => this.fenCarte.close();
+    recentrer.onclick = () => this.carte.centrer();
+  }
+
+  places() { return [...this.navires.values()].filter(n => n.lat !== undefined); }
+
+  ouvrirCarte() {
+    if (this.fenCarte.open) return;
+    this.afficherCarte(); this.carte.navires = this.places(); this.carte.centrer(); this.majTableau();
+  }
+
+  trier() {
+    const st = this.station;
+    const cle = n => st ? (n.lat !== undefined ? distanceKm(st.lat, st.lon, n.lat, n.lon) : 1e9) : -n.vu;
+    return [...this.navires.values()].sort((a, b) => cle(a) - cle(b));
+  }
+
+  majTableau() {
+    const st = this.station, v = x => String(x).replace(".", ",");
+    this.tableau.replaceChildren(...this.trier().map(n => {
+      const type = ["station de base", "aide à la navigation"].includes(n.classe) ? n.classe : n.type_navire ? categorieAIS(n.type_navire) : "";
+      const tr = el("tr", { className: n.mmsi === this.choisi ? "choisi" : "" },
+        el("td", {}, el("i", { className: "adsb-pastille" }), n.nom || (n.classe === "station de base" ? "station côtière" : "—")),
+        el("td", { textContent: String(n.mmsi).padStart(9, "0") }),
+        el("td", { textContent: type }),
+        el("td", { textContent: n.vitesse_nd != null ? `${v(n.vitesse_nd.toFixed(1))} nd` : "" }),
+        el("td", { textContent: n.route_deg != null ? `${Math.round(n.route_deg)}°` : "" }),
+        el("td", { textContent: st && n.lat !== undefined ? `${v(distanceKm(st.lat, st.lon, n.lat, n.lon).toFixed(1))} km` : "" }),
+        el("td", { textContent: new Date(n.vu).toLocaleTimeString("fr-FR") }),
+        el("td", { textContent: n.destination || "" }));
+      tr.firstChild.firstChild.style.background = n.couleur;
+      tr.onclick = () => {
+        if (n.lat === undefined) return;
+        this.choisi = this.carte.selection = n.mmsi;
+        this.carte.lat0 = n.lat; this.carte.lon0 = n.lon; this.carte.dessiner(); this.majTableau();
+      };
+      return tr;
+    }));
+  }
+
+  rafraichir() {
+    if (this.fenCarte?.open) {
+      this.resumeCarte.textContent = `${this.navires.size} navire(s) et station(s) · ${this.places().length} placé(s) · ${this.nombre} message(s)`;
+      this.carte.navires = this.places(); this.carte.dessiner();
+      if (this.carteAJour) { this.carteAJour = false; this.majTableau(); }
+    }
+    for (const [canal, m] of this.recus.splice(0)) {
+      this.nombre++;
+      this.liste.prepend(el("li", { textContent: `${new Date().toLocaleTimeString("fr-FR")}  ${texteAIS(m, canal)}` }));
+      if (this.liste.children.length > 500) this.liste.lastChild.remove();
+    }
+    const maj = (e, t) => { if (e.textContent !== t) e.textContent = t; };
+    const actifs = [...this.navires.values()].filter(n => Date.now() - n.vu < 600000).length;
+    maj(this.resume, `${actifs} navire(s) ou station(s) en 10 min · ${this.nombre} message(s)`);
+    const m = this.moteur, v = x => String(x).replace(".", ",");
+    const sat = this.saturation > 0.001;
+    maj(this.statut, performance.now() - this.derniersIQ > 1500 ? "Démarrez la réception : le décodeur lit les IQ de la clé."
+      : !m?.canaux.length ? "Les canaux AIS (161,975 et 162,025 MHz) ne sont pas dans la bande reçue : cliquez sur « Accorder »."
+      : `Écoute de ${m.canaux.map(c => `AIS ${c.nom}`).join(" et ")}${m.dehors.length ? ` · hors de la bande : ${m.dehors.map(([f]) => v((f / 1e6).toFixed(3))).join(", ")} MHz` : ""}`
+        + (sat ? ` · SATURATION ${v((100 * this.saturation).toFixed(1))} % : baissez le gain RF` : ""));
+    if (m?.canaux.length && performance.now() - this.derniersIQ <= 1500)
+      maj(this.diag, m.canaux.map(c => `AIS ${c.nom} : crête +${Math.round(c.crete - c.bruit)} dB, ${c.messages} msg`
+        + (c.decalage !== null ? `, décalage ${c.decalage >= 0 ? "+" : ""}${v((c.decalage / 1000).toFixed(1))} kHz` : "")).join(" · "));
+  }
+
+  arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); if (this.fenCarte?.open) this.fenCarte.close(); }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, EnregistreurIQ, Journal, Capteurs433, ModuleStereoRds, ADSB, DecodeurAIS, ScannerMemoires, ScannerFrequences, ModuleSSTV, FaxMeteo, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR, DecodeurACARS, Tonalites];
