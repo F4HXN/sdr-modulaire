@@ -90,7 +90,7 @@ modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite
 modules-a-telecharger/  adsb.py, scanner_memoires.py, scanner_frequences.py,
                         pilotage_rigctl.py, sstv.py, decodeur_cw.py, decodeur_aprs.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
 outils/decodeur_cw/     entraînement du réseau du Décodeur CW (PyTorch, non nécessaire à l'exécution)
-tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py, test_decodeur_dmr.py, test_tonalites.py
+tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py, test_decodeur_dmr.py, test_tonalites.py, test_enregistreur_iq.py
 ```
 
 ## Trois niveaux d'extension
@@ -148,6 +148,7 @@ python3 -m tests.test_decodeur_cw                                     # Décodeu
 python3 -m tests.test_decodeur_aprs                                   # Décodeur APRS sur trames AFSK synthétiques
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_decodeur_dmr dmr.wav  # Décodeur DMR sur un flux de relais synthétique
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_tonalites          # CTCSS, DTMF et 1750 Hz sur des émissions NFM synthétiques
+QT_QPA_PLATFORM=offscreen HOME=$(mktemp -d) python3 -m tests.test_enregistreur_iq  # formats IQ, enregistrement et relecture dans l'appli
 ```
 
 ## Modules disponibles
@@ -193,16 +194,25 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
   CTCSS par DFT sur 2 s avec interpolation (150,0 / 151,4 et 156,7 / 157,7 Hz bien séparés), DTMF par Goertzel.
   Fonctionne jusqu'à ~5 dB de C/N sur les signaux de `tests/test_tonalites.py`.
   Aussi dans SDR Web (`web/tonalites.js`, même algorithme, mêmes résultats).
+- **Enregistreur IQ** (toute la bande reçue) : enregistre les échantillons IQ au taux de la clé dans un WAV deux canaux
+  8 bits (2 octets par échantillon : 288 Mo par minute à 2,4 MS/s), nommé et marqué comme ceux de SDR# / HDSDR
+  (fréquence centrale et heure UTC dans le bloc `auxi`), donc lisible par SDR#, HDSDR, SDR++. Nouveau fichier si
+  le centre ou le taux change, ou près de 4 Go ; arrêt si le disque passe sous 1 Go libre. **Relecture** : le
+  module remplace la clé par l'enregistrement, à vitesse réelle, au taux et au centre du fichier (position réglable,
+  en boucle ou non) ; on s'accorde n'importe où dans la bande et tous les modules marchent comme en direct.
+  Lit aussi les WAV IQ 16 bits et flottants, SigMF (cu8, ci8, ci16_le, cf32_le) et les fichiers bruts de gqrx.
+  Aussi dans SDR Web (`web/enregistreur-iq.js` : même format de fichier, enregistrement dans un dossier choisi
+  sous Chrome, relecture des WAV 8 et 16 bits).
 
 ## Pistes
 
 Déjà réalisées : stéréo + RDS en WFM, scanner de mémoires, scanner de fréquences, ADS-B,
 capteurs 433 MHz, pilotage rigctl (Gpredict), décodeur SSTV, décodeur CW, décodeur APRS, décodeur FT8/FT4,
-décodeur DMR (données), tonalités CTCSS / DTMF / 1750 Hz, convertisseur HF,
+décodeur DMR (données), tonalités CTCSS / DTMF / 1750 Hz, enregistreur IQ, convertisseur HF,
 version navigateur (SDR Web).
 
 Restent : voix DMR (dsd-fme dans l'appli), envoi des trames APRS vers aprs.jerko.fr / APRS-IS,
-WSPR via `jt9`, enregistreur IQ, sortie MQTT vers InfluxDB/Grafana, serveur web pour
+WSPR via `jt9`, sortie MQTT vers InfluxDB/Grafana, serveur web pour
 l'écoute à distance.
 
 ## Licence

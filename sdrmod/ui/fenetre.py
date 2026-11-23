@@ -233,6 +233,8 @@ class FenetrePrincipale(QMainWindow):
             if centre != r.centre:
                 r.centre = centre
                 self.moteur.regler_centre(centre)
+            # centre bloqué (bord de la plage du tuner, relecture d'un fichier IQ) : le VFO reste dans la bande
+            f = min(max(f, r.centre - limite - bas), r.centre + limite - haut)
         r.decalage = f - r.centre
         self.moteur.decalage = r.decalage
         self._maj_vfo()

@@ -4,7 +4,7 @@
 import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261122-cw";
 import { CleRtlSdr } from "./rtlsdr.js?v=20261122-pll";
 import { SourceSimulation } from "./simulation.js?v=20261122-niveau";
-import { MODULES } from "./modules.js?v=20261123-tonalites";
+import { MODULES } from "./modules.js?v=20261123-iq";
 
 const $ = s => document.querySelector(s);
 const PAS = [1, 10, 100, 1000, 2500, 5000, 6250, 8330, 10000, 12500, 25000, 100000, 1000000];
@@ -95,12 +95,13 @@ async function demarrerAudio() {
   if (audio.state === "suspended") await audio.resume();
 }
 
-async function demarrer(type, usb = null) {   // usb : clé déjà autorisée (relance sans redemander)
+// usb : clé déjà autorisée (relance sans redemander) ; objet : source fournie par un module (fichier IQ)
+async function demarrer(type, usb = null, objet = null) {
   await arreter();
   try {
     await demarrerAudio();
-    source = type === "cle" ? (usb ? new CleRtlSdr(usb) : await CleRtlSdr.choisir()) : new SourceSimulation();
-    statut(type === "cle" ? "Ouverture de la clé…" : "Source simulée");
+    source = type === "fichier" ? objet : type === "cle" ? (usb ? new CleRtlSdr(usb) : await CleRtlSdr.choisir()) : new SourceSimulation();
+    statut(type === "cle" ? "Ouverture de la clé…" : type === "fichier" ? `Relecture : ${objet.fichier?.name ?? objet.nom}` : "Source simulée");
     await source.ouvrir(R.taux, R.centre + R.convertisseur);
     if (source.reglerDirect && R.direct) await source.reglerDirect(R.direct);
     if (source.reglerPpm) await source.reglerPpm(R.ppm);
@@ -116,7 +117,10 @@ async function demarrer(type, usb = null) {   // usb : clé déjà autorisée (r
   fft = new FFT(TAILLE_FFT); moyenne = null;
   const bloc = R.taux / 20;   // 50 ms
   if (source instanceof SourceSimulation) minuterie = setInterval(() => traiterBloc(source.lire(bloc)), 50);
-  else {
+  else if (type === "fichier") {
+    source.surErreur = e => { erreur("Relecture interrompue : " + e.message); arreter(); };
+    source.demarrerLecture(Math.ceil((bloc * 2) / 512) * 512, traiterBloc);
+  } else {
     source.surErreur = e => { erreur("Lecture interrompue : " + e.message); arreter(); };
     statut(`Clé ouverte (${nomCle()}), en attente des échantillons…`);
     clearTimeout(attenteEchantillons);
@@ -148,7 +152,10 @@ function accorderCentre(c) {      // les réglages de la clé passent l'un aprè
 
 // ---------------------------------------------------------------- accord
 function reglerFrequence(f, recentrer = true) {
-  const [a, b] = source?.plage || [22e6, 1100e6];   // plage de la clé, ramenée à l'affichage
+  const [a, b] = source?.centreFixe   // relecture d'un fichier : centre imposé, le VFO reste dans la bande enregistrée
+    ? [R.centre + R.convertisseur - R.taux * 0.46, R.centre + R.convertisseur + R.taux * 0.46]
+    : source?.plage || [22e6, 1100e6];   // plage de la clé, ramenée à l'affichage
+  if (source?.centreFixe) recentrer = false;
   const mini = Math.max(0, a - R.convertisseur), maxi = b - R.convertisseur;
   f = Math.round(Math.max(mini, Math.min(maxi, f)));
   const marge = R.taux * 0.4;
@@ -238,7 +245,9 @@ remplir($("#pas"), PAS, p => p >= 1e6 ? `${p / 1e6} MHz` : p >= 1000 ? `${p / 10
 remplir($("#taux"), TAUX, t => `${(t / 1e6).toFixed(3)} MS/s`, R.taux);
 $("#mode").onchange = e => reglerMode(e.target.value);
 $("#pas").onchange = e => { R.pas = Number(e.target.value); };
-$("#taux").onchange = async e => { R.taux = Number(e.target.value); remplirZoom(); if (source) await demarrer(source instanceof SourceSimulation ? "sim" : "cle", source.usb); };
+$("#taux").onchange = async e => {
+  if (source?.centreFixe) { e.target.value = R.taux; statut("Le taux est celui de l'enregistrement pendant la relecture."); return; }
+  R.taux = Number(e.target.value); remplirZoom(); if (source) await demarrer(source instanceof SourceSimulation ? "sim" : "cle", source.usb); };
 $("#largeur").value = largeur();
 $("#largeur").onchange = e => { R.largeurs[R.mode] = Number(e.target.value); chaine?.regler(R.mode, largeur()); };
 // Entrée HF : échantillonnage direct (branche Q de la Blog V3) ; décalage d'un convertisseur HF
@@ -304,7 +313,7 @@ function majEtat() {
   $("#b-arret").disabled = !actif;
   $("#etat").textContent = actif ? `${source.nom} en fonction` : "arrêté";
   $("#etat").className = actif ? "marche" : "";
-  const cle = actif && !(source instanceof SourceSimulation);   // une vraie clé est ouverte
+  const cle = actif && source instanceof CleRtlSdr;   // une vraie clé est ouverte
   $("#b-cle").classList.toggle("connecte", cle);
   $("#b-cle").textContent = cle ? "✓ Clé connectée" : "🔌 Connecter la clé";
   $("#b-cle").title = cle ? "Clé RTL-SDR ouverte et en réception (cliquer pour en choisir une autre)" : "";
@@ -476,10 +485,23 @@ const contexte = module => ({
     appliquerGain();
   },
   async reglerTaux(t) {
-    if (!TAUX.includes(t) || t === R.taux) return;
+    if (!TAUX.includes(t) || t === R.taux || source?.centreFixe) return;
     R.taux = t; $("#taux").value = t; remplirZoom();
     if (source) await demarrer(source instanceof SourceSimulation ? "sim" : "cle", source.usb);
   },
+  /** Remplace la source par un objet du module (relecture d'un fichier IQ : taux et centre imposés). */
+  async rejouer(objet) {
+    if (!TAUX.includes(objet.taux)) throw new Error(`taux de ${objet.taux / 1e6} MS/s non pris en charge (${TAUX.map(t => t / 1e6).join(", ")} MS/s)`);
+    const avant = frequence();
+    R.taux = objet.taux; $("#taux").value = objet.taux; remplirZoom();
+    R.centre = objet.centre;
+    R.decalage = Math.abs(avant - R.centre) < 0.4 * R.taux ? avant - R.centre : 0.1 * R.taux;
+    await demarrer("fichier", null, objet);
+    reglerFrequence(frequence(), false);
+    return source === objet;
+  },
+  source: () => source,
+  arreterSource: () => arreter(),
   lire(cle, defaut) { try { return JSON.parse(localStorage.getItem(`sdr-web/${module.nom}/${cle}`)) ?? defaut; } catch { return defaut; } },
   ecrire(cle, v) { localStorage.setItem(`sdr-web/${module.nom}/${cle}`, JSON.stringify(v)); },
 });
@@ -533,7 +555,7 @@ requestAnimationFrame(dessiner);
 // les utilisateurs de SDR Web en ce moment (stats/presence.py du serveur, page /visites/).
 const PRESENCE = crypto.getRandomValues(new Uint32Array(2)).reduce((s, x) => s + x.toString(36).padStart(7, "0"), "");
 const presence = (fin = false) => {
-  const cle = source && !(source instanceof SourceSimulation) ? 1 : 0;
+  const cle = source instanceof CleRtlSdr ? 1 : 0;
   const url = `/sdr-web/presence?s=${PRESENCE}&cle=${cle}${fin ? "&fin=1" : ""}`;
   if (fin) navigator.sendBeacon?.(url); else fetch(url, { cache: "no-store", keepalive: true }).catch(() => {});
 };

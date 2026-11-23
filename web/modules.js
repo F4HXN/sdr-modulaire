@@ -20,6 +20,7 @@ import { CarteRadar, couleurAltitude, couleurSymbole } from "./carte-adsb.js?v=2
 import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
 import { TAUX_CW, DUREE_FENETRE, DUREE_PAS } from "./cw.js?v=20261122-cw";
 import { DemodAFSK, trameVersTexte, positionAPRS } from "./aprs.js?v=20261122-carteaprs";
+import { enteteWav, iqVersOctets, nomFichier, lireEnteteWav, SourceFichierIQ, LIMITE_WAV } from "./enregistreur-iq.js?v=20261123-iq";
 import { MoteurTonalites, TAUX_TONALITES, texteCtcss, secondes } from "./tonalites.js?v=20261123-tonalites";
 import { DecodeurDMR as MoteurDMR, TAUX_DMR, FID as FID_DMR, SAP as SAP_DMR, nomSlot, texteAppel } from "./dmr.js?v=20261122-dmr";
 
@@ -1749,4 +1750,146 @@ class Tonalites {
   arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR, Tonalites];
+
+const enMo = o => o >= 1e9 ? `${(o / 1e9).toFixed(2).replace(".", ",")} Go` : `${Math.round(o / 1e6)} Mo`;
+const enDuree = s => { s = Math.floor(s); return `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, "0")} s`; };
+const enMHz = f => `${(f / 1e6).toFixed(4).replace(".", ",")} MHz`;
+
+class EnregistreurIQ {
+  static nom = "Enregistreur IQ";
+  static description = "Enregistre toute la bande reçue (IQ, pas seulement le son) dans un WAV que SDR#, HDSDR, SDR++ ou SDR Modulaire savent lire, puis la rejoue : on démodule après coup n'importe quelle station.";
+
+  demarrer() {
+    this.actif = false; this.dossier = null; this.lecture = null;
+    this.ctx.abonner("iq", (re, im, centre, taux) => this.recevoir(re, im, centre, taux));
+  }
+
+  // ------------------------------------------------------------- enregistrement
+  async commencer() {
+    this.erreur = "";
+    if (this.actif) return;
+    if (window.showDirectoryPicker && !this.dossier) {
+      try { this.dossier = await showDirectoryPicker({ id: "sdr-web-iq", mode: "readwrite", startIn: "downloads" }); }
+      catch (e) { if (e.name === "AbortError") return; this.dossier = null; }
+    }
+    Object.assign(this, { actif: true, octets: 0, perdus: 0, debut: performance.now(), fichier: null, chaine: Promise.resolve(), attente: 0 });
+    this.majBouton();
+  }
+
+  recevoir(re, im, centre, taux) {
+    if (!this.actif) return;
+    const o = iqVersOctets(re, im);
+    const f = this.fichier;
+    const limite = this.dossier ? LIMITE_WAV : this.limiteMemoire();
+    if (!f || f.centre !== centre || f.taux !== taux || f.octets + o.length > limite) {
+      const plein = f && !this.dossier && f.octets + o.length > limite;
+      if (f) { this.fichier = null; this.clore(f); }
+      if (plein) { this.arreterEnr(); this.erreur = "Limite de la mémoire atteinte : enregistrement arrêté et téléchargé."; return; }
+      this.fichier = this.ouvrir(centre, taux);
+    }
+    if (this.attente > 64e6) { this.perdus++; return; }      // le disque ne suit pas
+    const g = this.fichier;
+    g.octets += o.length; this.octets += o.length;
+    if (g.morceaux) { g.morceaux.push(o); return; }
+    this.attente += o.length;
+    this.chaine = this.chaine.then(() => g.flux.then(w => w.write(o))).then(() => { this.attente -= o.length; })
+      .catch(e => { this.erreur = `Écriture impossible : ${e.message}`; this.arreterEnr(); });
+  }
+
+  limiteMemoire() { return 1e9; }
+
+  ouvrir(centre, taux) {
+    const debut = new Date(), nom = nomFichier(debut, centre);
+    const f = { nom, centre, taux, debut, octets: 0 };
+    if (this.dossier) {
+      f.flux = this.dossier.getFileHandle(nom, { create: true }).then(h => h.createWritable())
+        .then(async w => { await w.write(enteteWav(taux, centre, debut, debut, 0)); return w; });
+    } else f.morceaux = [enteteWav(taux, centre, debut, debut, 0)];
+    this.dernier = nom;
+    return f;
+  }
+
+  clore(f) {
+    const entete = enteteWav(f.taux, f.centre, f.debut, new Date(), f.octets);
+    if (f.morceaux) {
+      f.morceaux[0] = entete;
+      const a = el("a", { href: URL.createObjectURL(new Blob(f.morceaux, { type: "audio/wav" })), download: f.nom });
+      a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+      f.morceaux = null;
+    } else {
+      this.chaine = this.chaine.then(() => f.flux).then(async w => { await w.write({ type: "write", position: 0, data: entete }); await w.close(); })
+        .catch(e => { this.erreur = `Fermeture impossible : ${e.message}`; });
+    }
+  }
+
+  arreterEnr() {
+    if (!this.actif) return;
+    this.actif = false;
+    if (this.fichier) this.clore(this.fichier);
+    this.fichier = null;
+    this.majBouton();
+  }
+
+  majBouton() { if (this.bEnr) this.bEnr.textContent = this.actif ? "■ Arrêter l'enregistrement" : "● Enregistrer"; }
+
+  // ------------------------------------------------------------- relecture
+  async rejouer(fichier) {
+    try {
+      const info = await lireEnteteWav(fichier);
+      this.arreterEnr();
+      const s = new SourceFichierIQ(fichier, info);
+      s.boucle = this.boucle.checked;
+      if (await this.ctx.rejouer(s)) this.lecture = s;
+    } catch (e) { this.erreur = `Relecture impossible : ${e.message}`; }
+  }
+
+  creerPanneau() {
+    this.statut = el("div", { className: "petit" });
+    this.bEnr = el("button", { type: "button", title: "Enregistre toute la bande reçue (2 octets par échantillon). Chrome demande d'abord un dossier." });
+    this.bEnr.onclick = () => this.actif ? this.arreterEnr() : this.commencer();
+    this.majBouton();
+    const choisir = el("input", { type: "file", accept: ".wav,audio/wav" });
+    choisir.style.display = "none";
+    choisir.onchange = () => { if (choisir.files[0]) this.rejouer(choisir.files[0]); choisir.value = ""; };
+    const bRejouer = el("button", { type: "button", textContent: "Rejouer un fichier…", title: "WAV IQ 8 ou 16 bits : SDR Web, SDR Modulaire, SDR#, HDSDR, SDR++" });
+    bRejouer.onclick = () => choisir.click();
+    this.bStop = el("button", { type: "button", textContent: "Arrêter la relecture", title: "Reconnectez ensuite la clé avec « Connecter la clé »" });
+    this.bStop.onclick = () => { if (this.ctx.source() === this.lecture) this.ctx.arreterSource(); this.lecture = null; };
+    this.boucle = el("input", { type: "checkbox", checked: this.ctx.lire("boucle", true) });
+    this.boucle.onchange = () => { this.ctx.ecrire("boucle", this.boucle.checked); if (this.lecture) this.lecture.boucle = this.boucle.checked; };
+    const boucle = el("label", { className: "sstv-auto" }, this.boucle, "En boucle");
+    this.position = el("input", { type: "range", min: 0, max: 1000, value: 0, title: "Position dans l'enregistrement" });
+    this.position.style.width = "100%";
+    this.position.oninput = () => { this.glisse = true; };
+    this.position.onchange = () => { this.lecture?.aller(this.position.value / 1000); this.glisse = false; };
+    this.lLecture = el("div", { className: "petit" });
+    const actions = el("div", { className: "scanner-choix cw-actions" }, this.bEnr, bRejouer, this.bStop, boucle, choisir);
+    this.minuterie = setInterval(() => this.rafraichir(), 300);
+    this.rafraichir();
+    return el("div", {}, this.statut, actions, this.position, this.lLecture);
+  }
+
+  rafraichir() {
+    const maj = (e, t) => { if (e.textContent !== t) e.textContent = t; };
+    if (this.actif) {
+      const ou = this.dossier ? `dossier « ${this.dossier.name} »` : `mémoire (téléchargé à l'arrêt, ${enMo(this.limiteMemoire())} au plus)`;
+      maj(this.statut, `● ${enDuree((performance.now() - this.debut) / 1000)} · ${enMo(this.octets)}${this.perdus ? ` · ${this.perdus} blocs perdus` : ""} · ${ou}\n${this.dernier ?? ""}`);
+      this.statut.style.color = "#ff5252"; this.statut.style.whiteSpace = "pre-line";
+    } else {
+      this.statut.style.color = "";
+      const t = this.ctx.taux();
+      maj(this.statut, this.erreur || `Prêt : ${enMo(2 * t * 60)} par minute à ${t / 1e6} MS/s.${this.dernier ? ` Dernier : ${this.dernier}` : ""}`);
+    }
+    const s = this.lecture && this.ctx.source() === this.lecture ? this.lecture : null;
+    if (!s && this.lecture && !this.ctx.source()) this.lecture = null;
+    this.bStop.disabled = !s; this.position.disabled = !s;
+    if (s) {
+      if (!this.glisse) this.position.value = Math.round(1000 * s.pos / Math.max(1, s.info.n - 1));
+      maj(this.lLecture, `▶ ${s.fichier.name} · ${enMHz(s.centre)} · ${enDuree(s.pos / s.taux)} / ${enDuree(s.info.n / s.taux)}${s.info.heure ? ` · enregistré le ${s.info.heure}` : ""}${s.fini ? " · fin de l'enregistrement" : ""}`);
+    } else maj(this.lLecture, "");
+  }
+
+  arreter() { this.arreterEnr(); clearInterval(this.minuterie); }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, EnregistreurIQ, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR, Tonalites];

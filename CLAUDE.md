@@ -86,6 +86,6 @@ du catalogue → le recopier dans le site, régénérer et resigner.
 
 ## Pistes
 
-Faites : stéréo + RDS, scanners, ADS-B, capteurs 433, rigctl, SSTV, CW, APRS, FT8/FT4, DMR (données), CTCSS/DTMF, convertisseur HF, SDR Web.
-Restent : voix DMR (dsd-fme, appli seule), envoi APRS vers aprs.jerko.fr, WSPR, enregistreur IQ,
+Faites : stéréo + RDS, scanners, ADS-B, capteurs 433, rigctl, SSTV, CW, APRS, FT8/FT4, DMR (données), CTCSS/DTMF, enregistreur IQ, convertisseur HF, SDR Web.
+Restent : voix DMR (dsd-fme, appli seule), envoi APRS vers aprs.jerko.fr, WSPR,
 sortie MQTT vers InfluxDB/Grafana, écoute à distance par le web.
