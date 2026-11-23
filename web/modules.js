@@ -983,6 +983,14 @@ class ScannerFrequences {
   arreter() { clearInterval(this.minuterie); this.actif = false; }
 }
 
+// Fréquences SSTV préréglées : [Hz, mode, libellé] (ondes courtes reprises d'IC-7300 Scope).
+const FREQUENCES_SSTV = [
+  [145_800_000, "NFM", "ISS (ARISS), PD120"], [144_500_000, "NFM", "2 m, appel SSTV (IARU Région 1)"],
+  [50_510_000, "USB", "6 m"], [28_680_000, "USB", "10 m"], [21_340_000, "USB", "15 m"],
+  [14_230_000, "USB", "20 m, la plus active"], [14_233_000, "USB", "20 m"],
+  [7_165_000, "LSB", "40 m"], [7_171_000, "LSB", "40 m"], [3_735_000, "LSB", "80 m"],
+];
+
 class ModuleSSTV {
   static nom = "Décodeur SSTV";
   static description = "Images SSTV (ISS en PD120, Martin, Scottie, Robot, PD) décodées depuis l'audio, téléchargeables en PNG.";
@@ -1018,14 +1026,25 @@ class ModuleSSTV {
     this.auto.onchange = () => this.ctx.ecrire("auto", this.auto.checked);
     const telecharger = el("button", { type: "button", textContent: "Télécharger l'image" });
     telecharger.onclick = () => { const d = this.decodeur; if (d?.image) this.telecharger(d.image, d.mode.largeur, d.mode.hauteur, d.mode.nom, new Date()); };
+    const frequence = el("select", { title: "Accorde le récepteur sur une fréquence SSTV, dans le bon mode (ondes courtes : clé qui reçoit la HF ou convertisseur)" },
+      el("option", { value: "", textContent: "Prérégler une fréquence…" }),
+      ...FREQUENCES_SSTV.map(([f, mode, nom], i) => el("option", { value: i, textContent: `${(f / 1e6).toFixed(3).replace(".", ",")} MHz ${mode} · ${nom}` })));
+    frequence.onchange = () => {
+      if (frequence.value === "") return;
+      const [f, mode] = FREQUENCES_SSTV[Number(frequence.value)];
+      this.ctx.reglerMode(mode); this.ctx.reglerFrequence(f);
+    };
+    const actions = el("div", { className: "scanner-choix sstv-actions" }, telecharger,
+      el("label", { className: "petit sstv-auto" }, this.auto, " Télécharger chaque image"));
+    const contenu = el("div", { className: "cw-contenu sstv-contenu" }, el("div", { className: "scanner-choix" }, frequence), this.canevas,
+      this.statut, this.tonalite, el("div", { className: "scanner-choix" }, this.choix, this.bDemarrer, this.bArreter), actions);
+    const { panneau, dialogue } = panneauAgrandissable(this.ctx, { titre: ModuleSSTV.nom, id: "sstv-titre", contenu, actions,
+      tailleDefaut: 1.0, attenteTexte: "Image affichée dans la fenêtre agrandie." });
+    this.dialogue = dialogue;
     this.version = -1;
     this.minuterie = setInterval(() => this.rafraichir(), 250);
     this.rafraichir();
-    return el("div", {}, this.canevas, this.statut, this.tonalite,
-      el("div", { className: "scanner-choix" }, this.choix, this.bDemarrer, this.bArreter),
-      el("div", { className: "scanner-choix sstv-actions" }, telecharger,
-        el("label", { className: "petit sstv-auto" }, this.auto, " Télécharger chaque image")),
-      el("small", { textContent: "ISS : 145,800 MHz en NFM. Ondes courtes : 14,230 · 21,340 · 28,680 MHz en USB." }));
+    return panneau;
   }
 
   rafraichir() {
@@ -1053,7 +1072,7 @@ class ModuleSSTV {
     }, "image/png");
   }
 
-  arreter() { clearInterval(this.minuterie); clearInterval(this.travail); }
+  arreter() { clearInterval(this.minuterie); clearInterval(this.travail); if (this.dialogue?.open) this.dialogue.close(); }
 }
 
 // Décodeur CW : même réseau de neurones que le module decodeur_cw.py de SDR Modulaire (cw.js).

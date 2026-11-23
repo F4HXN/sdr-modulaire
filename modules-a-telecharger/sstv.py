@@ -2,7 +2,8 @@
 """Décodeur SSTV (télévision à balayage lent) pour SDR Modulaire.
 
 Décode les images reçues dans l'audio du récepteur : ISS sur 145,800 MHz en NFM (PD120),
-ondes courtes en USB (14,230 / 21,340 / 28,680 MHz). Le mode est reconnu par son code VIS ;
+ondes courtes en USB (14,230 / 21,340 / 28,680 MHz) ou en LSB (7,165 / 3,735 MHz). Une liste de
+fréquences préréglées accorde le récepteur dans le bon mode ; « Agrandir » montre l'image en grand. Le mode est reconnu par son code VIS ;
 on peut aussi forcer un mode et démarrer à la main si l'en-tête a été manqué.
 
 Modes : Martin M1, M2 ; Scottie S1, S2, DX ; Robot 36, 72 ; PD50, PD90, PD120, PD160, PD180, PD240, PD290.
@@ -26,6 +27,25 @@ import numpy as np
 from scipy import signal
 
 from sdrmod.modules import Module
+
+# Fréquences préréglées : (fréquence en Hz, mode du récepteur, libellé). Ondes courtes reprises d'IC-7300 Scope.
+FREQUENCES = [
+    (145_800_000, "NFM", "ISS (ARISS), PD120"),
+    (144_500_000, "NFM", "2 m, appel SSTV (IARU Région 1)"),
+    (50_510_000, "USB", "6 m"),
+    (28_680_000, "USB", "10 m"),
+    (21_340_000, "USB", "15 m"),
+    (14_230_000, "USB", "20 m, la plus active"),
+    (14_233_000, "USB", "20 m"),
+    (7_165_000, "LSB", "40 m"),
+    (7_171_000, "LSB", "40 m"),
+    (3_735_000, "LSB", "80 m"),
+]
+
+
+def libelle_frequence(f: int, mode: str, nom: str) -> str:
+    return f"{f / 1e6:.3f} MHz {mode} · {nom}".replace(".", ",", 1)
+
 
 TAUX = 12_000                 # fréquence instantanée calculée à 48 kHz puis moyennée par 4
 CENTRE = 1900.0               # milieu de la bande SSTV, ramené à 0 Hz avant le calcul
@@ -413,6 +433,27 @@ class VueImage(QWidget):
         p.end()
 
 
+class FenetreSSTV(QWidget):
+    """Image en grand, dans une fenêtre à part (redimensionnable, proportions gardées)."""
+
+    def __init__(self) -> None:
+        super().__init__(None, Qt.WindowType.Window)
+        self.setWindowTitle("Décodeur SSTV")
+        self.resize(760, 660)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        self.vue = VueImage()
+        self.vue.HAUTEUR_MAX = 10_000
+        self.vue.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.vue._ajuster = lambda: None                   # la fenêtre décide de la taille
+        self.vue.setMinimumSize(320, 256)
+        self.vue.setMaximumHeight(16_777_215)
+        lay.addWidget(self.vue, 1)
+        self.statut = QLabel()
+        self.statut.setWordWrap(True)
+        lay.addWidget(self.statut)
+
+
 class SSTV(Module):
     nom = "Décodeur SSTV"
     description = "Images SSTV (ISS en PD120, Martin, Scottie, Robot, PD) décodées depuis l'audio, enregistrées en PNG."
@@ -459,6 +500,21 @@ class SSTV(Module):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 6, 8, 6)
         lay.setSpacing(4)
+        self.grande = None
+        ligne0 = QHBoxLayout()
+        self.c_freq = QComboBox()
+        self.c_freq.addItem("Prérégler une fréquence…")
+        for f, mode, nom in FREQUENCES:
+            self.c_freq.addItem(libelle_frequence(f, mode, nom))
+        self.c_freq.setToolTip("Accorde le récepteur sur une fréquence SSTV, dans le bon mode "
+                               "(ondes courtes : clé qui reçoit la HF ou convertisseur)")
+        self.c_freq.activated.connect(self._preregler)
+        ligne0.addWidget(self.c_freq, 1)
+        b_grand = QPushButton("Agrandir")
+        b_grand.setToolTip("Affiche l'image en grand dans une fenêtre à part")
+        b_grand.clicked.connect(self.agrandir)
+        ligne0.addWidget(b_grand)
+        lay.addLayout(ligne0)
         self.vue = VueImage()
         lay.addWidget(self.vue)
         self.statut = QLabel()
@@ -498,15 +554,27 @@ class SSTV(Module):
         ligne2.addWidget(b_dossier)
         lay.addLayout(ligne2)
 
-        aide = QLabel("ISS : 145,800 MHz en NFM. Ondes courtes : 14,230 · 21,340 · 28,680 MHz en USB.")
-        aide.setWordWrap(True)
-        aide.setStyleSheet("color: gray")
-        lay.addWidget(aide)
         self.version_vue = -1
         self.minuterie = QTimer(w, interval=250, timeout=self._rafraichir)
         self.minuterie.start()
         self._rafraichir()
         return w
+
+    def _preregler(self, i: int) -> None:
+        if i <= 0:
+            return
+        f, mode, _ = FREQUENCES[i - 1]
+        self.ctx.regler_mode(mode)
+        self.ctx.regler_frequence(f)
+
+    def agrandir(self) -> None:
+        if self.grande is None:
+            self.grande = FenetreSSTV()
+            if self.vue.qimage is not None:
+                self.grande.vue.montrer(self.vue.qimage)
+        self.grande.show()
+        self.grande.raise_()
+        self.grande.activateWindow()
 
     def _demarrer(self) -> None:
         if self.choix.currentIndex() > 0:
@@ -525,7 +593,10 @@ class SSTV(Module):
             self.version_vue = d.version
             terminees, d.terminees = d.terminees, []
         if nouvelle:
-            self.vue.montrer(self._qimage(img))
+            q = self._qimage(img)
+            self.vue.montrer(q)
+            if self.grande is not None:
+                self.grande.vue.montrer(q)
         for image, mode, date, partielle in terminees:
             if self.auto.isChecked():
                 nom = time.strftime("sstv_%Y%m%d_%H%M%S", date) + "_" + mode.replace(" ", "") + (
@@ -535,6 +606,8 @@ class SSTV(Module):
         if self.perdus:
             texte += f" ({self.perdus} blocs audio perdus : processeur trop chargé)"
         self.statut.setText(texte)
+        if self.grande is not None:
+            self.grande.statut.setText(texte)
         self.tonalite.setText(f"Tonalité : {d.tonalite:,.0f} Hz".replace(",", " ") if d.tonalite else "")
         self.b_arreter.setEnabled(d.etat == "image")
 
@@ -553,5 +626,9 @@ class SSTV(Module):
     def arreter(self) -> None:
         if hasattr(self, "minuterie"):
             self.minuterie.stop()
+        if getattr(self, "grande", None) is not None:
+            self.grande.close()
+            self.grande.deleteLater()
+            self.grande = None
         self.fin.set()
         self.fil.join(timeout=1)

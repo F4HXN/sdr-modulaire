@@ -167,7 +167,9 @@ Capteurs 433 MHz, Stéréo et RDS en FM.
 - **Décodeur SSTV** : images Martin M1/M2, Scottie S1/S2/DX, Robot 36/72, PD50 à PD290 (l'ISS émet en
   PD120 sur 145,800 MHz NFM ; en HF : 14,230 · 21,340 · 28,680 MHz USB). Mode reconnu par l'en-tête VIS
   (ou forcé à la main), lignes calées sur les tops de synchro (pas d'image penchée même sans correction ppm),
-  images enregistrées en PNG dans `~/.config/sdr-modulaire/donnees/sstv/` ; aussi dans SDR Web (`web/sstv.js`) ;
+  images enregistrées en PNG dans `~/.config/sdr-modulaire/donnees/sstv/` ; liste de fréquences préréglées qui accorde
+  dans le bon mode (ISS, 2 m, 6 m, 10 à 80 m en USB/LSB), bouton « Agrandir » (image en grand dans une fenêtre à part) ;
+  aussi dans SDR Web (`web/sstv.js`) ;
 - **Pilotage rigctl** : serveur compatible rigctld sur `localhost:4532` (IPv4 `127.0.0.1` et IPv6 `::1`,
   connexions locales seulement) : Gpredict corrige le Doppler des satellites, WSJT-X, fldigi… règlent
   fréquence et mode. Dans Gpredict : radio « RX only », hôte localhost, port 4532, puis « Engage ».
