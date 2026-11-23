@@ -72,8 +72,9 @@ function fenetreFlottante(dialogue, poignee, ctx, cle = "fenetre") {
  * taille du texte (variable CSS --cw-taille, retenue) et Réduire (ou Échap) pour le remettre en place.
  * actions : la ligne de boutons du panneau, où le bouton Agrandir est ajouté.
  * defiler : élément à faire défiler en bas à l'ouverture (ou null).
+ * tailleTexte : false pour les décodeurs d'images (SSTV, fax météo) : pas de boutons A− / A+.
  */
-function panneauAgrandissable(ctx, { titre: texteTitre, id, contenu, actions, tailleDefaut, defiler = null, attenteTexte }) {
+function panneauAgrandissable(ctx, { titre: texteTitre, id, contenu, actions, tailleDefaut, defiler = null, attenteTexte, tailleTexte = true }) {
   const agrandir = el("button", { type: "button", textContent: "Agrandir", className: "cw-agrandir" });
   agrandir.setAttribute("aria-haspopup", "dialog");
   actions.append(agrandir);
@@ -82,7 +83,7 @@ function panneauAgrandissable(ctx, { titre: texteTitre, id, contenu, actions, ta
   const plusGrand = el("button", { type: "button", textContent: "A+", title: "Texte plus grand" });
   const fermer = el("button", { type: "button", textContent: "Réduire", title: "Remettre dans la colonne des modules (Échap)" });
   const entete = el("header", { title: "Tirer pour déplacer · coin en bas à droite pour agrandir" }, titre,
-    el("span", { className: "cw-boutons" }, plusPetit, plusGrand, fermer));
+    el("span", { className: "cw-boutons" }, ...(tailleTexte ? [plusPetit, plusGrand] : []), fermer));
   const dialogue = el("dialog", { className: "capteurs-dialogue cw-dialogue" }, entete);
   dialogue.setAttribute("aria-labelledby", id);
   let taille = ctx.lire("taille", tailleDefaut);
@@ -1047,7 +1048,7 @@ class ModuleSSTV {
     const contenu = el("div", { className: "cw-contenu sstv-contenu" }, el("div", { className: "scanner-choix" }, frequence), avertissement, this.canevas,
       this.statut, this.tonalite, el("div", { className: "scanner-choix" }, this.choix, this.bDemarrer, this.bArreter), actions);
     const { panneau, dialogue } = panneauAgrandissable(this.ctx, { titre: ModuleSSTV.nom, id: "sstv-titre", contenu, actions,
-      tailleDefaut: 1.0, attenteTexte: "Image affichée dans la fenêtre agrandie." });
+      tailleDefaut: 1.0, attenteTexte: "Image affichée dans la fenêtre agrandie.", tailleTexte: false });
     this.dialogue = dialogue;
     this.version = -1;
     this.minuterie = setInterval(() => this.rafraichir(), 250);
@@ -2104,7 +2105,7 @@ class FaxMeteo {
     aide.style.color = "var(--doux)";
     const contenu = el("div", { className: "cw-contenu" }, el("div", { className: "scanner-choix" }, choix, accorder), this.cadre, this.statut, this.diag, actions, aide);
     const { panneau, dialogue } = panneauAgrandissable(this.ctx, { titre: FaxMeteo.nom, id: "fax-titre", contenu, actions,
-      tailleDefaut: 1.0, attenteTexte: "Carte affichée dans la fenêtre agrandie." });
+      tailleDefaut: 1.0, attenteTexte: "Carte affichée dans la fenêtre agrandie.", tailleTexte: false });
     this.dialogue = dialogue;
     this.vue = { version: -1, lignes: 0 };
     this.minuterie = setInterval(() => this.rafraichir(), 500);
