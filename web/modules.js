@@ -1029,14 +1029,22 @@ class ModuleSSTV {
     const frequence = el("select", { title: "Accorde le récepteur sur une fréquence SSTV, dans le bon mode (ondes courtes : clé qui reçoit la HF ou convertisseur)" },
       el("option", { value: "", textContent: "Prérégler une fréquence…" }),
       ...FREQUENCES_SSTV.map(([f, mode, nom], i) => el("option", { value: i, textContent: `${(f / 1e6).toFixed(3).replace(".", ",")} MHz ${mode} · ${nom}` })));
+    const avertissement = el("div", { className: "petit", hidden: true });
+    avertissement.style.color = "var(--orange)";
     frequence.onchange = () => {
       if (frequence.value === "") return;
       const [f, mode] = FREQUENCES_SSTV[Number(frequence.value)];
+      const avantF = this.ctx.frequence(), avantMode = this.ctx.mode();
       this.ctx.reglerMode(mode); this.ctx.reglerFrequence(f);
+      avertissement.hidden = Math.abs(this.ctx.frequence() - f) <= 1;
+      if (!avertissement.hidden) {      // hors de la plage de la clé : retour où l'on était, et pourquoi
+        this.ctx.reglerMode(avantMode); this.ctx.reglerFrequence(avantF); frequence.value = "";
+        avertissement.textContent = `${(f / 1e6).toFixed(3).replace(".", ",")} MHz est hors de la plage de la clé : réception impossible. Ondes courtes : convertisseur HF (réglage « Convert. »), clé RTL-SDR Blog V4 ou échantillonnage direct (menu Entrée).`;
+      }
     };
     const actions = el("div", { className: "scanner-choix sstv-actions" }, telecharger,
       el("label", { className: "petit sstv-auto" }, this.auto, " Télécharger chaque image"));
-    const contenu = el("div", { className: "cw-contenu sstv-contenu" }, el("div", { className: "scanner-choix" }, frequence), this.canevas,
+    const contenu = el("div", { className: "cw-contenu sstv-contenu" }, el("div", { className: "scanner-choix" }, frequence), avertissement, this.canevas,
       this.statut, this.tonalite, el("div", { className: "scanner-choix" }, this.choix, this.bDemarrer, this.bArreter), actions);
     const { panneau, dialogue } = panneauAgrandissable(this.ctx, { titre: ModuleSSTV.nom, id: "sstv-titre", contenu, actions,
       tailleDefaut: 1.0, attenteTexte: "Image affichée dans la fenêtre agrandie." });

@@ -515,6 +515,11 @@ class SSTV(Module):
         b_grand.clicked.connect(self.agrandir)
         ligne0.addWidget(b_grand)
         lay.addLayout(ligne0)
+        self.avertissement = QLabel()
+        self.avertissement.setWordWrap(True)
+        self.avertissement.setStyleSheet("color: #ff7043")
+        self.avertissement.hide()
+        lay.addWidget(self.avertissement)
         self.vue = VueImage()
         lay.addWidget(self.vue)
         self.statut = QLabel()
@@ -564,8 +569,22 @@ class SSTV(Module):
         if i <= 0:
             return
         f, mode, _ = FREQUENCES[i - 1]
+        avant_f, avant_mode = self.ctx.frequence(), self.ctx.mode()
         self.ctx.regler_mode(mode)
         self.ctx.regler_frequence(f)
+        if abs(self.ctx.frequence() - f) > 1:
+            # Hors de la plage de la clé : la fenêtre a laissé le VFO au bord de la bande. On revient
+            # où l'on était et on dit pourquoi, plutôt que d'écouter une fréquence qui n'est pas la bonne.
+            self.ctx.regler_mode(avant_mode)
+            self.ctx.regler_frequence(avant_f)
+            self.c_freq.setCurrentIndex(0)
+            self.avertissement.setText(
+                f"{f / 1e6:.3f} MHz est hors de la plage de la clé : réception impossible. ".replace(".", ",", 1)
+                + "Ondes courtes : convertisseur HF (réglage « Convertisseur »), clé RTL-SDR Blog V4 ou "
+                  "échantillonnage direct.")
+            self.avertissement.show()
+        else:
+            self.avertissement.hide()
 
     def agrandir(self) -> None:
         if self.grande is None:
