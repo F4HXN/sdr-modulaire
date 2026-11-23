@@ -4,7 +4,7 @@
 import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261122-cw";
 import { CleRtlSdr } from "./rtlsdr.js?v=20261122-pll";
 import { SourceSimulation } from "./simulation.js?v=20261122-niveau";
-import { MODULES } from "./modules.js?v=20261123-ais";
+import { MODULES } from "./modules.js?v=20261123-canal";
 
 const $ = s => document.querySelector(s);
 const PAS = [1, 10, 100, 1000, 2500, 5000, 6250, 8330, 10000, 12500, 25000, 100000, 1000000];
@@ -532,6 +532,8 @@ const actifs = new Map();
 const contexte = module => ({
   abonner(sujet, f) { f.module = module; abonnes[sujet].add(f); module._abos.push([sujet, f]); },
   frequence, mode: () => R.mode, reglerFrequence, reglerMode,
+  /** Canal affiché à côté de la fréquence (ex. « CH 03/12 · Appel FM 2 m ») ; null l'efface. */
+  afficherCanal(texte) { const c = $("#canal"); c.textContent = texte || ""; c.hidden = !texte; },
   taux: () => R.taux,
   gains: () => source?.gains?.() || [],
   gain: () => R.gain,         // dB, ou null en gain automatique du tuner

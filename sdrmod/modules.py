@@ -48,6 +48,10 @@ class Contexte:
     def regler_mode(self, mode: str) -> None:
         self._fenetre.regler_mode(mode)
 
+    def afficher_canal(self, texte: str | None) -> None:
+        """Affiche un canal (ex. « CH 03 · Appel FM 2 m ») à côté de la fréquence ; None l'efface."""
+        self._fenetre.afficher_canal(texte)
+
     def taux(self) -> int:
         """Taux d'échantillonnage courant de la clé (échantillons par seconde)."""
         return self._fenetre.reglages.taux

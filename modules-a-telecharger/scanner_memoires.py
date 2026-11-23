@@ -164,7 +164,7 @@ class ScannerMemoires(Module):
         self.liste.blockSignals(True)
         self.liste.clear()
         for i, m in enumerate(self.memoires):
-            item = QListWidgetItem(f"{m['frequence'] / 1e6:10.4f}  {m['mode']:4s} {m['nom']}")
+            item = QListWidgetItem(f"CH {i + 1:0{len(str(len(self.memoires)))}d}  {m['frequence'] / 1e6:10.4f}  {m['mode']:4s} {m['nom']}")
             item.setData(Qt.ItemDataRole.UserRole, i)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Unchecked if self.cle(m) in self.exclues else Qt.CheckState.Checked)
@@ -263,7 +263,20 @@ class ScannerMemoires(Module):
                 self.suivant()
         self._afficher()
 
+    def _canal(self, texte):
+        """Canal à côté de la fréquence dans la barre du haut (applis récentes seulement)."""
+        afficher = getattr(self.ctx, "afficher_canal", None)
+        if afficher and texte != getattr(self, "_canal_affiche", None):
+            self._canal_affiche = texte
+            afficher(texte)
+
+    def texte_canal(self):
+        m = self.memoires[self.indice]
+        n = len(self.memoires)
+        return f"CH {self.indice + 1:0{len(str(n))}d}/{n} · {m['nom']}"
+
     def _afficher(self, garder_statut=False):
+        self._canal(self.texte_canal() if self.actif and 0 <= self.indice < len(self.memoires) else None)
         self.b_marche.setText("■ Arrêter" if self.actif else "▶ Scanner")
         for k in range(self.liste.count()):
             item = self.liste.item(k)
@@ -286,3 +299,4 @@ class ScannerMemoires(Module):
 
     def arreter(self):
         self.actif = False
+        self._canal(None)

@@ -728,7 +728,7 @@ class ScannerMemoires {
     this.ul.replaceChildren(...this.memoires.map((m, i) => {
       const c = el("input", { type: "checkbox", checked: !this.exclues.has(this.cle(m)), title: "Décocher pour sauter cette mémoire" });
       c.onchange = () => { c.checked ? this.exclues.delete(this.cle(m)) : this.exclues.add(this.cle(m)); this.ctx.ecrire("exclues", [...this.exclues]); };
-      const li = el("li", {}, el("label", {}, c, ` ${(m.f / 1e6).toFixed(4)} ${m.mode} · ${m.nom}`)); li.dataset.i = i;
+      const li = el("li", {}, el("label", {}, c, ` ${this.numero(i)} ${(m.f / 1e6).toFixed(4)} ${m.mode} · ${m.nom}`)); li.dataset.i = i;
       return li;
     }));
   }
@@ -778,7 +778,13 @@ class ScannerMemoires {
     }
     this.afficher();
   }
+  numero(i) { const n = this.memoires.length; return `CH ${String(i + 1).padStart(String(n).length, "0")}`; }
+  canal(texte) {   // à côté de la fréquence, dans la barre du haut
+    if (texte !== this.canalAffiche) { this.canalAffiche = texte; this.ctx.afficherCanal?.(texte); }
+  }
   afficher() {
+    const courant = this.memoires[this.indice];
+    this.canal(this.actif && courant ? `${this.numero(this.indice)}/${this.memoires.length} · ${courant.nom}` : null);
     this.bMarche.textContent = this.actif ? "■ Arrêter" : "▶ Scanner";
     for (const li of this.ul.children) li.classList.toggle("courant", this.actif && Number(li.dataset.i) === this.indice);
     if (!this.actif) { this.statut.textContent = `${this.fini ? "Passage terminé" : "Arrêté"} · ${this.canaux().length} mémoire(s) à scanner`; return; }
@@ -787,7 +793,7 @@ class ScannerMemoires {
       ? `● Signal sur ${t}${this.tSilence === null ? "" : ` · reprise dans ${Math.max(0, this.reprise - (performance.now() - this.tSilence) / 1000).toFixed(0)} s`}`
       : `Balayage… ${t} · tour ${this.tours}`;
   }
-  arreter() { clearInterval(this.minuterie); this.actif = false; }
+  arreter() { clearInterval(this.minuterie); this.actif = false; this.canal(null); }
 }
 
 // Scanner de fréquences : plage début–fin avec un pas, arrêt sur signal, reprise après un silence.

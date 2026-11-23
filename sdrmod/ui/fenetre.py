@@ -118,6 +118,11 @@ class FenetrePrincipale(QMainWindow):
 
         self.afficheur = AfficheurFrequence()
         barre.addWidget(self.afficheur)
+        # Canal affiché à côté de la fréquence par un module (ex. scanner de mémoires), vide sinon.
+        self.l_canal = QLabel()
+        self.l_canal.setStyleSheet("QLabel { color: #ffb300; font: bold 13pt 'DejaVu Sans Mono'; padding: 0 8px; }")
+        self.a_canal = barre.addWidget(self.l_canal)       # dans une barre d'outils, on masque l'action
+        self.a_canal.setVisible(False)
         barre.addSeparator()
 
         barre.addWidget(QLabel(" Mode "))
@@ -266,6 +271,11 @@ class FenetrePrincipale(QMainWindow):
             self.c_mode.setCurrentText(mode)
             self.c_mode.blockSignals(False)
         self._maj_vfo()
+
+    def afficher_canal(self, texte: str | None) -> None:
+        """Texte affiché à côté de la fréquence (None ou vide : rien)."""
+        self.l_canal.setText(texte or "")
+        self.a_canal.setVisible(bool(texte))
 
     def _maj_vfo(self) -> None:
         r = self.reglages
