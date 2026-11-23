@@ -55,8 +55,18 @@ function majVue(recentrer = false) {
 // Confirmation d'ouverture de la clé : au premier bloc d'échantillons reçu, ou erreur au bout de 3 s.
 let attenteEchantillons = null;
 const nomCle = () => { const i = source?.infos?.() || {}; return [i.modele || "clé RTL-SDR", i.tuner && `tuner ${i.tuner}`].filter(Boolean).join(", "); };
+// Saturation : part des échantillons bruts à 0 ou 255 (la clé écrête), comptée en continu.
+const SEUIL_SATURATION = 1e-4;            // au-delà de 0,01 % d'échantillons écrêtés, le gain est trop fort
+const compteSat = { n: 0, sat: 0 }, mesureSat = { n: 0, sat: 0 };
+let tauxSat = 0;
 function traiterBloc(octets) {
-  if (attenteEchantillons) { clearTimeout(attenteEchantillons); attenteEchantillons = null; statut(`✓ Clé ouverte, réception en cours : ${nomCle()}.`); $("#statut").className = "ok"; }
+  if (attenteEchantillons) {
+    clearTimeout(attenteEchantillons); attenteEchantillons = null; statut(`✓ Clé ouverte, réception en cours : ${nomCle()}.`); $("#statut").className = "ok";
+    setTimeout(echelleAuto, 1500);        // niveaux du spectre et de la chute d'eau calés sur ce que reçoit la clé
+  }
+  let s = 0;
+  for (let k = 0; k < octets.length; k++) { const v = octets[k]; if (v === 0 || v === 255) s++; }
+  compteSat.n += octets.length; compteSat.sat += s; mesureSat.n += octets.length; mesureSat.sat += s;
   const [ir, ii] = octetsVersIQ(octets, etatDC);
   const nFFT = tailleFFT(ir.length);
   if (!fft || fft.n !== nFFT) { fft = new FFT(nFFT); moyenne = null; }
@@ -285,7 +295,7 @@ function majGain() {
   const auto = $("#gain-auto").checked, g = source?.gains?.() || [];
   $("#gain").disabled = auto || !g.length; $("#gain").max = Math.max(0, g.length - 1);
   const i = R.gain === null ? g.length - 1 : Math.max(0, g.findIndex(x => x >= R.gain));
-  $("#gain").value = i; $("#gain-val").textContent = auto ? "auto" : g.length ? `${g[i]} dB` : "—";
+  $("#gain").value = i; $("#gain-val").textContent = auto ? "auto" : g.length ? `${g[i].toLocaleString("fr-FR")} dB` : "—";
 }
 const appliquerGain = () => {
   const g = source?.gains?.() || [];
@@ -294,11 +304,59 @@ const appliquerGain = () => {
   if (source?.reglerGain) enAccord = enAccord.then(() => source.reglerGain(R.gain)).catch(e => erreur(e.message));
 };
 $("#gain-auto").onchange = appliquerGain; $("#gain").oninput = appliquerGain;
-$("#echelle").onclick = () => {
+function echelleAuto() {
   if (!dernierSpectre) return;
   const t = [...dernierSpectre].sort((a, b) => a - b);
   R.min = Math.round(t[Math.floor(t.length * 0.2)] - 8); R.max = Math.round(Math.max(t[Math.floor(t.length * 0.999)] + 5, R.min + 30));
-};
+}
+$("#echelle").onclick = echelleAuto;
+
+// Saturation affichée sous le gain (rouge au-delà de 0,05 %), mise à jour deux fois par seconde.
+function majSaturation() {
+  const e = $("#gain-sat"), fort = tauxSat > 5 * SEUIL_SATURATION;
+  e.textContent = !source || tauxSat < SEUIL_SATURATION ? "" : `saturation ${(100 * tauxSat).toLocaleString("fr-FR", { maximumFractionDigits: 2 })} %`;
+  e.classList.toggle("alerte", fort);
+  e.title = fort ? "La clé écrête : baissez le gain RF ou cliquez sur « Ajuster »." : "";
+}
+setInterval(() => {
+  if (compteSat.n) { tauxSat = compteSat.sat / compteSat.n; compteSat.n = compteSat.sat = 0; }
+  else if (!source) tauxSat = 0;
+  majSaturation();
+}, 500);
+
+/** Cherche, par dichotomie sur les paliers du tuner, le gain le plus fort qui ne fait pas saturer la clé. */
+let ajustement = false;
+async function ajusterGain() {
+  const g = source?.gains?.() || [];
+  if (!source?.reglerGain || !g.length) { erreur("Connectez d'abord la clé : le gain se règle sur ce qu'elle reçoit."); return; }
+  if (ajustement) return;
+  ajustement = true; $("#gain-ajuster").disabled = true;
+  const attendre = ms => new Promise(r => setTimeout(r, ms));
+  const mesurer = async i => {
+    $("#gain-auto").checked = false; $("#gain").value = i; appliquerGain();
+    statut(`Ajustement du gain : essai à ${g[i]} dB…`);
+    await enAccord; await attendre(250);                 // les échantillons d'avant le changement sont passés
+    mesureSat.n = mesureSat.sat = 0; await attendre(450);
+    return mesureSat.n ? mesureSat.sat / mesureSat.n : 0;
+  };
+  try {
+    let choisi, note = "";
+    if (await mesurer(g.length - 1) <= SEUIL_SATURATION) { choisi = g.length - 1; note = " (gain maximal : aucune saturation)"; }
+    else if (await mesurer(0) > SEUIL_SATURATION) { choisi = 0; note = " : la clé sature même au gain minimal, un émetteur très proche ou très fort est dans la bande"; }
+    else {
+      let bas = 0, haut = g.length - 2;                  // bas : sans saturation ; au-dessus de haut : saturation
+      while (bas < haut) { const m = Math.ceil((bas + haut) / 2); if (await mesurer(m) <= SEUIL_SATURATION) bas = m; else haut = m - 1; }
+      choisi = bas;
+    }
+    $("#gain-auto").checked = false; $("#gain").value = choisi; appliquerGain();
+    await enAccord; await attendre(900);
+    echelleAuto();
+    statut(`✓ Gain ajusté : ${g[choisi].toLocaleString("fr-FR")} dB, le plus fort sans saturation${note}. Niveaux du spectre recalés.`);
+    $("#statut").className = choisi === 0 && note ? "erreur" : "ok";
+  } catch (e) { erreur(`Ajustement du gain interrompu : ${e.message}`); }
+  finally { ajustement = false; $("#gain-ajuster").disabled = false; }
+}
+$("#gain-ajuster").onclick = ajusterGain;
 $("#b-cle").onclick = () => demarrer("cle");
 $("#b-arret").onclick = () => arreter();
 addEventListener("keydown", e => {
