@@ -21,6 +21,7 @@ import { DecodeurSSTV, MODES_SSTV } from "./sstv.js?v=20261122-sstv";
 import { TAUX_CW, DUREE_FENETRE, DUREE_PAS } from "./cw.js?v=20261122-cw";
 import { DemodAFSK, trameVersTexte, positionAPRS } from "./aprs.js?v=20261122-carteaprs";
 import { enteteWav, iqVersOctets, nomFichier, lireEnteteWav, SourceFichierIQ, LIMITE_WAV } from "./enregistreur-iq.js?v=20261123-iq";
+import { MoteurACARS, LISTES as LISTES_ACARS, texteMessage as texteACARS, mhz as mhzACARS } from "./acars.js?v=20261123-acars";
 import { MoteurTonalites, TAUX_TONALITES, texteCtcss, secondes } from "./tonalites.js?v=20261123-tonalites";
 import { DecodeurDMR as MoteurDMR, TAUX_DMR, FID as FID_DMR, SAP as SAP_DMR, nomSlot, texteAppel } from "./dmr.js?v=20261122-dmr";
 
@@ -1892,4 +1893,93 @@ class EnregistreurIQ {
   arreter() { this.arreterEnr(); clearInterval(this.minuterie); }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, EnregistreurIQ, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR, Tonalites];
+class DecodeurACARS {
+  static nom = "Décodeur ACARS";
+  static description = "Messages ACARS des avions et des stations sol (VHF AM, 131 MHz) : immatriculation, vol, label, texte. Fréquences préenregistrées (Europe, Amérique du Nord, Japon…) décodées ensemble.";
+
+  demarrer() {
+    this.choix = this.ctx.lire("liste", 0);
+    if (!LISTES_ACARS[this.choix]) this.choix = 0;
+    this.cle = ""; this.moteur = null; this.derniersIQ = -Infinity; this.avions = new Map(); this.tout = [];
+    this.ctx.abonner("iq", (re, im, centre, taux) => this.recevoir(re, im, centre, taux));
+  }
+
+  frequences() { const l = LISTES_ACARS[this.choix][1]; return l.length ? l : [this.ctx.frequence()]; }
+
+  recevoir(re, im, centre, taux) {
+    this.derniersIQ = performance.now();
+    const fs = this.frequences(), cle = `${centre}/${taux}/${fs.join(",")}`;
+    if (cle !== this.cle) { this.cle = cle; this.moteur = new MoteurACARS(fs, centre, taux); }
+    for (const m of this.moteur.traiter(re, im)) this.message(m);
+  }
+
+  message(m) {
+    if (m.immat) this.avions.set(m.immat, performance.now());
+    const ligne = `${new Date().toTimeString().slice(0, 8)}  ${texteACARS(m)}`;
+    this.tout.push(ligne);
+    if (this.tout.length > 2000) this.tout.shift();
+    if (!this.liste || (!m.texte.trim() && !this.vides.checked)) return;
+    this.liste.prepend(el("li", { textContent: ligne }));
+    while (this.liste.childElementCount > 500) this.liste.lastElementChild.remove();
+  }
+
+  accorder() {
+    const fs = LISTES_ACARS[this.choix][1];
+    if (!fs.length) return;
+    this.ctx.reglerMode("AM");
+    this.ctx.reglerFrequence(fs[0] + this.ctx.taux());     // la clé se recentre…
+    this.ctx.reglerFrequence(fs[0]);                       // … et couvre la première fréquence et ses voisines
+  }
+
+  creerPanneau() {
+    const choix = el("select", { title: "Fréquences décodées : toutes celles de la liste qui tiennent dans la bande reçue" });
+    LISTES_ACARS.forEach(([nom], i) => choix.add(new Option(nom, i, false, i === this.choix)));
+    choix.onchange = () => { this.choix = Number(choix.value); this.ctx.ecrire("liste", this.choix); };
+    const accorder = el("button", { type: "button", textContent: "Accorder", title: "Met la clé sur ces fréquences (VFO sur la première, en AM pour écouter)" });
+    accorder.onclick = () => this.accorder();
+    const haut = el("div", { className: "scanner-choix" }, choix, accorder);
+    this.statut = el("div", { className: "petit" });
+    this.diag = el("div", { className: "petit", title: "Par fréquence : niveau du canal au-dessus du bruit et messages reçus ; avions entendus dans les 10 dernières minutes" });
+    this.diag.style.color = "var(--doux)";
+    this.liste = el("ul", { className: "journal aprs-liste" });
+    this.liste.style.whiteSpace = "pre-wrap";
+    const effacer = el("button", { type: "button", textContent: "Effacer" });
+    effacer.onclick = () => { this.liste.replaceChildren(); this.tout = []; };
+    const copier = el("button", { type: "button", textContent: "Copier" });
+    copier.onclick = () => navigator.clipboard?.writeText(this.tout.join("\n")).then(() => {
+      copier.textContent = "Copié"; setTimeout(() => { copier.textContent = "Copier"; }, 1200);
+    }).catch(() => {});
+    const enregistrer = el("button", { type: "button", textContent: "Enregistrer", title: "Télécharge tous les messages reçus (vides compris) dans un fichier texte" });
+    enregistrer.onclick = () => {
+      const d = new Date(), h = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "_");
+      const a = el("a", { href: URL.createObjectURL(new Blob([this.tout.join("\n") + "\n"], { type: "text/plain" })), download: `acars_${h}.txt` });
+      a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    };
+    this.vides = el("input", { type: "checkbox", checked: this.ctx.lire("vides", false) });
+    this.vides.onchange = () => this.ctx.ecrire("vides", this.vides.checked);
+    const vides = el("label", { className: "sstv-auto", title: "Affiche aussi les accusés et messages sans texte (label _d, essais de liaison…)" }, this.vides, "Messages vides");
+    const actions = el("div", { className: "scanner-choix cw-actions" }, effacer, copier, enregistrer, vides);
+    const contenu = el("div", { className: "cw-contenu aprs-contenu" }, haut, this.statut, this.diag, this.liste, actions);
+    const { panneau, dialogue } = panneauAgrandissable(this.ctx, { titre: DecodeurACARS.nom, id: "acars-titre", contenu, actions,
+      tailleDefaut: 1.0, attenteTexte: "Messages affichés dans la fenêtre agrandie." });
+    this.dialogue = dialogue;
+    this.minuterie = setInterval(() => this.rafraichir(), 300);
+    this.rafraichir();
+    return panneau;
+  }
+
+  rafraichir() {
+    const m = this.moteur, maj = (e, t) => { if (e.textContent !== t) e.textContent = t; };
+    maj(this.statut, performance.now() - this.derniersIQ > 1500 ? "En attente des échantillons de la clé."
+      : !m?.canaux.length ? "Aucune de ces fréquences n'est dans la bande reçue : cliquez sur « Accorder »."
+      : `Décodage de ${m.canaux.map(c => mhzACARS(c.frequence)).join(", ")} MHz.${m.dehors.length ? ` Hors de la bande : ${m.dehors.map(mhzACARS).join(", ")} MHz.` : ""}`);
+    if (m?.canaux.length) {
+      const avions = [...this.avions.values()].filter(t => performance.now() - t < 600000).length;
+      maj(this.diag, m.canaux.map(c => `${mhzACARS(c.frequence)} : ${Math.round((c.niveau ?? -99) - (c.bruit ?? -99))} dB, ${c.messages} msg`).join(" · ") + ` · ${avions} avion(s)`);
+    }
+  }
+
+  arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); }
+}
+
+export const MODULES = [SMetre, Memoires, Enregistreur, EnregistreurIQ, Journal, Capteurs433, ModuleStereoRds, ADSB, ScannerMemoires, ScannerFrequences, ModuleSSTV, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR, DecodeurACARS, Tonalites];

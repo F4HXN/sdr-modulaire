@@ -25,5 +25,6 @@ par le script de déploiement du site).
 | `decodeur_aprs.py` | trames APRS (AFSK 1200, AX.25) décodées sans logiciel externe, sur 144,800 MHz extrait des IQ même si le VFO écoute ailleurs ; alerte de saturation |
 | `decodeur_ft.py` | messages FT8 et FT4 reçus en USB, décodés par `jt9` (WSJT-X) sur les créneaux UTC de 15 s ou 7,5 s ; liste des bandes (160 m à 70 cm) qui accorde en USB sur la fréquence d'appel ; horloge synchronisée requise |
 | `decodeur_dmr.py` | appels DMR des relais et du direct, sans logiciel externe : slot, color code, groupe ou privé, ID et alias de l'émetteur, chiffrement ; SMS (IP, Motorola TMS) ; CSBK sur demande. Suit le VFO, quel que soit le mode. La voix n'est pas décodée |
+| `decodeur_acars.py` | messages ACARS (VHF AM) sans logiciel externe : listes de fréquences préenregistrées (Europe, Amérique du Nord, Japon, Asie) décodées ensemble, immatriculation, vol, label, texte ; CRC et correction d'erreurs |
 | `enregistreur_iq.py` | enregistre toute la bande reçue (WAV IQ 8 bits à la SDR#, bloc `auxi`) et la rejoue à la place de la clé pour démoduler après coup ; lit aussi WAV 16/32 bits, SigMF et gqrx |
 | `tonalites.py` | sous-porteuse CTCSS d'accès d'un relais (tonalité normalisée, fréquence mesurée, déviation, durée), codes DTMF et tonalité 1750 Hz, sur la fréquence du VFO quel que soit le mode ; journal horodaté |
