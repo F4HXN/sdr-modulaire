@@ -48,6 +48,10 @@ class Contexte:
     def regler_mode(self, mode: str) -> None:
         self._fenetre.regler_mode(mode)
 
+    def modes(self) -> list[str]:
+        """Modes de démodulation disponibles (AM, NFM, WFM…)."""
+        return list(self._fenetre.modes)
+
     def afficher_canal(self, texte: str | None) -> None:
         """Affiche un canal (ex. « CH 03 · Appel FM 2 m ») à côté de la fréquence ; None l'efface."""
         self._fenetre.afficher_canal(texte)

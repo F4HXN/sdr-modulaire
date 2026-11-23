@@ -91,7 +91,7 @@ modules/           smetre.py, enregistreur_wav.py, memoires.py, journal_activite
 modules-a-telecharger/  adsb.py, scanner_memoires.py, scanner_frequences.py,
                         pilotage_rigctl.py, sstv.py, decodeur_cw.py, decodeur_aprs.py (non chargés d'office : à copier dans ~/.config/sdr-modulaire/modules/)
 outils/decodeur_cw/     entraînement du réseau du Décodeur CW (PyTorch, non nécessaire à l'exécution)
-tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py, test_decodeur_dmr.py, test_tonalites.py, test_enregistreur_iq.py, test_decodeur_acars.py, test_fax_meteo.py, test_decodeur_ais.py, test_gain.py
+tests/             test_dsp.py, test_interface.py, test_materiel.py, test_catalogue.py, test_sstv.py, test_decodeur_cw.py, test_decodeur_aprs.py, test_decodeur_dmr.py, test_tonalites.py, test_enregistreur_iq.py, test_decodeur_acars.py, test_fax_meteo.py, test_decodeur_ais.py, test_gain.py, test_memoires.py
 ```
 
 ## Trois niveaux d'extension
@@ -154,12 +154,18 @@ QT_QPA_PLATFORM=offscreen python3 -m tests.test_decodeur_acars      # ACARS : MS
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_fax_meteo carte.png # fax météo : départ, phasage, pente, arrêt, carte comparée point par point
 QT_QPA_PLATFORM=offscreen python3 -m tests.test_decodeur_ais        # AIS : messages de gpsd, banc GMSK de 40 salves par niveau, 2 canaux
 QT_QPA_PLATFORM=offscreen HOME=$(mktemp -d) python3 -m tests.test_gain  # saturation et bouton « Ajuster » (clé simulée qui écrête)
+QT_QPA_PLATFORM=offscreen HOME=$(mktemp -d) python3 -m tests.test_memoires  # mémoires, CSV vérifié par CHIRP s'il est installé
 ```
 
 ## Modules disponibles
 
 Fournis avec l'application : S-mètre, Mémoires, Enregistreur audio (WAV), Journal d'activité,
 Capteurs 433 MHz, Stéréo et RDS en FM.
+
+Le module **Mémoires** gère les fréquences favorites : tableau numéroté (les mêmes CH que le
+scanner de mémoires), recherche, groupes, ajout / modification / suppression, double-clic pour
+écouter. Tout est enregistré automatiquement ; « Sauvegarder… » écrit un CSV compatible CHIRP
+(ou un JSON) et « Importer… » relit ces fichiers, ceux de CHIRP et ceux de SDR Web.
 
 À télécharger (Modules → Ajouter des modules…) :
 

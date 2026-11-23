@@ -12,7 +12,7 @@
 //            lire(clé, défaut), ecrire(clé, valeur).
 // Les rappels du bus doivent rester rapides : on stocke, et une minuterie met l'affichage à jour.
 
-import { FirComplexe, NCO, passeBas, LARGEURS, FFT } from "./dsp.js?v=20261122-cw";
+import { FirComplexe, NCO, passeBas, LARGEURS, FFT, MODES } from "./dsp.js?v=20261122-cw";
 import { StereoRds } from "./fm-stereo.js?v=20261122-cw";
 import { DecodeurOOK433, TAUX_CAPTEURS } from "./capteurs433.js";
 import { DemodModeS, Trafic, distanceKm } from "./adsb.js?v=20261122-niveau";
@@ -252,32 +252,177 @@ class SMetre {
   arreter() { cancelAnimationFrame(this.anim); }
 }
 
+// Mémoires : même gestion et mêmes fichiers que l'application (CSV compatible CHIRP, JSON).
+const TOUS_GROUPES = "Tous";
+const COLONNES_CHIRP = ["Location", "Name", "Frequency", "Duplex", "Offset", "Tone", "rToneFreq", "cToneFreq", "DtcsCode",
+  "DtcsPolarity", "RxDtcsCode", "CrossMode", "Mode", "TStep", "Skip", "Power", "Comment", "URCALL", "RPT1CALL", "RPT2CALL", "DVCODE"];
+const VERS_CHIRP = { NFM: "FM", WFM: "WFM", AM: "AM", USB: "USB", LSB: "LSB", CW: "CW" };
+const DEPUIS_CHIRP = { FM: "NFM", NFM: "NFM", WFM: "WFM", AM: "AM", NAM: "AM", USB: "USB", LSB: "LSB", CW: "CW", CWR: "CW" };
+
+/** « 145.5 », « 145,500 » (MHz) ou « 145500000 » (Hz) → Hz ; null si illisible. */
+export function lireFrequence(t) {
+  const v = Number(String(t ?? "").trim().replace(",", ".").replace(/\s/g, ""));
+  if (!(v > 0) || !String(t ?? "").trim()) return null;
+  return Math.round(v < 100_000 ? v * 1e6 : v);
+}
+/** Mémoire venue d'un fichier (forme de l'application ou de SDR Web) → { nom, f, mode, groupe } ou null. */
+export function normaliserMemoire(m) {
+  if (!m || typeof m !== "object") return null;
+  const brut = m.f ?? m.frequence;
+  const f = typeof brut === "number" ? (brut > 0 ? Math.round(brut) : null) : typeof brut === "string" ? lireFrequence(brut) : null;
+  if (f === null) return null;
+  const mode = String(m.mode ?? "NFM").toUpperCase();
+  return { nom: String(m.nom ?? "").trim() || "—", f, mode: MODES.includes(mode) ? mode : "NFM", groupe: String(m.groupe ?? "").trim() };
+}
+const champCsv = v => /[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+export function versCsvChirp(liste) {
+  const lignes = [COLONNES_CHIRP.join(",")];
+  [...liste].sort((a, b) => a.f - b.f).forEach((m, i) => {
+    const l = Object.fromEntries(COLONNES_CHIRP.map(c => [c, ""]));
+    Object.assign(l, { Location: String(i), Name: m.nom, Frequency: (m.f / 1e6).toFixed(6), Offset: "0.000000", rToneFreq: "88.5",
+      cToneFreq: "88.5", DtcsCode: "023", DtcsPolarity: "NN", RxDtcsCode: "023", CrossMode: "Tone->Tone",
+      Mode: VERS_CHIRP[m.mode] || "FM", TStep: "5.00", Power: "50W", Comment: m.groupe || "" });   // CHIRP refuse une puissance vide
+    lignes.push(COLONNES_CHIRP.map(c => champCsv(l[c])).join(","));
+  });
+  return lignes.join("\r\n") + "\r\n";
+}
+function lignesCsv(texte) {
+  const premiere = texte.split(/\r?\n/, 1)[0];
+  const sep = [",", ";", "\t"].reduce((a, b) => premiere.split(b).length > premiere.split(a).length ? b : a);
+  const lignes = []; let ligne = [], champ = "", guillemets = false;
+  for (let i = 0; i < texte.length; i++) {
+    const c = texte[i];
+    if (guillemets) {
+      if (c === '"' && texte[i + 1] === '"') { champ += '"'; i++; }
+      else if (c === '"') guillemets = false;
+      else champ += c;
+    } else if (c === '"') guillemets = true;
+    else if (c === sep) { ligne.push(champ); champ = ""; }
+    else if (c === "\n" || c === "\r") {
+      if (c === "\r" && texte[i + 1] === "\n") i++;
+      ligne.push(champ); lignes.push(ligne); ligne = []; champ = "";
+    } else champ += c;
+  }
+  if (champ || ligne.length) { ligne.push(champ); lignes.push(ligne); }
+  return lignes.filter(l => l.some(x => x.trim()));
+}
+/** CSV de CHIRP (Name, Frequency, Mode, Comment) ou en français (Nom, Fréquence, Mode, Groupe). */
+export function depuisCsv(texte) {
+  const [tete, ...lignes] = lignesCsv(texte.replace(/^﻿/, ""));
+  if (!tete) return [];
+  const col = noms => tete.findIndex(t => noms.includes(t.trim().toLowerCase()));
+  const iF = col(["frequency", "fréquence", "frequence", "fréquence (mhz)", "mhz"]), iN = col(["name", "nom"]);
+  const iM = col(["mode"]), iG = col(["comment", "groupe"]);
+  if (iF < 0) return [];
+  return lignes.map(l => {
+    const mode = (l[iM] ?? "").trim().toUpperCase();
+    return normaliserMemoire({ nom: l[iN] ?? "", frequence: l[iF] ?? "", mode: DEPUIS_CHIRP[mode] ?? (mode || "NFM"), groupe: l[iG] ?? "" });
+  }).filter(Boolean);
+}
+
 class Memoires {
   static nom = "Mémoires";
-  static description = "Fréquences favorites : ajouter la fréquence courante, rappeler d'un clic.";
+  static description = "Fréquences favorites : ajouter, modifier, ranger par groupe, rappeler, sauvegarder dans un fichier.";
   demarrer() {
-    this.liste = this.ctx.lire("liste", MEMOIRES_DEFAUT);
+    this.liste = this.ctx.lire("liste", MEMOIRES_DEFAUT).map(normaliserMemoire).filter(Boolean).sort((a, b) => a.f - b.f);
+    this.groupe = TOUS_GROUPES; this.recherche = "";
   }
+  groupes() { return [...new Set(this.liste.map(m => m.groupe).filter(Boolean))].sort((a, b) => a.localeCompare(b, "fr")); }
   creerPanneau() {
+    const cherche = el("input", { type: "search", placeholder: "Rechercher…", className: "mem-recherche" });
+    cherche.oninput = () => { this.recherche = cherche.value; this.remplir(); };
+    this.choixGroupe = el("select", { className: "mem-groupe", title: "N'afficher qu'un groupe" });
+    this.choixGroupe.onchange = () => { this.groupe = this.choixGroupe.value; this.remplir(); };
     this.ul = el("ul", { className: "memoires" });
-    const ajout = el("button", { type: "button", textContent: "Ajouter la fréquence actuelle" });
-    ajout.onclick = () => {
-      const nom = prompt("Nom de la mémoire :"); if (nom === null) return;
-      this.liste.push({ nom: nom || "—", f: Math.round(this.ctx.frequence()), mode: this.ctx.mode() }); this.sauver();
+    const bouton = (texte, titre, action) => { const b = el("button", { type: "button", textContent: texte, title: titre }); b.onclick = action; return b; };
+    this.fichier = el("input", { type: "file", accept: ".csv,.json,text/csv,application/json", hidden: true });
+    this.fichier.onchange = async () => {
+      const f = this.fichier.files[0]; this.fichier.value = ""; if (!f) return;
+      const r = this.importerTexte(await f.text());
+      this.etat.textContent = r ? `${r[0]} mémoire(s) ajoutée(s) depuis ${f.name}${r[1] ? `, ${r[1]} déjà présente(s)` : ""}` : `Aucune mémoire reconnue dans ${f.name}.`;
     };
+    this.etat = el("div", { className: "petit" });
     this.remplir();
-    return el("div", {}, this.ul, ajout);
+    return el("div", {},
+      el("div", { className: "scanner-choix" }, cherche, this.choixGroupe), this.ul,
+      el("div", { className: "scanner-boutons" },
+        bouton("Ajouter", "Mémoriser la fréquence et le mode actuels", () => this.editer(null)),
+        bouton("Sauvegarder…", "Télécharger les mémoires : CSV compatible CHIRP", () => this.exporter("csv")),
+        bouton("JSON", "Télécharger les mémoires en JSON (même format que l'application)", () => this.exporter("json")),
+        bouton("Importer…", "Ajouter des mémoires depuis un fichier CSV (CHIRP) ou JSON", () => this.fichier.click())),
+      this.fichier, this.etat);
   }
+  numero(i) { return `CH ${String(i + 1).padStart(String(this.liste.length).length, "0")}`; }
   remplir() {
-    this.ul.replaceChildren(...[...this.liste].sort((a, b) => a.f - b.f).map(m => {
-      const b = el("button", { type: "button", className: "rappel", textContent: `${(m.f / 1e6).toFixed(4)} ${m.mode} · ${m.nom}` });
+    const groupes = [TOUS_GROUPES, ...this.groupes()];
+    if (!groupes.includes(this.groupe)) this.groupe = TOUS_GROUPES;
+    this.choixGroupe.replaceChildren(...groupes.map(g => new Option(g, g, false, g === this.groupe)));
+    const q = this.recherche.trim().toLowerCase().replace(",", ".");
+    let n = 0;
+    this.ul.replaceChildren(...this.liste.flatMap((m, i) => {
+      if (this.groupe !== TOUS_GROUPES && m.groupe !== this.groupe) return [];
+      if (q && !`${m.nom} ${(m.f / 1e6).toFixed(6)} ${m.groupe} ${m.mode}`.toLowerCase().includes(q)) return [];
+      n++;
+      const b = el("button", { type: "button", className: "rappel", title: `Écouter${m.groupe ? ` · groupe ${m.groupe}` : ""}`,
+        textContent: `${this.numero(i)} ${(m.f / 1e6).toFixed(4)} ${m.mode} · ${m.nom}` });
       b.onclick = () => { this.ctx.reglerMode(m.mode); this.ctx.reglerFrequence(m.f); };
+      const e = el("button", { type: "button", className: "suppr", textContent: "✎", title: "Modifier" }); e.onclick = () => this.editer(m);
       const x = el("button", { type: "button", className: "suppr", textContent: "×", title: "Supprimer" });
-      x.onclick = () => { this.liste = this.liste.filter(y => y !== m); this.sauver(); };
-      return el("li", {}, b, x);
+      x.onclick = () => { if (confirm(`Supprimer « ${m.nom} » (${(m.f / 1e6).toFixed(4)} MHz) ?`)) { this.liste = this.liste.filter(y => y !== m); this.sauver(); } };
+      return [el("li", {}, b, e, x)];
     }));
+    this.etat.textContent = `${n} / ${this.liste.length} mémoire(s) · enregistrées automatiquement dans ce navigateur`;
   }
-  sauver() { this.ctx.ecrire("liste", this.liste); this.remplir(); }
+  /** Boîte d'ajout (m = null : fréquence actuelle) ou de modification. */
+  editer(m) {
+    const ancien = m ?? { nom: "", f: Math.round(this.ctx.frequence()), mode: this.ctx.mode(), groupe: this.groupe === TOUS_GROUPES ? "" : this.groupe };
+    const mhz = f => (f / 1e6).toFixed(6).replace(/\.?0+$/, "");
+    const nom = el("input", { type: "text", value: ancien.nom, placeholder: "ex. Relais R2" });
+    const freq = el("input", { type: "text", value: mhz(ancien.f), inputMode: "decimal", placeholder: "MHz, ex. 145.500" });
+    const mode = el("select", {}, ...MODES.map(x => new Option(x, x, false, x === ancien.mode)));
+    const liste = el("datalist", { id: "mem-groupes" }, ...this.groupes().map(g => new Option(g)));
+    const groupe = el("input", { type: "text", value: ancien.groupe, placeholder: "aucun (ex. Relais, Aviation…)" }); groupe.setAttribute("list", "mem-groupes");
+    const actuelle = el("button", { type: "button", textContent: "Fréquence actuelle", title: "Reprendre la fréquence et le mode du récepteur" });
+    actuelle.onclick = () => { freq.value = mhz(this.ctx.frequence()); mode.value = this.ctx.mode(); };
+    const erreur = el("div", { className: "petit mem-erreur" });
+    const ok = el("button", { type: "submit", textContent: "OK" }), annuler = el("button", { type: "button", textContent: "Annuler" });
+    const ligne = (titre, ...c) => el("label", {}, el("span", { textContent: titre }), ...c);
+    const d = el("dialog", { className: "mem-dialogue" }, el("form", { method: "dialog" },
+      el("h2", { textContent: m ? "Modifier la mémoire" : "Nouvelle mémoire" }),
+      ligne("Nom", nom), ligne("MHz", freq, actuelle), ligne("Mode", mode), ligne("Groupe", groupe, liste), erreur,
+      el("div", { className: "scanner-boutons mem-actions" }, annuler, ok)));
+    annuler.onclick = () => d.close();
+    d.querySelector("form").onsubmit = e => {
+      const f = lireFrequence(freq.value);
+      if (f === null) { e.preventDefault(); erreur.textContent = "Fréquence illisible : en MHz, par exemple 145.500"; freq.focus(); return; }
+      const nouveau = { nom: nom.value.trim() || "—", f, mode: mode.value, groupe: groupe.value.trim() };
+      this.liste = m ? this.liste.map(y => y === m ? nouveau : y) : [...this.liste, nouveau];
+      this.sauver();
+    };
+    d.addEventListener("close", () => d.remove());
+    document.body.append(d); d.showModal(); nom.focus(); nom.select();
+    return d;
+  }
+  exporter(format) {
+    const contenu = format === "json"
+      ? JSON.stringify(this.liste.map(m => ({ nom: m.nom, frequence: m.f, mode: m.mode, groupe: m.groupe })), null, 2)
+      : versCsvChirp(this.liste);
+    const a = el("a", { href: URL.createObjectURL(new Blob([contenu], { type: format === "json" ? "application/json" : "text/csv" })), download: `memoires.${format}` });
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    this.etat.textContent = `${this.liste.length} mémoire(s) sauvegardée(s) dans memoires.${format}`;
+  }
+  /** Ajoute les mémoires d'un fichier JSON ou CSV, sans doublon (fréquence + mode) : [ajoutées, doublons], ou null. */
+  importerTexte(texte) {
+    let liste = [];
+    if (texte.trimStart().startsWith("[")) { try { liste = JSON.parse(texte).map(normaliserMemoire).filter(Boolean); } catch { liste = []; } }
+    else liste = depuisCsv(texte);
+    if (!liste.length) return null;
+    const connues = new Set(this.liste.map(m => `${m.f}/${m.mode}`)), nouvelles = [];
+    for (const m of liste) if (!connues.has(`${m.f}/${m.mode}`)) { connues.add(`${m.f}/${m.mode}`); nouvelles.push(m); }
+    this.liste.push(...nouvelles); this.sauver();
+    return [nouvelles.length, liste.length - nouvelles.length];
+  }
+  sauver() { this.liste.sort((a, b) => a.f - b.f); this.ctx.ecrire("liste", this.liste); this.remplir(); }
 }
 
 class Enregistreur {
