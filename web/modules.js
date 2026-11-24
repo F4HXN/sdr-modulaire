@@ -184,7 +184,6 @@ class SMetre {
     this.toile.setAttribute("aria-hidden", "true");
     this.leds = Array.from({ length: NB_LED }, () => el("i"));
     const barre = el("div", { className: "smetre-leds" }, ...this.leds);
-    this.txt = el("div", { className: "smetre-txt", role: "status" });
     let avant = performance.now(), dernierTexte = 0, cleEchelle = "";
     const signal = echelleSignal();
     const animer = maintenant => {
@@ -208,10 +207,10 @@ class SMetre {
       this.dessiner(e);
       const allumees = Math.round(Math.min(1, this.aiguille) * NB_LED), iCrete = Math.min(NB_LED - 1, Math.floor(e.pos(this.crete) * NB_LED));
       this.leds.forEach((led, i) => { led.classList.toggle("on", i < allumees); led.classList.toggle("crete", i === iCrete && i >= allumees); });
-      if (maintenant - dernierTexte > 200) { dernierTexte = maintenant; this.txt.textContent = e.texte(v, this.crete); }
+      if (maintenant - dernierTexte > 200) { dernierTexte = maintenant; this.toile.title = e.texte(v, this.crete); }
     };
     this.anim = requestAnimationFrame(animer);
-    return el("div", { className: "smetre" }, choix, this.toile, barre, this.txt);
+    return el("div", { className: "smetre" }, choix, this.toile, barre);
   }
   dessiner(e) {
     const c = this.toile, r = devicePixelRatio || 1, W = c.clientWidth, H = c.clientHeight;
