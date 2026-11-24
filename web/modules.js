@@ -1381,8 +1381,19 @@ class DecodeurAPRS {
     let pr = this.pr, pi = this.pi;
     for (let k = 0; k < cr.length; k++) { const a = cr[k], b = ci[k]; fm[k] = Math.atan2(b * pr - a * pi, a * pr + b * pi); pr = a; pi = b; }
     this.pr = pr; this.pi = pi;
+    // Diagnostic : variance du discriminateur par bloc (≈ 3,3 = bruit seul, nettement moins = porteuse FM présente).
+    let v = 0; for (let k = 0; k < fm.length; k++) v += fm[k] * fm[k];
+    if (fm.length) { (this.varFM ??= []).push(v / fm.length); if (this.varFM.length > 600) this.varFM.shift(); }
     const [audio] = this.versAudio.traiter(fm, new Float32Array(fm.length));
     for (const o of this.demod.traiter(audio)) { const t = trameVersTexte(o); if (t) { this.recues.push(t); this.placer(t); } }
+  }
+
+  /** Mesures pour le rapport de diagnostic (sans le contenu des trames ni la station). */
+  diagnostic() {
+    const v = [...(this.varFM || [])].sort((a, b) => a - b), q = p => v.length ? +v[Math.floor(p * (v.length - 1))].toFixed(2) : null;
+    return { frequence: this.frequence, couverte: this.couvert, saturation: +(100 * this.saturation).toFixed(3),
+      trames: this.recues.length, stations: this.stations.size, iqIlYa: Number.isFinite(this.derniersIQ) ? +((performance.now() - this.derniersIQ) / 1000).toFixed(1) : null,
+      varianceFM_30s: { min: q(0), mediane: q(0.5), bruitSeul: 3.29 } };
   }
 
   /** Met à jour la station (ou l'objet) si la trame contient une position. */

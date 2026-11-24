@@ -4,7 +4,7 @@
 import { Chaine, FFT, octetsVersIQ, TAUX, MODES, LARGEURS, TAUX_AUDIO } from "./dsp.js?v=20261122-cw";
 import { CleRtlSdr } from "./rtlsdr.js?v=20261122-pll";
 import { SourceSimulation } from "./simulation.js?v=20261122-niveau";
-import { MODULES } from "./modules.js?v=20261124-vumetre";
+import { MODULES } from "./modules.js?v=20261124-diag";
 
 const $ = s => document.querySelector(s);
 const PAS = [1, 10, 100, 1000, 2500, 5000, 6250, 8330, 10000, 12500, 25000, 100000, 1000000];
@@ -59,8 +59,21 @@ const nomCle = () => { const i = source?.infos?.() || {}; return [i.modele || "c
 const SEUIL_SATURATION = 1e-4;            // au-delà de 0,01 % d'échantillons écrêtés, le gain est trop fort
 const compteSat = { n: 0, sat: 0 }, mesureSat = { n: 0, sat: 0 };
 let tauxSat = 0;
+// Débit réellement reçu de la clé, comparé au taux demandé (diagnostic : échantillons perdus en USB).
+const debit = { octets: 0, historique: [], debut: 0 };
+setInterval(() => {
+  debit.historique.push([performance.now(), debit.octets]);
+  if (debit.historique.length > 6) debit.historique.shift();
+}, 1000);
+function debitRecu() {
+  const h = debit.historique; if (h.length < 2 || !source) return null;
+  const [t0, o0] = h[0], [t1, o1] = h[h.length - 1];
+  return t1 > t0 ? (o1 - o0) / 2 / ((t1 - t0) / 1000) / R.taux : null;
+}
 function traiterBloc(octets) {
+  debit.octets += octets.length;
   if (attenteEchantillons) {
+    debit.debut = performance.now();
     clearTimeout(attenteEchantillons); attenteEchantillons = null; statut(`✓ Clé ouverte, réception en cours : ${nomCle()}.`); $("#statut").className = "ok";
     setTimeout(echelleAuto, 1500);        // niveaux du spectre et de la chute d'eau calés sur ce que reçoit la clé
   }
@@ -622,3 +635,80 @@ const presence = (fin = false) => {
 presence(); setInterval(presence, 30000);
 addEventListener("pagehide", () => presence(true));
 navigator.usb?.addEventListener("disconnect", e => { if (source?.usb === e.device) { erreur("La clé a été débranchée."); source = null; majEtat(); } });
+
+// ---------------------------------------------------------------- diagnostic à envoyer (sur demande)
+// Sur clic seulement : un rapport technique (navigateur, clé, réglages, mesures de réception, lignes de
+// diagnostic des modules, commentaire) part dans l'adresse d'une requête que le serveur range dans un
+// journal à part, sans adresse IP. Ni son, ni IQ, ni trames reçues, ni position de la station.
+const VERSION_DIAG = "20261124-diag";
+const arrondi = (x, n = 1) => Number.isFinite(x) ? +x.toFixed(n) : null;
+function rapportDiagnostic(commentaire, code) {
+  const i = source?.infos?.() || {};
+  const type = !source ? "aucune" : source instanceof CleRtlSdr ? "clé" : source instanceof SourceSimulation ? "simulation" : "fichier";
+  let bruit = null, crete = null;
+  if (dernierSpectre) { const t = [...dernierSpectre].sort((a, b) => a - b); bruit = t[Math.floor(t.length * 0.2)]; crete = t[t.length - 1]; }
+  const modules = {};
+  for (const [nom, m] of actifs) {
+    let d = null;
+    try { d = m.diagnostic?.() ?? null; } catch (e) { d = `erreur : ${e.message}`; }
+    const lignes = [...(m._boite?.querySelectorAll(".petit, [role=status]") || [])]
+      .map(e => e.textContent.trim()).filter(Boolean).map(t => t.slice(0, 300)).slice(0, 8);
+    modules[nom] = d ? { mesures: d, lignes } : lignes;
+  }
+  const dr = debitRecu();
+  return {
+    v: VERSION_DIAG, code, date: new Date().toISOString(),
+    navigateur: navigator.userAgent, plateforme: navigator.userAgentData?.platform ?? null, webusb: !!navigator.usb,
+    source: { type, modele: i.modele ?? null, fabricant: i.fabricant ?? null, tuner: i.tuner ?? null, couverture: i.couverture ?? null, paliers: i.gains?.length ?? null },
+    reglages: { centre: R.centre, vfo: frequence(), taux: R.taux, mode: R.mode, largeur: largeur(), gain: R.gain, ppm: R.ppm, agc: R.agc,
+      direct: R.direct, convertisseur: R.convertisseur, squelch: R.squelch },
+    reception: { secondes: source && debit.debut ? Math.round((performance.now() - debit.debut) / 1000) : null,
+      debit: dr === null ? null : arrondi(100 * dr) + " %", saturation: arrondi(100 * tauxSat, 3) + " %",
+      bruit: arrondi(bruit), crete: arrondi(crete), niveauVFO: arrondi(chaine?.niveau) },
+    statut: $("#statut").textContent.slice(0, 300), modules, commentaire: commentaire.slice(0, 500),
+  };
+}
+const versBase64url = texte => {
+  const o = new TextEncoder().encode(texte); let b = "";
+  for (let k = 0; k < o.length; k += 0x8000) b += String.fromCharCode(...o.subarray(k, k + 0x8000));
+  return btoa(b).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+function ouvrirDiagnostic() {
+  const code = Array.from(crypto.getRandomValues(new Uint8Array(4)), x => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[x % 32]).join("") +
+    "-" + Array.from(crypto.getRandomValues(new Uint8Array(2)), x => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[x % 32]).join("");
+  const d = document.createElement("dialog"); d.className = "mem-dialogue diag-dialogue";
+  d.innerHTML = `<h2>Envoyer un diagnostic</h2>
+    <p class="diag-aide">Laissez SDR Web tourner sur la fréquence qui pose problème (module ouvert), puis envoyez. Le rapport ci-dessous part tel quel :
+    navigateur, clé, réglages et mesures de réception. <strong>Ni son, ni échantillons, ni trames reçues, ni position, ni adresse IP.</strong>
+    <a href="/confidentialite.html#diagnostic" target="_blank" rel="noopener">En savoir plus</a></p>
+    <label class="diag-champ">Ce qui ne marche pas (facultatif)<textarea maxlength="500" rows="3" placeholder="Ex. : aucune trame APRS alors que j'entends les salves en NFM"></textarea></label>
+    <details><summary>Voir le rapport</summary><pre class="diag-rapport"></pre></details>
+    <p class="diag-resultat" role="status"></p>
+    <div class="scanner-boutons mem-actions"><button type="button" class="annuler">Annuler</button><button type="button" class="envoyer" style="color:#03060d;background:var(--cyan);border-color:var(--cyan)">Envoyer</button></div>`;
+  const zone = d.querySelector("textarea"), pre = d.querySelector("pre"), res = d.querySelector(".diag-resultat");
+  const envoyer = d.querySelector(".envoyer"), annuler = d.querySelector(".annuler");
+  const maj = () => { pre.textContent = JSON.stringify(rapportDiagnostic(zone.value, code), null, 1); };
+  maj(); const minut = setInterval(maj, 1000); zone.oninput = maj;
+  annuler.onclick = () => d.close();
+  d.addEventListener("close", () => { clearInterval(minut); d.remove(); });
+  envoyer.onclick = async () => {
+    const r = rapportDiagnostic(zone.value, code);
+    let t = versBase64url(JSON.stringify(r));
+    if (t.length > 7000) {                  // trop long pour l'adresse : lignes des modules raccourcies
+      for (const k in r.modules) r.modules[k] = JSON.stringify(r.modules[k]).slice(0, 400);
+      t = versBase64url(JSON.stringify(r));
+    }
+    envoyer.disabled = true; res.className = "diag-resultat"; res.textContent = "Envoi…";
+    try {
+      const rep = await fetch(`/sdr-web/diagnostic?d=${t}`, { cache: "no-store" });
+      if (rep.status === 429) throw new Error("trop d'envois rapprochés, réessayez dans une minute");
+      if (!rep.ok) throw new Error(`le serveur a répondu ${rep.status}`);
+      clearInterval(minut);
+      res.className = "diag-resultat ok";
+      res.innerHTML = `✓ Diagnostic envoyé. Son code : <b>${code}</b>. Indiquez-le si vous écrivez à <a href="mailto:contact@rtl-sdr.fr?subject=Diagnostic%20SDR%20Web%20${code}">contact@rtl-sdr.fr</a>.`;
+      envoyer.hidden = true; annuler.textContent = "Fermer";
+    } catch (e) { res.className = "diag-resultat erreur"; res.textContent = `✗ Envoi impossible : ${e.message}`; envoyer.disabled = false; }
+  };
+  document.body.append(d); d.showModal(); zone.focus();
+}
+$("#b-diag").onclick = ouvrirDiagnostic;
