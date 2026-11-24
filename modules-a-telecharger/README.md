@@ -30,3 +30,4 @@ par le script de déploiement du site).
 | `decodeur_acars.py` | messages ACARS (VHF AM) sans logiciel externe : listes de fréquences préenregistrées (Europe, Amérique du Nord, Japon, Asie) décodées ensemble, immatriculation, vol, label, texte ; CRC et correction d'erreurs |
 | `enregistreur_iq.py` | enregistre toute la bande reçue (WAV IQ 8 bits à la SDR#, bloc `auxi`) et la rejoue à la place de la clé pour démoduler après coup ; lit aussi WAV 16/32 bits, SigMF et gqrx |
 | `tonalites.py` | sous-porteuse CTCSS d'accès d'un relais (tonalité normalisée, fréquence mesurée, déviation, durée), codes DTMF et tonalité 1750 Hz, sur la fréquence du VFO quel que soit le mode ; journal horodaté |
+| `vumetre.py` | vu-mètre égaliseur à LED : l'audio en 8 à 32 bandes (échelle logarithmique jusqu'à 3,2, 5 ou 16 kHz selon le mode), colonnes vertes, jaunes et rouges avec crête et reflet, colonne VU du niveau global ; fenêtre « Agrandir » |

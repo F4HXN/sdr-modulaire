@@ -25,6 +25,7 @@ import { enteteWav, iqVersOctets, nomFichier, lireEnteteWav, SourceFichierIQ, LI
 import { DecodeurFax, STATIONS as STATIONS_FAX, LARGEUR as LARGEUR_FAX, TAUX_FAX, DECALAGE_USB } from "./fax-meteo.js?v=20261123-fax";
 import { MoteurACARS, LISTES as LISTES_ACARS, texteMessage as texteACARS, mhz as mhzACARS } from "./acars.js?v=20261123-acars";
 import { MoteurTonalites, TAUX_TONALITES, texteCtcss, secondes } from "./tonalites.js?v=20261123-tonalites";
+import { MoteurVumetre, dessiner as dessinerVumetre, frequenceMax, bords as bordsVumetre, BANDES as BANDES_VUMETRE } from "./vumetre.js?v=20261124-vumetre";
 import { DecodeurDMR as MoteurDMR, TAUX_DMR, FID as FID_DMR, SAP as SAP_DMR, nomSlot, texteAppel } from "./dmr.js?v=20261122-dmr";
 
 const el = (balise, props = {}, ...enfants) => { const e = Object.assign(document.createElement(balise), props); e.append(...enfants); return e; };
@@ -2489,4 +2490,45 @@ class DecodeurAIS {
   arreter() { clearInterval(this.minuterie); if (this.dialogue?.open) this.dialogue.close(); if (this.fenCarte?.open) this.fenCarte.close(); }
 }
 
-export const MODULES = [SMetre, Memoires, Enregistreur, EnregistreurIQ, Journal, Capteurs433, ModuleStereoRds, ADSB, DecodeurAIS, ScannerMemoires, ScannerFrequences, ModuleSSTV, FaxMeteo, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR, DecodeurACARS, Tonalites];
+// Vu-mètre égaliseur à LED : calcul et dessin dans vumetre.js (même calcul que modules-a-telecharger/vumetre.py).
+class Vumetre {
+  static nom = "Vu-mètre égaliseur";
+  static description = "L'audio découpé en bandes de fréquence, en colonnes de LED vertes, jaunes et rouges avec crête et reflet, comme un égaliseur de chaîne hi-fi ; colonne VU du niveau global.";
+  demarrer() {
+    this.moteur = new MoteurVumetre(); this.dernier = -Infinity;
+    this.bandes = this.ctx.lire("bandes", 16); this.reflet = this.ctx.lire("reflet", true);
+    this.ctx.abonner("audio", (a, taux) => { this.moteur.pousser(a, taux); this.dernier = performance.now(); });
+  }
+  creerPanneau() {
+    this.toile = el("canvas", { className: "vumetre-toile" });
+    this.toile.setAttribute("aria-hidden", "true");
+    const choix = el("select", { title: "Nombre de bandes" }, ...BANDES_VUMETRE.map(n => new Option(`${n} bandes`, n, false, n === this.bandes)));
+    choix.onchange = () => { this.bandes = +choix.value; this.ctx.ecrire("bandes", this.bandes); };
+    const caseReflet = el("input", { type: "checkbox", checked: this.reflet });
+    caseReflet.onchange = () => { this.reflet = caseReflet.checked; this.ctx.ecrire("reflet", this.reflet); };
+    const actions = el("div", { className: "scanner-choix cw-actions vumetre-actions" }, choix, el("label", { className: "petit" }, caseReflet, " Reflet"));
+    this.txt = el("div", { className: "petit" });
+    const contenu = el("div", { className: "cw-contenu vumetre" }, this.toile, actions, this.txt);
+    const { panneau } = panneauAgrandissable(this.ctx, { titre: Vumetre.nom, id: "vumetre-titre", contenu, actions,
+      tailleDefaut: 1, attenteTexte: "Vu-mètre affiché dans la fenêtre agrandie.", tailleTexte: false });
+    let avant = performance.now(), cle = "";
+    const animer = maintenant => {
+      this.anim = requestAnimationFrame(animer);
+      const dt = Math.min(0.1, (maintenant - avant) / 1000); avant = maintenant;
+      const fmax = frequenceMax(this.ctx.mode());
+      const etat = this.moteur.image(dt, this.bandes, fmax, maintenant - this.dernier < 500);
+      dessinerVumetre(this.toile, etat, this.reflet);
+      const c = `${this.bandes}/${fmax}/${this.ctx.mode()}`;
+      if (c !== cle) {
+        cle = c;
+        const b = bordsVumetre(this.bandes, fmax), hz = f => f >= 1000 ? `${(f / 1000).toLocaleString("fr-FR", { maximumFractionDigits: 1 })} kHz` : `${Math.round(f)} Hz`;
+        this.txt.textContent = `${this.bandes} bandes de ${hz(b[0])} à ${hz(b[b.length - 1])} (${this.ctx.mode()}) · échelle automatique`;
+      }
+    };
+    this.anim = requestAnimationFrame(animer);
+    return panneau;
+  }
+  arreter() { cancelAnimationFrame(this.anim); }
+}
+
+export const MODULES = [SMetre, Vumetre, Memoires, Enregistreur, EnregistreurIQ, Journal, Capteurs433, ModuleStereoRds, ADSB, DecodeurAIS, ScannerMemoires, ScannerFrequences, ModuleSSTV, FaxMeteo, DecodeurCW, DecodeurAPRS, DecodeurFT, DecodeurDMR, DecodeurACARS, Tonalites];

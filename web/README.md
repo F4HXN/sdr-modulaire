@@ -9,7 +9,7 @@ le traitement dans le navigateur. En ligne : https://rtl-sdr.fr/sdr-web.html
 | `dsp.js`        | NCO, filtres décimants à état, FFT, démodulateurs, AGC      | MIT |
 | `audio.js`      | sortie audio (AudioWorklet, tampon circulaire)              | MIT |
 | `simulation.js` | source simulée (émetteurs fictifs), plus proposée dans la page : sert au développement | MIT |
-| `modules.js`    | modules à chaud : S-mètre, mémoires, enregistreurs WAV et IQ, journal, capteurs 433 MHz, stéréo et RDS, ADS-B, AIS (navires), scanners de mémoires et de fréquences, décodeurs SSTV, fax météo, FT8, FT4, DMR et ACARS, tonalités CTCSS et DTMF | MIT |
+| `modules.js`    | modules à chaud : S-mètre, vu-mètre égaliseur, mémoires, enregistreurs WAV et IQ, journal, capteurs 433 MHz, stéréo et RDS, ADS-B, AIS (navires), scanners de mémoires et de fréquences, décodeurs SSTV, fax météo, FT8, FT4, DMR et ACARS, tonalités CTCSS et DTMF | MIT |
 | `ft8-worker.js` | décode les créneaux UTC FT8 (15 s) ou FT4 (7,5 s) depuis l’audio USB, sans bloquer l’interface | MIT |
 | `ft8-lib/` | moteur WebAssembly ft8_lib pour le décodage FT8 et FT4 | voir `ft8-lib/LICENSE.txt` |
 | `sstv.js`       | décodeur SSTV (Martin, Scottie, Robot, PD) : VIS, calage des lignes sur les tops de synchro ; même algorithme que `modules-a-telecharger/sstv.py` | MIT |
@@ -20,6 +20,7 @@ le traitement dans le navigateur. En ligne : https://rtl-sdr.fr/sdr-web.html
 | `fax-meteo.js` | fax météo (WEFAX) : signaux de départ et d'arrêt, phasage, pente, lignes ; même algorithme que `modules-a-telecharger/fax_meteo.py` | MIT |
 | `acars.js` | ACARS : démodulation MSK cohérente, trame, CRC-16 et correction, plusieurs fréquences ensemble ; même algorithme que `modules-a-telecharger/decodeur_acars.py` | MIT |
 | `enregistreur-iq.js` | enregistreur IQ : WAV 8 bits à la SDR# (bloc `auxi`), source « fichier » pour la relecture ; même format que `modules-a-telecharger/enregistreur_iq.py` | MIT |
+| `vumetre.js` | vu-mètre égaliseur à LED : bandes de l'audio par FFT, échelle automatique, balistique et dessin ; même calcul que `modules-a-telecharger/vumetre.py` | MIT |
 | `tonalites.js`  | CTCSS (DFT sur 2 s, interpolation, 52 tonalités normalisées), DTMF (Goertzel) et 1750 Hz ; même algorithme que `modules-a-telecharger/tonalites.py` | MIT |
 | `carte-adsb.js` | carte radar des avions, des stations APRS et des navires AIS (canevas)                              | MIT |
 | `carte-monde.js` | côtes et frontières du monde (Natural Earth, domaine public), chargé à l'ouverture de la carte | domaine public |
