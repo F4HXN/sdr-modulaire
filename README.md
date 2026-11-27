@@ -18,6 +18,7 @@ modules à chaud**, sans redémarrer.
 - Détection de la clé : modèle, tuner, couverture, paliers de gain, taux max ; options non prises en charge grisées, fréquence en rouge hors couverture (menu Source → Informations sur le matériel)
 - RTL-SDR : taux d'échantillonnage, gain RF (auto ou manuel), correction ppm, échantillonnage direct I/Q (HF sur V3), bias-T
 - Saturation de la clé affichée en continu (part des échantillons écrêtés, en rouge au-delà de 0,05 %) et bouton « Ajuster » : gain le plus fort sans saturation, trouvé par dichotomie sur les paliers du tuner (~6 s), puis niveaux du spectre recalés ; même chose dans SDR Web
+- Sources de son déjà démodulé (menu Source) : **Son du PC**, une entrée son au choix dans une liste (carte son, codec USB d'un transceiver…), ou **IC-7300 (serveur)**, le son de l'IC-7300 lu sur le PC de la radio (PipeWire-Pulse TCP 4713, serveur d'IC-7300 Scope). Pas de démodulation : spectre du son de 0 à 3, 4, 6, 12 ou 24 kHz, et les modules (CW, SSTV, FT8, fax…) reçoivent ce son. Avec l'IC-7300, fréquence et mode synchronisés dans les deux sens par le serveur CAT (port 7300), en second d'IC-7300 Scope : l'émission reste à IC-7300 Scope
 - Convertisseur HF (Ham It Up…) : décalage en MHz dans les réglages ; l'afficheur et le spectre montrent la vraie fréquence HF, la clé est accordée sur fréquence + décalage
 - Réglages, modules actifs et disposition des fenêtres retrouvés au lancement suivant
 
@@ -83,6 +84,7 @@ sdrmod/
   modules.py       Module, Contexte, GestionnaireModules
   signature.py     vérification Ed25519 du catalogue des modules (Python pur)
   sources/         rtlsdr_source.py (une classe Source par matériel),
+                   audio_source.py (son du PC, IC-7300 par le réseau, synchro CI-V),
                    simulation.py (émetteurs fictifs, pour les tests automatiques seulement)
   demods/          am.py, fm.py, blu.py              (un fichier = un ou plusieurs modes)
   ui/              fenêtre, waterfall, afficheur, panneau, dialogue modules
@@ -159,7 +161,7 @@ QT_QPA_PLATFORM=offscreen HOME=$(mktemp -d) python3 -m tests.test_memoires  # m�
 
 ## Modules disponibles
 
-Fournis avec l'application : S-mètre, Mémoires, Enregistreur audio (WAV), Journal d'activité,
+Fournis avec l'application : S-mètre (cadran à aiguille et barre de LED, comme dans SDR Web), Mémoires, Enregistreur audio (WAV), Journal d'activité,
 Capteurs 433 MHz, Stéréo et RDS en FM.
 
 Le module **Mémoires** gère les fréquences favorites : tableau numéroté (les mêmes CH que le

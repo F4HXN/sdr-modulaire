@@ -7,7 +7,7 @@ import logging
 import numpy as np
 from PySide6.QtCore import QByteArray, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QComboBox, QDockWidget, QFrame, QLabel, QMainWindow,
+from PySide6.QtWidgets import (QComboBox, QInputDialog, QDockWidget, QFrame, QLabel, QMainWindow,
                                QMessageBox, QScrollArea, QToolButton, QVBoxLayout, QWidget)
 
 from .. import __version__
@@ -17,7 +17,7 @@ from ..config import PAS_ACCORD, Reglages
 from ..demods import decouvrir
 from ..modules import Contexte, GestionnaireModules
 from ..moteur import Moteur
-from ..sources import SOURCES, TOUTES_SOURCES
+from ..sources import SOURCES, TOUTES_SOURCES, lister_entrees
 from ..sources.rtlsdr_source import libelle_cle, lister_cles
 from .afficheur import AfficheurFrequence
 from .dialogue_modules import DialogueModules
@@ -78,6 +78,7 @@ class FenetrePrincipale(QMainWindow):
         m.convertisseur = r.convertisseur
         m.volume, m.squelch, m.agc_actif = r.volume, r.squelch, r.agc
         m.taille_fft, m.moyennage, m.zoom = r.taille_fft, r.moyennage, r.zoom
+        m.zoom_audio = r.zoom_audio
 
         self._construire_interface()
         self._connecter()
@@ -201,13 +202,15 @@ class FenetrePrincipale(QMainWindow):
         p.volume_change.connect(lambda v: self._param("volume", "volume", v))
         p.fft_change.connect(lambda v: self._param("taille_fft", "taille_fft", v))
         p.moyennage_change.connect(lambda v: self._param("moyennage", "moyennage", v))
-        p.zoom_change.connect(lambda v: self._param("zoom", "zoom", v))
+        p.zoom_change.connect(self._changer_zoom)
         p.niveaux_change.connect(self._changer_niveaux)
         p.auto_echelle.connect(self._echelle_auto)
         p.ajuster_gain.connect(self._ajuster_gain)
         self._ajustement = None
         self._minuterie_sat = QTimer(self, interval=500, timeout=self._maj_saturation)
         self._minuterie_sat.start()
+        self._minuterie_radio = QTimer(self, interval=250, timeout=self._suivre_radio)
+        self._minuterie_radio.start()
 
     @staticmethod
     def _texte_pas(p: int) -> str:
@@ -226,6 +229,16 @@ class FenetrePrincipale(QMainWindow):
     def regler_frequence(self, f: float) -> None:
         r = self.reglages
         f = max(0.0, float(f))
+        if r.source == "ic7300":
+            # la fréquence est celle de la radio : envoyée par CI-V, pas de recentrage de clé
+            if not 30_000 <= f <= 74_800_000:
+                self._maj_vfo()     # hors de la couverture de l'IC-7300 : on garde la fréquence actuelle
+                return
+            r.centre, r.decalage = f, 0.0
+            self.moteur.centre, self.moteur.decalage = f, 0.0
+            self.moteur.commande_source("regler_frequence", f)
+            self._maj_vfo()
+            return
         bas, haut = self._bande()
         limite = r.taux / 2 * 0.92
         if f + bas < r.centre - limite or f + haut > r.centre + limite:
@@ -249,6 +262,8 @@ class FenetrePrincipale(QMainWindow):
         self._maj_vfo()
 
     def _clic_spectre(self, f: float) -> None:
+        if self.reglages.source in ("son_pc", "ic7300"):
+            return              # spectre du son (0–24 kHz), en marche ou non : un clic n'y désigne pas une fréquence radio
         pas = self.reglages.pas
         self.regler_frequence(round(f / pas) * pas)
 
@@ -266,11 +281,27 @@ class FenetrePrincipale(QMainWindow):
         largeur = r.largeurs.get(mode, classe.largeur_defaut)
         self.panneau.regler_demod(classe.largeur_min, classe.largeur_max, classe.pas_largeur, largeur)
         self.moteur.regler_mode(mode, largeur)
+        if r.source == "ic7300":
+            self.moteur.commande_source("regler_mode", mode)
         if self.c_mode.currentText() != mode:
             self.c_mode.blockSignals(True)
             self.c_mode.setCurrentText(mode)
             self.c_mode.blockSignals(False)
         self._maj_vfo()
+
+    def _suivre_radio(self) -> None:
+        """Source IC-7300 : la fréquence et le mode changés sur la radio (ou dans IC-7300 Scope) suivent ici."""
+        src = self.moteur.source
+        if not (self.moteur.actif and self.reglages.source == "ic7300" and hasattr(src, "frequence_radio")):
+            return
+        f, mode = src.frequence_radio, src.mode_radio
+        if mode and mode != self.reglages.mode:
+            self.regler_mode(mode)
+        if f and f != round(self.reglages.frequence):
+            self.regler_frequence(f)
+        if src.etat_cat != getattr(self, "_etat_cat", None):
+            self._etat_cat = src.etat_cat
+            self._maj_statut()
 
     def afficher_canal(self, texte: str | None) -> None:
         """Texte affiché à côté de la fréquence (None ou vide : rien)."""
@@ -297,6 +328,12 @@ class FenetrePrincipale(QMainWindow):
     def _param(self, cle: str, attr: str, valeur) -> None:
         setattr(self.reglages, cle, valeur)
         setattr(self.moteur, attr, valeur)
+
+    def _changer_zoom(self, v: float) -> None:
+        if getattr(self, "_largeurs_audio", False):
+            self.reglages.zoom_audio = self.moteur.zoom_audio = v
+        else:
+            self._param("zoom", "zoom", v)
 
     def _plages(self) -> list[tuple[float, float]]:
         """Plages du tuner ramenées aux fréquences affichées (décalage du convertisseur HF)."""
@@ -441,6 +478,10 @@ class FenetrePrincipale(QMainWindow):
         m.convertisseur = r.convertisseur
         if r.source == "rtlsdr":
             source = SOURCES["rtlsdr"](index=r.rtlsdr_index, serie=r.rtlsdr_serie)
+        elif r.source == "son_pc":
+            source = SOURCES["son_pc"](r.son_pc_entree)
+        elif r.source == "ic7300":
+            source = SOURCES["ic7300"](r.ic7300_hote)
         else:
             source = TOUTES_SOURCES[r.source]()
         problemes = []
@@ -471,8 +512,11 @@ class FenetrePrincipale(QMainWindow):
             QMessageBox.warning(
                 self, "Démarrage impossible",
                 f"Impossible d'ouvrir la source « {source.nom} » :\n\n{exc}\n\n"
-                "Vérifiez que la clé est branchée et qu'aucun autre programme ne l'utilise "
-                "(SDR Web dans le navigateur, rtl_tcp, Gqrx…).")
+                + ("Vérifiez que le PC de la radio est allumé et que son serveur son "
+                   "(PipeWire-Pulse, TCP 4713) accepte ce PC." if r.source == "ic7300" else
+                   "Vérifiez l'entrée son choisie dans le menu Source." if r.source == "son_pc" else
+                   "Vérifiez que la clé est branchée et qu'aucun autre programme ne l'utilise "
+                   "(SDR Web dans le navigateur, rtl_tcp, Gqrx…)."))
             return
         self.panneau.appliquer_materiel(self.infos_materiel)
         self._maj_statut()
@@ -483,7 +527,16 @@ class FenetrePrincipale(QMainWindow):
     def _etat_marche(self, actif: bool) -> None:
         self.b_marche.setChecked(actif)
         self.b_marche.setText("■ Arrêter" if actif else "▶ Démarrer")
-        self.panneau.taux.setEnabled(True)
+        # source audio : 48 kHz imposés, le taux d'échantillonnage ne s'applique pas,
+        # et la largeur affichée est celle du son (0–4 kHz…)
+        audio = actif and self.moteur.source_audio
+        self.panneau.taux.setEnabled(not audio)
+        if audio != getattr(self, "_largeurs_audio", False):
+            self._largeurs_audio = audio
+            if audio:
+                self.panneau.zooms_audio(self.reglages.zoom_audio)
+            else:
+                self.panneau._zooms_pour(self.reglages.taux, self.reglages.zoom)
         self._maj_statut()
 
     def _erreur_moteur(self, msg: str) -> None:
@@ -518,15 +571,65 @@ class FenetrePrincipale(QMainWindow):
             a = menu.addAction("RTL-SDR : aucune clé détectée")
             a.setEnabled(False)
         for cle, classe in SOURCES.items():
-            if cle != "rtlsdr":
+            if cle not in ("rtlsdr", "son_pc", "ic7300"):
                 ajouter(classe.nom, cle == r.source, lambda _=False, c=cle: self._choisir_source(c))
+
+        # Son déjà démodulé : une entrée son de ce PC (liste déroulante), ou l'IC-7300 par son serveur
+        menu.addSeparator()
+        sous = menu.addMenu("Son du PC")
+        if r.source == "son_pc":
+            sous.setTitle("✓ Son du PC")
+        entrees = [{"nom": "", "description": "Entrée par défaut"}] + lister_entrees()
+        for e in entrees:
+            a = QAction(e["description"], sous, checkable=True)
+            a.setChecked(r.source == "son_pc" and r.son_pc_entree == e["nom"])
+            a.setToolTip(e["nom"])
+            a.triggered.connect(lambda _=False, n=e["nom"]: self._choisir_son_pc(n))
+            groupe.addAction(a)
+            sous.addAction(a)
+        ajouter(f"IC-7300 (serveur {r.ic7300_hote})" if r.ic7300_hote else "IC-7300 (serveur)…",
+                r.source == "ic7300",
+                lambda _=False: self._choisir_source("ic7300") if r.ic7300_hote else self._demander_hote_ic7300())
+        menu.addAction("Adresse du serveur IC-7300…", self._demander_hote_ic7300)
         menu.addSeparator()
         menu.addAction("Informations sur le matériel…", self._afficher_materiel)
+
+    def _choisir_son_pc(self, entree: str) -> None:
+        self.reglages.son_pc_entree = entree
+        if self.reglages.source == "son_pc" and self.moteur.actif:
+            self.moteur.arreter()
+            self.demarrer()
+        else:
+            self._choisir_source("son_pc")
+
+    def _demander_hote_ic7300(self) -> None:
+        r = self.reglages
+        hote, ok = QInputDialog.getText(
+            self, "Serveur IC-7300",
+            "Adresse du PC de la radio (IC-7300 Serveur, son PipeWire-Pulse TCP 4713) :",
+            text=r.ic7300_hote)
+        hote = hote.strip()
+        if not ok or not hote:
+            return
+        r.ic7300_hote = hote
+        if r.source == "ic7300" and self.moteur.actif:
+            self.moteur.arreter()
+            self.demarrer()
+        else:
+            self._choisir_source("ic7300")
 
     def _choisir_source(self, cle: str, index: int | None = None, serie: str | None = None) -> None:
         etait = self.moteur.actif
         if etait:
             self.moteur.arreter()
+        r = self.reglages
+        if cle == "ic7300" and r.source != "ic7300":
+            r.frequence_sdr = [r.centre, r.decalage]     # la radio impose sa fréquence : on garde celle de la clé
+        elif cle != "ic7300" and r.source == "ic7300" and len(r.frequence_sdr) == 2:
+            r.centre, r.decalage = r.frequence_sdr
+            self.moteur.centre, self.moteur.decalage = r.centre, r.decalage
+            r.frequence_sdr = []
+            self._maj_vfo()
         self.reglages.source = cle
         if cle == "rtlsdr" and index is not None:
             self.reglages.rtlsdr_index = index
@@ -543,6 +646,9 @@ class FenetrePrincipale(QMainWindow):
         if i.get("numero_serie"):
             detail += f", n° {i['numero_serie']}"
         texte = f"Source : {TOUTES_SOURCES[self.reglages.source].nom}{detail} ({etat})"
+        src = self.moteur.source
+        if self.moteur.actif and self.reglages.source == "ic7300" and hasattr(src, "etat_cat"):
+            texte += f" · CAT {src.etat_cat}"
         if getattr(self, "_avertissement", ""):
             texte = f"<span style='color:#ff7043;font-weight:bold'>{self._avertissement}</span>&nbsp;&nbsp;&nbsp;{texte}"
         self.lbl_source.setText(texte)

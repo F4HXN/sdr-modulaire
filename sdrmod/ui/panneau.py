@@ -302,6 +302,17 @@ class PanneauReglages(QWidget):
 
     ZOOMS = (0.0, 1_000_000.0, 500_000.0, 200_000.0, 100_000.0, 50_000.0, 20_000.0)
 
+    ZOOMS_AUDIO = [3_000, 4_000, 6_000, 12_000, 24_000]
+
+    def zooms_audio(self, actuel: float) -> None:
+        """Source audio : largeurs du spectre du son, comptées depuis 0 Hz."""
+        self.zoom.blockSignals(True)
+        self.zoom.clear()
+        for z in self.ZOOMS_AUDIO:
+            self.zoom.addItem(f"0–{z / 1e3:g} kHz (son)", float(z))
+        self.zoom.setCurrentIndex(max(0, self.zoom.findData(float(actuel))))
+        self.zoom.blockSignals(False)
+
     def _zooms_pour(self, taux: float, actuel: float) -> None:
         """Largeurs proposées : plus petites que la bande reçue."""
         self.zoom.blockSignals(True)

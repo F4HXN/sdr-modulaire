@@ -1,3 +1,4 @@
+from .audio_source import SourceIC7300, SourceSonPC, lister_entrees
 from .base import Source
 from .rtlsdr_source import SourceRtlSdr
 from .simulation import SourceSimulation
@@ -5,6 +6,8 @@ from .simulation import SourceSimulation
 # Sources proposées à l'utilisateur (menu Source).
 SOURCES: dict[str, type[Source]] = {
     "rtlsdr": SourceRtlSdr,
+    "son_pc": SourceSonPC,
+    "ic7300": SourceIC7300,
 }
 
 # Source simulée : réservée aux tests automatiques (tests/), jamais proposée dans l'application.
@@ -13,4 +16,5 @@ SOURCES_ESSAI: dict[str, type[Source]] = {
 }
 TOUTES_SOURCES = {**SOURCES, **SOURCES_ESSAI}
 
-__all__ = ["Source", "SOURCES", "SOURCES_ESSAI", "TOUTES_SOURCES", "SourceRtlSdr", "SourceSimulation"]
+__all__ = ["Source", "SOURCES", "SOURCES_ESSAI", "TOUTES_SOURCES", "SourceRtlSdr", "SourceSimulation",
+           "SourceSonPC", "SourceIC7300", "lister_entrees"]

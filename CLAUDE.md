@@ -45,6 +45,10 @@ Toujours relancer les trois tests après une modification du DSP ou de l'interfa
   `decalage_nco` sert de BFO (CW). `bande()` donne la bande affichée relative au VFO.
 - `sdrmod/sources/` : `Source` (ouvrir, lire, regler_*, gains, infos). `SOURCES` dans
   `__init__.py`. `infos()` alimente le cadre « Matériel » (table `TUNERS` dans rtlsdr_source.py).
+  `audio_source.py` : sources de son déjà démodulé (`audio = True`) — « Son du PC » (entrée
+  PipeWire choisie dans le menu Source) et « IC-7300 (serveur) » (parec vers le PC de la radio,
+  TCP 4713). Le moteur passe alors à 48 kHz sans démodulation (`_traiter_audio`, spectre 0–24 kHz).
+  « Son du PC » ne renvoie pas le son aux haut-parleurs (`ecoute = False`, larsen).
 - `sdrmod/ui/` : `fenetre.py` (fenêtre principale, logique d'accord, docks des modules),
   `vue_spectre.py` (spectre + waterfall, clic/glisser/molette), `afficheur.py`
   (fréquence façon transceiver), `panneau.py` (réglages), `dialogue_modules.py`.

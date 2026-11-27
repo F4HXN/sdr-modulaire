@@ -39,6 +39,9 @@ class Reglages:
     echantillonnage_direct: int = 0     # 0 = non, 1 = branche I, 2 = branche Q
     convertisseur: float = 0.0          # décalage d'un convertisseur HF en Hz (Ham It Up : 125e6), 0 sans
     bias_t: bool = False
+    son_pc_entree: str = ""             # entrée son de la source « Son du PC » ; vide = par défaut
+    ic7300_hote: str = ""               # PC de la radio, demandé au premier choix (serveur IC-7300, PipeWire-Pulse TCP 4713)
+    frequence_sdr: list = field(default_factory=list)  # [centre, decalage] de la clé, gardés pendant l'IC-7300
 
     mode: str = "NFM"
     largeurs: dict = field(default_factory=dict)   # bande passante mémorisée par mode
@@ -50,6 +53,7 @@ class Reglages:
     taille_fft: int = 4096
     moyennage: float = 0.5
     zoom: float = 0.0                   # largeur affichée par le spectre (Hz), 0 = toute la bande
+    zoom_audio: float = 4000.0          # source audio : spectre affiché de 0 à cette fréquence (Hz)
     niveau_min: float = -110.0
     niveau_max: float = -40.0
 

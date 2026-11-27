@@ -37,6 +37,7 @@ class Moteur(QObject):
         self.modes = modes
         self.sortie = sortie
         self.source: Source | None = None
+        self.source_audio = False      # source de son déjà démodulé (48 kHz, sans démodulation)
 
         # paramètres modifiables depuis l'interface (lus par le thread DSP)
         self.centre = 145_300_000.0
@@ -49,6 +50,7 @@ class Moteur(QObject):
         self.taille_fft = 4096
         self.moyennage = 0.5
         self.zoom = 0.0                 # Hz affichés (0 = toute la bande)
+        self.zoom_audio = 4000.0        # source audio : spectre de 0 à zoom_audio Hz
         self._vue_centre = 0.0          # centre de la portion affichée, par rapport au centre de la clé
         self._mode_demande: tuple[str, float] | None = None
         self._largeur_demandee: float | None = None
@@ -72,6 +74,10 @@ class Moteur(QObject):
     def demarrer(self, source: Source, mode: str, largeur: float, initialiser=None) -> None:
         """initialiser(source) est appelé après l'ouverture, avant le lancement des threads."""
         self.source = source
+        # Source audio (son déjà démodulé) : 48 kHz, ni décimation ni démodulation.
+        self.source_audio = bool(getattr(source, "audio", False))
+        if self.source_audio:
+            self.taux = TAUX_AUDIO
         source.ouvrir(self.taux, self.centre + self.convertisseur)
         if initialiser:
             initialiser(source)
@@ -137,6 +143,12 @@ class Moteur(QObject):
             pass
 
     def _construire_chaine(self, mode: str, largeur: float) -> None:
+        if self.source_audio:
+            self.n_bloc = taille_bloc(TAUX_AUDIO, 1)
+            self._moy_spectre = None
+            self._fenetre = None
+            self._installer_demod(mode, largeur)
+            return
         d1, d2 = plan_decimation(self.taux, TAUX_AUDIO)
         self.d1, self.d2 = d1, d2
         self.fs_inter = self.taux / d1
@@ -211,6 +223,8 @@ class Moteur(QObject):
             self.demod.regler_largeur(self._largeur_demandee)
             self._largeur_demandee = None
         demod = self.demod
+        if self.source_audio:
+            return self._traiter_audio(x)
 
         ecretes = int(np.count_nonzero((np.abs(x.real) >= 0.99) | (np.abs(x.imag) >= 0.99)))
         for c in (self.compte_sat, self.mesure_sat):
@@ -243,6 +257,53 @@ class Moteur(QObject):
         if self.sortie:
             self.sortie.ecrire(audio * self.volume)
         return audio
+
+    def _traiter_audio(self, x: np.ndarray) -> np.ndarray:
+        """Source audio : le son passe tel quel vers le bus, spectre 0–24 kHz."""
+        x = np.asarray(x, dtype=np.float32)
+        ecretes = int(np.count_nonzero(np.abs(x) >= 0.99))
+        for c in (self.compte_sat, self.mesure_sat):
+            c[0] += ecretes
+            c[1] += len(x)
+        self._spectre_audio(x)
+        niveau = float(10 * np.log10(np.mean(x.astype(np.float64) ** 2) + 1e-20))
+        audio = np.clip(x, -1.0, 1.0)
+        if niveau < self.squelch:
+            audio = np.zeros_like(audio)
+        self.bus.publier("niveau", niveau)
+        self.bus.publier("audio", audio, TAUX_AUDIO)
+        self.niveau.emit(niveau)
+        if self.sortie and getattr(self.source, "ecoute", True):
+            self.sortie.ecrire(audio * self.volume)
+        return audio
+
+    def _spectre_audio(self, x: np.ndarray) -> None:
+        n = self.taille_fft
+        if self._fenetre is None or len(self._fenetre) != n:
+            self._fenetre = signal.windows.blackmanharris(n).astype(np.float32)
+            self._norme = float(self._fenetre.sum()) ** 2
+            self._moy_spectre = None
+        nseg = min(len(x) // n, 8)
+        if nseg == 0:            # bloc plus court que la FFT : on garde un historique
+            self._histo = np.concatenate([getattr(self, "_histo", np.zeros(0, np.float32)), x])[-n:]
+            if len(self._histo) < n:
+                return
+            segs = self._histo[None, :] * self._fenetre
+        else:
+            segs = x[: nseg * n].reshape(nseg, n) * self._fenetre
+        # signal réel : on garde les fréquences positives, puissance doublée
+        p = 4 * (np.abs(np.fft.rfft(segs, axis=1)) ** 2).mean(axis=0) / self._norme
+        db = 10.0 * np.log10(p[:-1] + 1e-20)
+        if self._moy_spectre is None or len(self._moy_spectre) != len(db):
+            self._moy_spectre = db
+        else:
+            a = self.moyennage
+            self._moy_spectre = a * self._moy_spectre + (1 - a) * db
+        demi = TAUX_AUDIO / 2
+        largeur = min(max(self.zoom_audio, 500.0), demi)
+        k = max(2, int(round(len(self._moy_spectre) * largeur / demi)))
+        largeur = k * demi / len(self._moy_spectre)
+        self.spectre_pret.emit((self._moy_spectre[:k].astype(np.float32), largeur / 2, largeur))
 
     def _vue(self) -> tuple[float, float] | None:
         """Portion affichée (Hz par rapport au centre de la clé) quand on zoome, sinon None.
